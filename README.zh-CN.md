@@ -42,7 +42,7 @@
 
 ## 163 邮箱说明
 
-网易 Coremail（163 / 126 / yeah / 188）要求客户端登录前先发 IMAP **ID 命令（RFC 2971），字段名要加引号**，否则 `SELECT` 会被拒（`NO SELECT Unsafe Login`；不加引号回 `BAD Parse command error`）。后端经 imapflow 发这个命令。163 登录须用**客户端授权码**，不是网页密码。
+网易 Coremail（163 / 126 / yeah / 188）要求客户端登录前先发 IMAP **ID 命令（RFC 2971），字段名要加引号**，否则 `SELECT` 会被拒（`NO SELECT Unsafe Login`；不加引号回 `BAD Parse command error`）。后端经 imapflow 发这个命令。部分邮箱服务商，如163 邮箱，QQ邮箱登录须用**客户端授权码**，不是网页密码。
 
 ## 知名邮箱自动填服务器
 
