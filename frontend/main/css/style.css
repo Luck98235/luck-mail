@@ -1,0 +1,162 @@
+/* Luck-Mail 主界面 — 响应式（基于用户上传的 4 栏蓝色布局） */
+/* 桌面 >1024px：完整 4 栏（最左窄栏 + 左栏 + 邮件列表 + 阅读窗），按上传文件原样。 */
+
+/* 手机/平板共用：返回栏默认隐藏，桌面不显示 */
+.mobile-backbar { display: none; }
+
+/* ---------- 平板 768–1024px：收起最左窄栏，邮件列表略收窄 ---------- */
+@media (max-width: 1024px) {
+    #sysnav { display: none; }
+    #maillist { width: 260px; }
+    /* 平板端把设置/改密码/退出放到左栏底部 */
+    #tablet-sysactions { display: flex; }
+}
+
+/* ---------- 手机 <768px：单栏钻取式 ---------- */
+/* body[data-mview] 控制当前显示哪一栏：nav（邮箱导航）/ list（邮件列表）/ read（阅读窗） */
+@media (max-width: 767px) {
+    /* 最左窄栏隐藏（系统操作改由左栏底部的 tablet-sysactions 承担，手机上也显示） */
+    #sysnav { display: none; }
+    #tablet-sysactions { display: flex; }
+
+    /* 三栏全部改为全宽单栏，默认隐藏，由 data-mview 决定显示哪一栏 */
+    #mailsidebar, #maillist, #reading {
+        width: 100% !important;
+        flex: 1 1 auto;
+        border-right: none;
+        display: none;
+    }
+    body[data-mview="nav"] #mailsidebar { display: flex; }
+    body[data-mview="list"] #maillist { display: flex; }
+    body[data-mview="read"] #reading { display: flex; }
+
+    /* 手机端返回栏 */
+    .mobile-backbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 48px;
+        padding: 0 12px;
+        border-bottom: 1px solid var(--c-100);
+        background: #fff;
+        flex-shrink: 0;
+    }
+    .mobile-backbtn {
+        width: 32px;
+        height: 32px;
+        border-radius: 9999px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--c-500);
+        background: var(--c-50);
+    }
+    .mobile-backbtn:active { background: var(--c-100); }
+    .mobile-backtitle {
+        font-weight: 700;
+        color: #334155;
+        font-size: 15px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .mobile-backspace { flex: 1; }
+
+    /* 手机端阅读窗正文内边距收紧 */
+    #reading-body { padding: 16px !important; }
+
+    /* 手机端列表头部收紧 */
+    #maillist .h-16 { height: 52px; }
+}
+
+/* ---------- 主题配色 ---------- */
+/* 每套主题的色阶变量（对应 Tailwind 的 50/100/200/300/400/500/600/700/900） */
+body[data-theme="blue"] {
+    --c-50: #eff6ff; --c-100: #dbeafe; --c-200: #bfdbfe; --c-300: #93c5fd; --c-400: #60a5fa;
+    --c-500: #3b82f6; --c-600: #2563eb; --c-700: #1d4ed8; --c-900: #1e3a8a;
+}
+body[data-theme="green"] {
+    --c-50: #f0fdf4; --c-100: #dcfce7; --c-200: #bbf7d0; --c-300: #86efac; --c-400: #4ade80;
+    --c-500: #22c55e; --c-600: #16a34a; --c-700: #15803d; --c-900: #14532d;
+}
+body[data-theme="red"] {
+    --c-50: #fef2f2; --c-100: #fee2e2; --c-200: #fecaca; --c-300: #fca5a5; --c-400: #f87171;
+    --c-500: #ef4444; --c-600: #dc2626; --c-700: #b91c1c; --c-900: #7f1d1d;
+}
+body[data-theme="purple"] {
+    --c-50: #faf5ff; --c-100: #f3e8ff; --c-200: #e9d5ff; --c-300: #d8b4fe; --c-400: #c084fc;
+    --c-500: #a855f7; --c-600: #9333ea; --c-700: #7e22ce; --c-900: #581c87;
+}
+body[data-theme="orange"] {
+    --c-50: #fff7ed; --c-100: #ffedd5; --c-200: #fed7aa; --c-300: #fdba74; --c-400: #fb923c;
+    --c-500: #f97316; --c-600: #ea580c; --c-700: #c2410c; --c-900: #7c2d12;
+}
+body[data-theme="teal"] {
+    --c-50: #f0fdfa; --c-100: #ccfbf1; --c-200: #99f6e4; --c-300: #5eead4; --c-400: #2dd4bf;
+    --c-500: #14b8a6; --c-600: #0d9488; --c-700: #0f766e; --c-900: #134e4a;
+}
+/* 50% 透明版本（对应 /50 的类） */
+body[data-theme] {
+    --c-50-50: color-mix(in srgb, var(--c-50) 50%, transparent);
+    --c-100-50: color-mix(in srgb, var(--c-100) 50%, transparent);
+}
+
+/* 滚动条跟随主题 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--c-300); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: var(--c-400); }
+body { scrollbar-color: var(--c-300) transparent; scrollbar-width: thin; }
+
+/* 把 Tailwind 蓝色类映射到主题变量（body[data-theme] 前缀 + !important，保证盖过 Tailwind） */
+/* 背景 */
+body[data-theme] .bg-blue-50 { background-color: var(--c-50) !important; }
+body[data-theme] .bg-blue-100 { background-color: var(--c-100) !important; }
+body[data-theme] .bg-blue-200 { background-color: var(--c-200) !important; }
+body[data-theme] .bg-blue-500 { background-color: var(--c-500) !important; }
+body[data-theme] .bg-blue-600 { background-color: var(--c-600) !important; }
+body[data-theme] .bg-blue-50\/50 { background-color: var(--c-50-50) !important; }
+body[data-theme] .bg-blue-100\/50 { background-color: var(--c-100-50) !important; }
+body[data-theme] .hover\:bg-blue-50:hover { background-color: var(--c-50) !important; }
+body[data-theme] .hover\:bg-blue-100:hover { background-color: var(--c-100) !important; }
+body[data-theme] .hover\:bg-blue-600:hover { background-color: var(--c-600) !important; }
+body[data-theme] .hover\:bg-blue-50\/50:hover { background-color: var(--c-50-50) !important; }
+body[data-theme] .hover\:bg-blue-100\/50:hover { background-color: var(--c-100-50) !important; }
+/* 文字 */
+body[data-theme] .text-blue-400 { color: var(--c-400) !important; }
+body[data-theme] .text-blue-500 { color: var(--c-500) !important; }
+body[data-theme] .text-blue-600 { color: var(--c-600) !important; }
+body[data-theme] .text-blue-700 { color: var(--c-700) !important; }
+body[data-theme] .text-blue-900 { color: var(--c-900) !important; }
+body[data-theme] .hover\:text-blue-500:hover { color: var(--c-500) !important; }
+body[data-theme] .hover\:text-blue-600:hover { color: var(--c-600) !important; }
+/* 边框 */
+body[data-theme] .border-blue-50 { border-color: var(--c-50) !important; }
+body[data-theme] .border-blue-100 { border-color: var(--c-100) !important; }
+body[data-theme] .border-blue-200 { border-color: var(--c-200) !important; }
+body[data-theme] .border-blue-300 { border-color: var(--c-300) !important; }
+body[data-theme] .border-blue-400 { border-color: var(--c-400) !important; }
+body[data-theme] .border-blue-100\/50 { border-color: var(--c-100-50) !important; }
+body[data-theme] .focus\:border-blue-400:focus { border-color: var(--c-400) !important; }
+/* focus ring */
+body[data-theme] .focus\:ring-blue-400:focus { --tw-ring-color: var(--c-400) !important; }
+/* Logo 渐变 */
+body[data-theme] .from-blue-400 { --tw-gradient-from: var(--c-400) !important; }
+body[data-theme] .to-blue-600 { --tw-gradient-to: var(--c-600) !important; }
+
+/* 配色面板（fixed，JS 按点击的调色板按钮定位） */
+#theme-panel { position: fixed; z-index: 60; width: 208px; background: #fff; border: 1px solid var(--c-200); border-radius: 12px; box-shadow: 0 10px 30px rgba(15, 23, 42, .18); padding: 12px; }
+#theme-panel .theme-title { font-size: 12px; font-weight: 700; color: #475569; margin: 0 0 8px 2px; }
+#theme-panel .theme-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+#theme-panel .theme-swatch { display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 8px 2px 6px; border-radius: 10px; cursor: pointer; border: 1px solid transparent; background: transparent; }
+#theme-panel .theme-swatch:hover { background: var(--c-50); }
+#theme-panel .theme-swatch .dot { width: 28px; height: 28px; border-radius: 9999px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .06); }
+#theme-panel .theme-swatch .nm { font-size: 11px; color: #475569; line-height: 1; }
+#theme-panel .theme-swatch.active { border-color: var(--c-300); background: var(--c-50); }
+#theme-panel .theme-swatch.active .dot { box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--c-400); }
+
+/* ---------- 邮箱文件夹展开 / 折叠 ---------- */
+#account-list .acct-folders { max-height: 0; overflow: hidden; transition: max-height .25s ease; }
+#account-list .acct-item.expanded .acct-folders { max-height: 240px; }
+#account-list .acct-row .fa-chevron-right { transition: transform .2s ease; }
+#account-list .acct-item.expanded .acct-row .fa-chevron-right { transform: rotate(90deg); }

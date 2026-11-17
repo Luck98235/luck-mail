@@ -1,0 +1,112 @@
+<?php
+namespace Frickmail\User;
+
+/**
+ * Helpers used by external plugins (login-gmail, login-o365) to:
+ *   - detect whether the current request is inside a Frickmail-user session
+ *   - persist OAuth-account records into frickmail_mail_accounts
+ *   - retrieve a user's mail account for the bridge to LoginProcess()
+ *
+ * Callers should `require_once APP_PLUGINS_PATH . 'frickmail-user/lib/Bridge.php';`
+ * which transitively pulls Crypto + Db.
+ */
+
+require_once __DIR__ . '/Crypto.php';
+require_once __DIR__ . '/Db.php';
+
+class Bridge
+{
+	const SESSION_KEY_USER = 'frickmail_user_id';
+	const SESSION_KEY_KEY  = 'frickmail_crypt_key';
+
+	public static function startSession() : void
+	{
+		if (\PHP_SESSION_ACTIVE !== \session_status()) {
+			// Guard: Alpine default save_path is empty → sessions silently write to '/' (H1).
+			if ('' === \session_save_path()) {
+				$sSavePath = \rtrim(APP_DATA_FOLDER_PATH, '/') . '/_sessions_';
+				if (!\is_dir($sSavePath)) {
+					\mkdir($sSavePath, 0700, true);
+				}
+				\session_save_path($sSavePath);
+			}
+			// Consider both HTTPS server var and X-Forwarded-Proto from reverse proxy (L1).
+			$bSecure = !empty($_SERVER['HTTPS'])
+				|| (\strtolower($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+			\session_start([
+				'cookie_httponly' => true,
+				'cookie_secure'   => $bSecure,
+				'cookie_samesite' => 'Lax',
+				'use_strict_mode' => true,
+			]);
+		}
+	}
+
+	public static function currentUserId() : ?int
+	{
+		self::startSession();
+		$uid = $_SESSION[self::SESSION_KEY_USER] ?? null;
+		return $uid ? (int) $uid : null;
+	}
+
+	public static function currentCryptKey() : ?string
+	{
+		self::startSession();
+		$b64 = $_SESSION[self::SESSION_KEY_KEY] ?? null;
+		return $b64 ? \base64_decode($b64, true) : null;
+	}
+
+	/** Insert or update an OAuth account for the current Frickmail user. */
+	public static function upsertOAuthAccount(string $sType, string $sEmail, string $sRefreshToken, ?string $sTenant = null) : int
+	{
+		$uid = self::currentUserId();
+		$key = self::currentCryptKey();
+		if (!$uid || !$key) {
+			throw new \RuntimeException('No Frickmail session');
+		}
+		$db = new Db();
+		$existing = self::findByEmail($db, $uid, $sEmail);
+		$cipher = Crypto::encrypt($sRefreshToken, $key);
+		if ($existing) {
+			$st = $db->pdo()->prepare(
+				"UPDATE frickmail_mail_accounts SET
+					type = :type,
+					encrypted_oauth_refresh_token = decode(:tok, 'hex'),
+					oauth_tenant = :tenant, login = :login, updated_at = NOW()
+				 WHERE id = :id AND user_id = :uid"
+			);
+			$st->execute([
+				':id' => (int) $existing['id'],
+				':uid' => $uid,
+				':type' => $sType,
+				':tok' => \bin2hex($cipher),
+				':tenant' => $sTenant,
+				':login' => $sEmail,
+			]);
+			return (int) $existing['id'];
+		}
+		// Check before insert so the count reflects the pre-insert state (M4).
+		$bIsFirst = 0 === \count($db->listMailAccounts($uid));
+		$id = $db->insertMailAccount($uid, [
+			'label'                        => $sEmail,
+			'email'                        => $sEmail,
+			'type'                         => $sType,
+			'login'                        => $sEmail,
+			'encrypted_oauth_refresh_token' => $cipher,
+			'oauth_tenant'                 => $sTenant,
+			'is_primary'                   => $bIsFirst,
+		]);
+		if ($id && $bIsFirst) {
+			$db->setPrimaryMailAccount($uid, $id);
+		}
+		return $id;
+	}
+
+	private static function findByEmail(Db $db, int $userId, string $email) : ?array
+	{
+		$st = $db->pdo()->prepare('SELECT * FROM frickmail_mail_accounts WHERE user_id = :u AND lower(email) = lower(:e) LIMIT 1');
+		$st->execute([':u' => $userId, ':e' => $email]);
+		$row = $st->fetch();
+		return $row ?: null;
+	}
+}

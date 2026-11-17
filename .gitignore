@@ -1,0 +1,47 @@
+# luck-mail — 轻量开源网页邮箱（Node + SQLite + Vue）
+#
+# 绝不进仓库的东西：密钥、数据库、环境变量、构建产物、依赖。
+# 其中 .key（邮箱密码加密密钥）和 data/（SQLite 数据库 + 正文/附件）
+# 必须一起备份，丢了 .key 则已存的邮箱密码无法解密。
+
+# 密钥与凭证
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# 数据库与运行数据
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/
+uploads/
+
+# 备份与日志
+*.tar.gz
+*.tgz
+*.log
+*.zip
+
+# 依赖
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+
+# 构建产物
+backend/dist/
+frontend/dist/
+.next/
+dist/
+
+# 编辑器与系统文件
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

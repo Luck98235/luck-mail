@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+/* Luck-Mail — Vue 版样式：Tailwind 本地构建 + 主题变量（由 body[data-theme] 驱动） */
+/* 桌面 >1024px：完整 4 栏（与旧版一致）。手机/平板：QQ 邮箱 APP 式布局（见下方 .mobile-shell）。 */
+
+html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+
+/* ---------- 主题配色（6 色，与旧版 css/style.css 一致） ---------- */
+body[data-theme="blue"] {
+    --c-50: #eff6ff; --c-100: #dbeafe; --c-200: #bfdbfe; --c-300: #93c5fd; --c-400: #60a5fa;
+    --c-500: #3b82f6; --c-600: #2563eb; --c-700: #1d4ed8; --c-900: #1e3a8a;
+}
+body[data-theme="green"] {
+    --c-50: #f0fdf4; --c-100: #dcfce7; --c-200: #bbf7d0; --c-300: #86efac; --c-400: #4ade80;
+    --c-500: #22c55e; --c-600: #16a34a; --c-700: #15803d; --c-900: #14532d;
+}
+body[data-theme="mono"] {
+    --c-50: #f9fafb; --c-100: #f3f4f6; --c-200: #e5e7eb; --c-300: #d1d5db; --c-400: #9ca3af;
+    --c-500: #111827; --c-600: #030712; --c-700: #000000; --c-900: #000000;
+}
+body[data-theme="purple"] {
+    --c-50: #faf5ff; --c-100: #f3e8ff; --c-200: #e9d5ff; --c-300: #d8b4fe; --c-400: #c084fc;
+    --c-500: #a855f7; --c-600: #9333ea; --c-700: #7e22ce; --c-900: #581c87;
+}
+body[data-theme="orange"] {
+    --c-50: #fff7ed; --c-100: #ffedd5; --c-200: #fed7aa; --c-300: #fdba74; --c-400: #fb923c;
+    --c-500: #f97316; --c-600: #ea580c; --c-700: #c2410c; --c-900: #7c2d12;
+}
+body[data-theme="teal"] {
+    --c-50: #f0fdfa; --c-100: #ccfbf1; --c-200: #99f6e4; --c-300: #5eead4; --c-400: #2dd4bf;
+    --c-500: #14b8a6; --c-600: #0d9488; --c-700: #0f766e; --c-900: #134e4a;
+}
+body[data-theme] {
+    --c-50-50: color-mix(in srgb, var(--c-50) 50%, transparent);
+    --c-100-50: color-mix(in srgb, var(--c-100) 50%, transparent);
+}
+
+/* 滚动条跟随主题 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--c-300); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: var(--c-400); }
+body { scrollbar-color: var(--c-300) transparent; scrollbar-width: thin; }
+
+/* 把 Tailwind 蓝色类映射到主题变量（与旧版一致，!important 盖过 Tailwind） */
+body[data-theme] .bg-blue-50 { background-color: var(--c-50) !important; }
+body[data-theme] .bg-blue-100 { background-color: var(--c-100) !important; }
+body[data-theme] .bg-blue-200 { background-color: var(--c-200) !important; }
+body[data-theme] .bg-blue-500 { background-color: var(--c-500) !important; }
+body[data-theme] .bg-blue-600 { background-color: var(--c-600) !important; }
+body[data-theme] .bg-blue-50\/50 { background-color: var(--c-50-50) !important; }
+body[data-theme] .bg-blue-100\/50 { background-color: var(--c-100-50) !important; }
+body[data-theme] .hover\:bg-blue-50:hover { background-color: var(--c-50) !important; }
+body[data-theme] .hover\:bg-blue-100:hover { background-color: var(--c-100) !important; }
+body[data-theme] .hover\:bg-blue-600:hover { background-color: var(--c-600) !important; }
+body[data-theme] .hover\:bg-blue-50\/50:hover { background-color: var(--c-50-50) !important; }
+body[data-theme] .hover\:bg-blue-100\/50:hover { background-color: var(--c-100-50) !important; }
+body[data-theme] .text-blue-400 { color: var(--c-400) !important; }
+body[data-theme] .text-blue-500 { color: var(--c-500) !important; }
+body[data-theme] .text-blue-600 { color: var(--c-600) !important; }
+body[data-theme] .text-blue-700 { color: var(--c-700) !important; }
+body[data-theme] .text-blue-900 { color: var(--c-900) !important; }
+body[data-theme] .hover\:text-blue-500:hover { color: var(--c-500) !important; }
+body[data-theme] .hover\:text-blue-600:hover { color: var(--c-600) !important; }
+body[data-theme] .border-blue-50 { border-color: var(--c-50) !important; }
+body[data-theme] .border-blue-100 { border-color: var(--c-100) !important; }
+body[data-theme] .border-blue-200 { border-color: var(--c-200) !important; }
+body[data-theme] .border-blue-300 { border-color: var(--c-300) !important; }
+body[data-theme] .border-blue-400 { border-color: var(--c-400) !important; }
+body[data-theme] .border-blue-100\/50 { border-color: var(--c-100-50) !important; }
+body[data-theme] .focus\:border-blue-400:focus { border-color: var(--c-400) !important; }
+body[data-theme] .focus\:ring-blue-400:focus { --tw-ring-color: var(--c-400) !important; }
+body[data-theme] .from-blue-400 { --tw-gradient-from: var(--c-400) !important; }
+body[data-theme] .to-blue-600 { --tw-gradient-to: var(--c-600) !important; }
+
+/* 配色面板（fixed，JS 按点击的调色板按钮定位；与旧版一致） */
+#theme-panel { position: fixed; z-index: 60; width: 208px; background: #fff; border: 1px solid var(--c-200); border-radius: 12px; box-shadow: 0 10px 30px rgba(15, 23, 42, .18); padding: 12px; }
+#theme-panel .theme-title { font-size: 12px; font-weight: 700; color: #475569; margin: 0 0 8px 2px; }
+#theme-panel .theme-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+#theme-panel .theme-swatch { display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 8px 2px 6px; border-radius: 10px; cursor: pointer; border: 1px solid transparent; background: transparent; }
+#theme-panel .theme-swatch:hover { background: var(--c-50); }
+#theme-panel .theme-swatch .dot { width: 28px; height: 28px; border-radius: 9999px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .06); }
+#theme-panel .theme-swatch .nm { font-size: 11px; color: #475569; line-height: 1; }
+#theme-panel .theme-swatch.active { border-color: var(--c-300); background: var(--c-50); }
+#theme-panel .theme-swatch.active .dot { box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--c-400); }
+
+/* ---------- 桌面端邮箱文件夹展开 / 折叠（与旧版一致） ---------- */
+#account-list .acct-folders { max-height: 0; overflow: hidden; transition: max-height .25s ease; }
+#account-list .acct-item.expanded .acct-folders { max-height: 240px; }
+#account-list .acct-row .fa-chevron-right { transition: transform .2s ease; }
+#account-list .acct-item.expanded .acct-row .fa-chevron-right { transform: rotate(90deg); }
+
+/* ---------- 移动/平板 QQ 式布局 ---------- */
+/* 容器：.mobile-shell[data-mview] 决定当前显示哪一级
+   home（账号总览）/ account（邮箱内列表）/ read（阅读窗）
+   配色：全部用本项目主题变量（浅色），不用 QQ 的深色。 */
+.mobile-shell { height: 100%; }
+.m-home, .m-content { height: 100%; min-height: 0; }
+.m-list, .m-reading { min-height: 0; }
+
+/* 手机 <768px：单栏，home / account / read 三级切换 */
+@media (max-width: 767px) {
+  .mobile-shell { display: flex; flex-direction: column; }
+  .mobile-shell .m-home, .mobile-shell .m-content { display: none; width: 100%; flex: 1 1 auto; }
+  .mobile-shell[data-mview="home"] .m-home { display: flex; }
+  .mobile-shell[data-mview="account"] .m-content,
+  .mobile-shell[data-mview="read"] .m-content { display: flex; }
+  .mobile-shell .m-list, .mobile-shell .m-reading { display: none; flex: 1 1 auto; }
+  .mobile-shell[data-mview="account"] .m-list { display: flex; }
+  .mobile-shell[data-mview="read"] .m-reading { display: flex; }
+}
+
+/* 平板 768–1024px：左栏 = QQ 账号总览（固定 300px），右栏 = 列表/阅读窗 */
+@media (min-width: 768px) and (max-width: 1023px) {
+  .mobile-shell { display: flex; flex-direction: row; }
+  .mobile-shell .m-home { display: flex; width: 300px; flex-shrink: 0; border-right: 1px solid var(--c-100); }
+  .mobile-shell .m-content { display: flex; flex: 1 1 auto; min-width: 0; }
+  .mobile-shell .m-list, .mobile-shell .m-reading { display: none; flex: 1 1 auto; }
+  .mobile-shell[data-mview="account"] .m-list,
+  .mobile-shell[data-mview="home"] .m-list { display: flex; }
+  .mobile-shell[data-mview="read"] .m-reading { display: flex; }
+}
+
+/* QQ 式侧滑文件夹抽屉（手机/平板共用，浅色 + 主题色高亮） */
+.m-drawer-mask { position: fixed; inset: 0; z-index: 55; background: rgba(15, 23, 42, .35); }
+.m-drawer { position: fixed; top: 0; bottom: 0; left: 0; z-index: 56; width: min(78vw, 320px); background: #fff; box-shadow: 0 0 30px rgba(15, 23, 42, .25); display: flex; flex-direction: column; transform: translateX(-105%); transition: transform .25s ease; }
+.m-drawer.open { transform: translateX(0); }
+.m-drawer .drawer-item { display: flex; align-items: center; gap: 14px; padding: 13px 20px; font-size: 15px; color: #334155; cursor: pointer; }
+.m-drawer .drawer-item:active { background: var(--c-50); }
+.m-drawer .drawer-item.active { color: var(--c-600); background: var(--c-50); font-weight: 600; }
+
+/* QQ 式列表行：头像圆 + 发件人/主题/摘要两行 + 日期 + > */
+.qq-row { display: flex; gap: 12px; padding: 10px 16px; border-bottom: 1px solid #f1f5f9; cursor: pointer; background: #fff; }
+.qq-row:active { background: var(--c-50); }
+.qq-row.active { background: #fde8e8; }

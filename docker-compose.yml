@@ -1,0 +1,13 @@
+services:
+  luck-mail:
+    build: .
+    image: luck-mail:latest
+    container_name: luck-mail
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8888"
+    volumes:
+      - ./data:/var/lib/snappymail
+    environment:
+      - UPLOAD_MAX_SIZE=25M
+      - MEMORY_LIMIT=128M
