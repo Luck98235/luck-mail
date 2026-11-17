@@ -29,7 +29,7 @@ Moving to a new server? See [MIGRATION.md](MIGRATION.md).
 
 ## Architecture
 
-Single Node process + SQLite. No PostgreSQL, Redis, S3 or Elasticsearch. Designed for at most 50 mailboxes — no distributed microservices.
+Single Node process + SQLite. No PostgreSQL, Redis, S3 or Elasticsearch.
 
 | Layer | Stack |
 |---|---|

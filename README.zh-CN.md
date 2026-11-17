@@ -28,7 +28,7 @@
 
 ## 架构
 
-单 Node 进程 + SQLite。不用 PostgreSQL、Redis、S3、Elasticsearch。按最多 50 个邮箱设计，不用分布式微服务。
+单 Node 进程 + SQLite。不用 PostgreSQL、Redis、S3、Elasticsearch。
 
 | 层 | 技术 |
 |---|---|
