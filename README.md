@@ -16,7 +16,7 @@ Moving to a new server? See [MIGRATION.md](MIGRATION.md).
 
 ## Features
 
-1. **Login** — a clean card: username only (no email suffix), password with show/hide eye, "remember me for 30 days" checkbox, blue login button. No QR login, no "forgot password" link (change password inside Settings). Lockout after 5 failed attempts in 15 minutes. Username is case-insensitive.
+1. **Login** — Lockout after 5 failed attempts in 15 minutes. Username is case-insensitive.
 2. **Add mailbox** — Foxmail-style form: email, password, IMAP server + SSL + port, SMTP server + SSL + port, STARTTLS checkbox. Known providers auto-fill servers; unknown domains default to `imap.<domain>` / `smtp.<domain>`. The backend tests IMAP + SMTP connectivity before saving. **IMAP only** — POP3 is fully removed.
 3. **Manage mailboxes** — a popup table: serial number, mailbox, alias (edit inline), sort order (drag to reorder), actions (**test connectivity**, settings, temporarily disable, delete). The **Test** button checks IMAP + SMTP without opening settings. Bottom bar: **+ Add mailbox** and **Export all mailboxes** (downloads a real `.xlsx` with serial, email, authorization code, IMAP/SMTP server + port, alias), count, **OK / Cancel**. No low mailbox limit (designed for up to 50).
 4. **Unified inbox** — aggregate views: All Inboxes, All Unread, All Drafts, All Sent, All Trash. Click a mailbox to expand its folders and switch to its inbox. Unread counts are live.
