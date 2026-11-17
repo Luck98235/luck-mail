@@ -18,7 +18,7 @@ Moving to a new server? See [MIGRATION.md](MIGRATION.md).
 
 1. **Login** — Lockout after 5 failed attempts in 15 minutes. Username is case-insensitive.
 2. **Add mailbox** — Foxmail-style form: email, password, IMAP server + SSL + port, SMTP server + SSL + port, STARTTLS checkbox. Known providers auto-fill servers; unknown domains default to `imap.<domain>` / `smtp.<domain>`. The backend tests IMAP + SMTP connectivity before saving. **IMAP only** — POP3 is fully removed.
-3. **Manage mailboxes** — a popup table: serial number, mailbox, alias (edit inline), sort order (drag to reorder), actions (**test connectivity**, settings, temporarily disable, delete). The **Test** button checks IMAP + SMTP without opening settings. Bottom bar: **+ Add mailbox** and **Export all mailboxes** (downloads a real `.xlsx` with serial, email, authorization code, IMAP/SMTP server + port, alias), count, **OK / Cancel**. No low mailbox limit (designed for up to 50).
+3. **Manage mailboxes** — a popup table: serial number, mailbox, alias (edit inline), sort order (drag to reorder), actions (**test connectivity**, settings, temporarily disable, delete). The **Test** button checks IMAP + SMTP without opening settings. Bottom bar: **+ Add mailbox** and **Export all mailboxes** (downloads a real `.xlsx` with serial, email, authorization code, IMAP/SMTP server + port, alias), count, **OK / Cancel**.
 4. **Unified inbox** — aggregate views: All Inboxes, All Unread, All Drafts, All Sent, All Trash. Click a mailbox to expand its folders and switch to its inbox. Unread counts are live.
 5. **Message list** — sender avatar, sender + time, bold subject, one-line gray snippet, red unread dot before the sender name, pink selected row. Checkboxes on hover (always visible on mobile). **Batch select + batch delete** (up to 200 at a time; trash view = permanent delete, elsewhere = move to trash). While deleting, the button counts down the remaining messages ("Deleting (15)…"), the indicator belongs only to the view where the delete started, and the list stays scrollable (viewing/selecting is locked until it finishes). **Pagination** — 50 per page, with prev/next. Your current view (aggregate or a single mailbox/folder) is restored after a refresh.
 6. **Reading pane** — sanitized HTML rendered in a sandboxed iframe. Hover the sender to copy their email address. A **Translate** button under the sender date translates English bodies to Chinese (free MyMemory service, no key); click again to return to the original. No reply-all / print / more-menu clutter.
@@ -41,10 +41,6 @@ Single Node process + SQLite. No PostgreSQL, Redis, S3 or Elasticsearch. Designe
 
 **How mail flows:** the frontend talks only to the Node backend over one WebSocket (Socket.io). imapflow keeps an IDLE connection per mailbox; on new mail the backend pushes JSON to Vue, which updates unread counts and the list. Deleting a message performs the IMAP operation on the server first (move to trash, or expunge for permanent delete), then updates the local database — client and server stay in sync.
 
-## 163 / Coremail note
-
-NetEase Coremail (163 / 126 / yeah / 188) refuses `SELECT` with `NO SELECT Unsafe Login` unless the client sends the IMAP **ID command (RFC 2971) with quoted field names** (unquoted keys get `BAD Parse command error`). The backend sends it via imapflow. 163 login requires a **client authorization code**, not the web password.
-
 ## Known provider presets
 
 Adding a mailbox auto-fills servers for known providers. A few examples:
@@ -61,7 +57,6 @@ Adding a mailbox auto-fills servers for known providers. A few examples:
 | AOL | aol.com / aim.com | imap.aol.com:993 SSL | smtp.aol.com:465 SSL | App password |
 | Yandex | yandex.com / yandex.ru / ya.ru | imap.yandex.com:993 SSL | smtp.yandex.com:465 SSL | App password, enable IMAP first |
 | Zoho | zoho.com / zohomail.com | imap.zoho.com:993 SSL | smtp.zoho.com:465 SSL | — |
-| Yangtian Machinery | heavycrusher.com | mail.oqumail.com:993 SSL | mail.oqumail.com:587 STARTTLS | — |
 
 Note: ProtonMail has no direct IMAP (requires the local Proton Bridge), so no preset is provided.
 
