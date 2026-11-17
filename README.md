@@ -2,6 +2,8 @@
 
 [中文版](README.zh-CN.md)
 
+![Luck-Mail interface](screenshot.png)
+
 A lightweight, fast, self-hosted webmail for managing many mailboxes in one place.
 One login, one unified inbox, no bloat. Built with **Node.js + Vue 3 + SQLite**.
 

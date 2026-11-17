@@ -2,6 +2,8 @@
 
 [English version](README.md)
 
+![Luck-Mail 界面](screenshot.png)
+
 轻量、快速、自托管的网页邮箱，一个地方管多个邮箱。一个登录、一个统一收件箱，不臃肿。**Node.js + Vue 3 + SQLite**。
 
 - **单用户** — 一个登录账号，没有多用户的复杂性。
