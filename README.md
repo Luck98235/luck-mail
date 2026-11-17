@@ -132,7 +132,7 @@ LICENSE                  # AGPL-3.0
 
 ## Security
 
-- Mailbox passwords (163 authorization codes, app passwords) are encrypted with AES-256-GCM; the key file lives outside the database. Lose the key file and stored passwords cannot be recovered — mailboxes must be re-added.
+- Mailbox passwords (authorization codes, app passwords) are encrypted with AES-256-GCM; the key file lives outside the database. Lose the key file and stored passwords cannot be recovered — mailboxes must be re-added.
 - Login: 5 failed attempts lock the account for 15 minutes. "Remember me for 30 days" uses a rotating token; only its hash is stored.
 - Message bodies are sanitized with DOMPurify and rendered in a sandboxed iframe (`srcdoc`).
 - Deleting a message first performs the IMAP operation on the server, then updates the local database, so a failed server operation never leaves the two out of sync. Permanently deleted messages are recorded in a tombstone table so a sync glitch can never resurrect them.
