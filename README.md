@@ -1,5 +1,7 @@
 # luck-mail — Lightweight Self-Hosted Open-Source Webmail
 
+[![Version](https://img.shields.io/badge/version-v0.1.0-blue)](CHANGELOG.md)
+
 [中文版](README.zh-CN.md)
 
 ![Luck-Mail interface](screenshot.png)

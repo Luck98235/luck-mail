@@ -1,5 +1,7 @@
 # luck-mail — 轻量开源网页邮箱
 
+[![Version](https://img.shields.io/badge/version-v0.1.0-blue)](CHANGELOG.zh-CN.md)
+
 [English version](README.md)
 
 ![Luck-Mail 界面](screenshot.png)
