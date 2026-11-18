@@ -57,8 +57,8 @@ export interface MessageEnvelope {
   isRead: boolean
   hasAttachments: boolean
   size: number
-  /** 本地草稿（契约无存草稿接口，见 mail.ts 说明） */
-  isLocalDraft?: boolean
+  /** 服务端草稿行（GET /api/drafts 来的，不是服务端邮件） */
+  isDraft?: boolean
 }
 
 export interface MessageDetail extends MessageEnvelope {
@@ -93,14 +93,16 @@ export interface ViewState {
   folderId: number | null
 }
 
-/** 本地草稿（localStorage） */
-export interface LocalDraft {
-  id: string
+/** 服务端草稿（GET /api/drafts；2026-11-18 用户定夺：草稿进数据库） */
+export interface Draft {
+  id: number | string
   accountId: number | null
   to: string
   subject: string
   text: string
   updatedAt: string
+  /** 发信幂等键：创建时传或服务端生成；PUT 不改它 */
+  idempotencyKey?: string
 }
 
 /** Socket.io 服务端 → 客户端事件（契约） */

@@ -76,7 +76,7 @@
                   </div>
                   <div class="flex items-center gap-1">
                     <span class="text-sm truncate flex-1" :class="m.isRead ? 'text-slate-700' : 'font-bold text-slate-900'">
-                      {{ m.subject }}<span v-if="m.isLocalDraft" class="text-amber-500 text-xs">（本地草稿）</span>
+                      {{ m.subject }}<span v-if="m.isDraft" class="text-amber-500 text-xs">（草稿）</span>
                     </span>
                     <i v-if="m.hasAttachments" class="fa-solid fa-paperclip text-[10px] text-slate-400 shrink-0" title="附件"></i>
                   </div>
@@ -183,6 +183,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (ro) { ro.disconnect(); ro = null }
+  // 搜索防抖定时器卸载时清理：避免组件已卸载、定时器还触发 setSearch（审计 #5 LOW）。
+  if (timer) { clearTimeout(timer); timer = null }
 })
 
 // 切视图 / 翻页 / 搜索后回到顶部（列表内容换了，停在半截会看错页）
@@ -198,5 +200,16 @@ watch(() => mail.searchQuery, scrollToTop)
 // 靠这次重测量到真实高度；nextTick 等 DOM 落定后再量）。
 watch(() => mail.mailList.length, () => {
   void nextTick(() => measureViewport())
+})
+
+// 新邮件插到顶部时的滚动补偿（审计 #5 LOW）：用户已往下滚时把滚动位置
+// 下移一行高，保持当前可见内容不动；在顶部（scrollTop=0）时不补偿，
+// 新邮件自然出现在视野顶部。nextTick 等虚拟滚动重算后再调位置。
+watch(() => mail.topInsertCount, () => {
+  void nextTick(() => {
+    if (scrollEl.value && scrollEl.value.scrollTop > 0) {
+      scrollEl.value.scrollTop += rowHeight.value
+    }
+  })
 })
 </script>

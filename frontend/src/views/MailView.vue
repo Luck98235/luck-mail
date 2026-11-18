@@ -60,7 +60,7 @@ const settingsOpen = ref<boolean>(false)
 onMounted(() => { void mail.init() })
 onUnmounted(() => { mail.disconnectRealtime(); mail.destroyMobileHistory() })
 
-// 点本地草稿：回填到写信弹窗
+// 点草稿：回填到写信弹窗
 watch(() => mail.composeDraft, (d) => {
   if (!d) return
   composeInitial.value = { to: d.to, subject: d.subject, body: d.text, accountId: d.accountId, draftId: d.id }

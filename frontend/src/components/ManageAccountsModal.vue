@@ -73,7 +73,7 @@
           <button class="px-4 py-2 rounded-md text-sm text-slate-600 hover:bg-slate-100 border border-slate-200 bg-white font-medium disabled:opacity-60" :disabled="importing" @click="importInput?.click()">
             <i class="fa-solid fa-file-import mr-1"></i>{{ importing ? '导入中…' : '导入' }}
           </button>
-          <input ref="importInput" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="hidden" @change="onImportFile" />
+          <input ref="importInput" type="file" accept=".csv,text/csv" class="hidden" @change="onImportFile" />
         </div>
         <div class="flex items-center gap-2">
           <button class="px-4 py-2 rounded-md text-sm text-slate-600 hover:bg-slate-100" @click="close">取消</button>
@@ -246,6 +246,8 @@ async function confirm(): Promise<void> {
 // 导出全部邮箱为 Excel：字段 序号/邮箱名/授权码/IMAP 服务器/IMAP 端口/SMTP 服务器/SMTP 端口/备注。
 async function exportAll(): Promise<void> {
   if (exporting.value || !rows.value.length) return
+  // 导出文件含全部邮箱明文授权码：先弹一次确认，写明风险（审计 #5 安全轨 S11）。
+  if (!await mail.requestConfirm('导出的 Excel 包含全部邮箱的明文授权码，请妥善保存，用后及时删除。确定导出吗？', true)) return
   exporting.value = true
   try {
     const { blob, filename } = await api.exportAccounts()
@@ -260,7 +262,7 @@ async function exportAll(): Promise<void> {
   }
 }
 
-// 下载导入模板：空的 .xlsx，只有表头一行。
+// 下载导入模板：空的 .csv，只有表头一行。
 async function downloadTemplate(): Promise<void> {
   if (downloadingTemplate.value) return
   downloadingTemplate.value = true
@@ -274,7 +276,7 @@ async function downloadTemplate(): Promise<void> {
   }
 }
 
-// 批量导入：选填好的导入模板（.xlsx）上传；同名邮箱跳过。
+// 批量导入：选填好的导入模板（.csv）上传；同名邮箱跳过。
 async function onImportFile(ev: Event): Promise<void> {
   const input = ev.target as HTMLInputElement
   const file = input.files?.[0]

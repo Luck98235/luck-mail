@@ -128,7 +128,8 @@ export function accountRoutes(ctx: Ctx): express.Router {
   // 导出全部邮箱为 Excel（.xlsx）：字段 序号 / 邮箱名 / 授权码 / 接收服务器（IMAP）/
   // IMAP 端口 / 发送服务器（SMTP）/ SMTP 端口 / 备注，按当前排序导出。授权码为明文，
   // 文件请妥善保存。须登录。
-  r.get('/accounts/export', async (_req: Request, res: Response) => {
+  // S1: 只接受 POST（同 /api/backup/download，防跨站顶层导航 CSRF 下载）。
+  r.post('/accounts/export', async (_req: Request, res: Response) => {
     const db = getDb();
     const rows = db.prepare('SELECT * FROM accounts ORDER BY sort_order, id').all() as AccountRow[];
     const wb = new ExcelJS.Workbook();
@@ -157,55 +158,89 @@ export function accountRoutes(ctx: Ctx): express.Router {
     res.send(Buffer.from(buf));
   });
 
-  // 导入模板：空的 .xlsx，只有表头一行（与导出相同的 8 列），供用户填好后导入。
-  // 须登录。
-  r.get('/accounts/import-template', async (_req: Request, res: Response) => {
-    const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet('邮箱');
-    ws.columns = ACCOUNT_EXCEL_COLUMNS;
-    ws.getRow(1).font = { bold: true };
-    const buf = await wb.xlsx.writeBuffer();
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="luck-mail-import-template.xlsx"');
-    res.send(Buffer.from(buf));
+  // 导入模板：空的 CSV，只有表头一行（与导出相同的 8 列），供用户填好后导入。
+  // 须登录。带 UTF-8 BOM，Excel 打开中文表头不乱码。
+  r.get('/accounts/import-template', (_req: Request, res: Response) => {
+    const header = '序号,邮箱名,授权码,接收服务器（IMAP）,IMAP端口,发送服务器（SMTP）,SMTP端口,备注';
+    const csv = '\uFEFF' + header + '\r\n';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="luck-mail-import-template.csv"');
+    res.send(csv);
   });
 
-  // 批量导入邮箱：上传填好的导入模板（.xlsx），按行读出邮箱信息逐个添加。
+  // CSV 解析（轻量自写，不引新依赖）：处理引号字段、字段内逗号、
+  // 字段内换行、UTF-8 BOM、CRLF。引号字段内 "" 转义为一个 "。
+  // 返回行数组（每行是 string[]）；引号未闭合等不合规处按宽容处理
+  // （字段结束），不让一份手填文件整体失败。
+  function parseCsv(text: string): string[][] {
+    const rows: string[][] = [];
+    let row: string[] = [];
+    let field = '';
+    let inQuotes = false;
+    let i = text.charCodeAt(0) === 0xfeff ? 1 : 0; // 去 UTF-8 BOM
+    for (; i < text.length; i++) {
+      const ch = text[i];
+      if (inQuotes) {
+        if (ch === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else inQuotes = false;
+        } else field += ch;
+      } else if (ch === '"') {
+        // 字段开头的引号进入引号模式；字段中间的引号按普通字符处理。
+        if (field.length === 0) inQuotes = true;
+        else field += ch;
+      } else if (ch === ',') {
+        row.push(field); field = '';
+      } else if (ch === '\n') {
+        row.push(field); field = '';
+        rows.push(row); row = [];
+      } else if (ch === '\r') {
+        // CRLF 的 \r：后面是 \n 时跳过（\n 分支会收行）；单独 \r 也当换行。
+        if (text[i + 1] === '\n') continue;
+        row.push(field); field = '';
+        rows.push(row); row = [];
+      } else field += ch;
+    }
+    // 末尾残留字段/行（无结尾换行时）。
+    if (field.length > 0 || row.length > 0 || inQuotes) {
+      row.push(field);
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  // 批量导入邮箱：上传填好的导入模板（.csv），按行读出邮箱信息逐个添加。
   // 同名邮箱（不区分大小写）跳过，不报错；空行跳过；格式不对或服务器信息不全的行
   // 记入 failed，不中断其余行。导入时不做连通测试（批量测太慢），加完后可用管理
   // 列表每行的“测试”按钮逐个测。服务器地址/端口留空时按域名自动取预设，取不到则失败。
-  // 须登录；文件限 5MB。
+  // 须登录；文件限 5MB。exceljs 只留给导出（只写不读），导入不再解析 xlsx。
   const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
   r.post('/accounts/import', importUpload.single('file'), async (req: Request, res: Response) => {
     const db = getDb();
     const f = (req as Request & { file?: Express.Multer.File }).file;
-    if (!f || !f.buffer) return res.status(400).json({ ok: false, error: '请选择要导入的 Excel 文件' });
-    let wb: ExcelJS.Workbook;
-    try {
-      wb = new ExcelJS.Workbook();
-      // ExcelJS 自带的 Buffer 类型是旧版 @types/node 的，与 Node 22 的 Buffer
-      // 在 Symbol.toStringTag 上对不上（纯类型问题，运行时本来就能读），这里转一下。
-      await wb.xlsx.load(f.buffer as unknown as Parameters<ExcelJS.Workbook['xlsx']['load']>[0]);
-    } catch {
-      return res.status(400).json({ ok: false, error: '文件不是有效的 Excel（.xlsx），请用下载的导入模板填写' });
+    if (!f || !f.buffer) return res.status(400).json({ ok: false, error: '请选择要导入的 CSV 文件' });
+    // 旧模板是 .xlsx（ZIP）：直接报清楚，别让用户对着乱码排查。
+    if (f.buffer.length >= 4 && f.buffer[0] === 0x50 && f.buffer[1] === 0x4b && f.buffer[2] === 0x03 && f.buffer[3] === 0x04) {
+      return res.status(400).json({ ok: false, error: '请上传 CSV 文件（.csv），不是 Excel（.xlsx）；请用“下载导入模板”拿新模板' });
     }
-    const ws = wb.worksheets[0];
-    if (!ws) return res.status(400).json({ ok: false, error: 'Excel 里没有工作表' });
-    // 列顺序与导入模板一致：A 序号（忽略），B 邮箱名，C 授权码，D IMAP 服务器，
-    // E IMAP 端口，F SMTP 服务器，G SMTP 端口，H 备注。第 1 行是表头。
+    const rows = parseCsv(f.buffer.toString('utf8'));
+    if (!rows.length) return res.status(400).json({ ok: false, error: 'CSV 文件是空的，请用下载的导入模板填写' });
     const added: string[] = [];
     const skipped: string[] = [];
     const failed: { row: number; email: string; reason: string }[] = [];
     const seenInFile = new Set<string>();
-    ws.eachRow({ includeEmpty: false }, (row, rnum) => {
+    // 列顺序与导入模板一致：0 序号（忽略），1 邮箱名，2 授权码，3 IMAP 服务器，
+    // 4 IMAP 端口，5 SMTP 服务器，6 SMTP 端口，7 备注。第 1 行是表头。
+    rows.forEach((cols, idx) => {
+      const rnum = idx + 1;
       if (rnum === 1) return;
-      const email = String(row.getCell(2).value ?? '').trim().toLowerCase();
-      const password = String(row.getCell(3).value ?? '').trim();
-      const imapHost = String(row.getCell(4).value ?? '').trim();
-      const imapPortRaw = row.getCell(5).value;
-      const smtpHost = String(row.getCell(6).value ?? '').trim();
-      const smtpPortRaw = row.getCell(7).value;
-      const displayName = String(row.getCell(8).value ?? '').trim();
+      const email = String(cols[1] ?? '').trim().toLowerCase();
+      const password = String(cols[2] ?? '').trim();
+      const imapHost = String(cols[3] ?? '').trim();
+      const imapPortRaw = cols[4];
+      const smtpHost = String(cols[5] ?? '').trim();
+      const smtpPortRaw = cols[6];
+      const displayName = String(cols[7] ?? '').trim();
       if (!email) return;
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         failed.push({ row: rnum, email, reason: '邮箱地址格式不正确' });

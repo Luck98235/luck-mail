@@ -21,7 +21,8 @@ each mail server, message metadata (subject, sender, recipients, date, snippet,
 read state, UID, Message-ID), attachment metadata (name, size, type, IMAP part
 number — content is **not** stored), per-folder sync state, tombstones of
 permanently deleted messages (so a deleted mail never comes back), settings
-(signature, default account), the full-text search index (FTS5) and login sessions.
+(signature, default account), drafts (with idempotency keys), the full-text
+search index (FTS5) and login sessions.
 
 The code itself is this repository — it does **not** need a separate backup.
 Re-deploy it from GitHub on the new server.
@@ -46,16 +47,15 @@ useless for the mailbox passwords:
 
 ## What does NOT migrate
 
-- **Local drafts** — stored in the browser's `localStorage`, per browser. They
-  stay in the browser they were written in; a new server does not move them.
 - **Theme preference** — also browser `localStorage`.
 - **Login sessions** — log in again after the migration.
 - **TLS certificate** — re-issue it on the new server (Let's Encrypt).
 
 ## Backup (on the old server)
 
-Stop the service first so the SQLite database is in a consistent state, then
-make one tarball containing **both** the key and the data directory:
+Preferred: use the in-app **Backup to local** button (Settings), which downloads a tarball of `.key` + `data/` via `POST /api/backup/download` — it uses a consistent database snapshot (`db.backup()`), so the service does **not** need to stop.
+
+Manual method (if the web UI is unavailable): stop the service first so the SQLite database is in a consistent state, then make one tarball containing **both** the key and the data directory:
 
 ```bash
 sudo systemctl stop luck-mail
@@ -64,9 +64,7 @@ sudo tar -czf luck-mail-backup-$(date +%Y%m%d).tar.gz -C /opt/luck-mail .key dat
 scp luck-mail-backup-*.tar.gz root@<new-server>:/tmp/
 ```
 
-The whole data directory is small (5.5 MB as of 2026-11-17 — reference value — with 27 mailboxes
-and 374 messages), so a daily tarball is cheap. Keep backups **off** the same
-server.
+The whole data directory is small (7.8 MB as of 2026-11-18 — reference value — with 27 mailboxes and 228 messages: DB 1.7 MB + WAL 4.1 MB + bodies 1.6 MB + attachments 556 KB), so a daily tarball is cheap. Keep backups **off** the same server.
 
 ## Migration steps (on the new server)
 
@@ -79,11 +77,14 @@ server.
 ### 2. Get the code
 
 ```bash
-git clone https://github.com/Luck98235/luck-mail   # private repo
+git clone https://github.com/Luck98235/luck-mail   # private repo, needs authentication
 cd luck-mail/backend && npm ci && npm run build
 cd ../frontend && npm ci && npm run build
-# then copy the built backend (incl. dist/ and frontend dist/ as public/) to /opt/luck-mail/backend
+cp -r dist ../backend/public   # the backend serves the built frontend from public/
+# then copy the built backend to /opt/luck-mail/backend
 ```
+
+Use `npm ci` here (clean, reproducible install from `package-lock.json`); `npm install` is for local development when adding or updating dependencies.
 
 Or copy `/opt/luck-mail/backend` from the old server as-is.
 
@@ -137,6 +138,12 @@ sudo systemctl status luck-mail   # should be active
 Proxy `/` (and `/socket.io/` with the `Upgrade` header for WebSocket) to
 `127.0.0.1:8080`, with `proxy_read_timeout 120s` and `client_max_body_size 25m`.
 Issue a Let's Encrypt certificate for the domain and redirect HTTP to HTTPS.
+
+Certificate auto-renewal: `/opt/acme/renew.sh` runs daily at 03:30 via cron; it
+renews the Let's Encrypt certificate (ACME challenge via webroot) and reloads
+the `1Panel-openresty` container (the reverse proxy) so the new certificate
+takes effect. Check `/opt/acme/renew.log` for the last run and the next renewal
+date.
 
 ### 6. Verify
 

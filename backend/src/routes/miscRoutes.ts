@@ -36,7 +36,14 @@ export function miscRoutes(): express.Router {
          ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
       ).run(k, String(v ?? ''));
     };
-    if (b.signature !== undefined) put('signature', String(b.signature));
+    if (b.signature !== undefined) {
+      // D10: 签名长度上限 10000 字符——旧版无上限（实际风险极低，
+      // 1MB JSON 上限兜着），加个明确上限防误操作塞巨量文本。
+      if (typeof b.signature === 'string' && b.signature.length > 10000) {
+        return res.status(400).json({ ok: false, error: '签名过长（最多 10000 字符）' });
+      }
+      put('signature', String(b.signature));
+    }
     if (b.defaultAccountId !== undefined) {
       const v = b.defaultAccountId === null || b.defaultAccountId === '' ? '' : String(Number(b.defaultAccountId));
       put('defaultAccountId', v);
@@ -55,7 +62,9 @@ export function miscRoutes(): express.Router {
   // 包内结构与迁移说明一致（.key + data/），解压到新服务器的 /opt/luck-mail 即可恢复。
   // 数据库用 better-sqlite3 在线备份做一致性快照（含 WAL 已提交数据），不直接拷正在用的库文件；
   // 正文与附件缓存是静态文件，直接拷。路由在 /api 下，已有 requireAuth（仅登录用户可下）。
-  r.get('/backup/download', async (_req: Request, res: Response) => {
+  // S1: 只接受 POST——GET 可被跨站顶层导航触发（SameSite=Lax 不挡顶层
+  // 导航 GET），登录状态下点一条恶意链接就会把含主密钥的备份种进下载目录。
+  r.post('/backup/download', async (_req: Request, res: Response) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'luck-mail-backup-'));
     try {
       fs.copyFileSync(KEY_FILE, path.join(tmp, '.key'));

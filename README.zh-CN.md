@@ -39,7 +39,7 @@
 | 后端 | Node 22 + Express + TypeScript（strict）+ Socket.io + better-sqlite3 |
 | 邮件 | imapflow（IDLE + 增量同步）+ Nodemailer（发信）+ mailparser（流式解析） |
 | 前端 | Vue 3 + Vite + TypeScript（strict）+ Pinia + Tailwind + socket.io-client |
-| 存储 | SQLite（WAL + FTS5 trigram）；消毒后的 HTML 正文存文件；附件只记元信息，下载时从 IMAP 实时取，不落盘 |
+| 存储 | SQLite（WAL + FTS5 trigram）；消毒后的 HTML 正文存文件；附件只记元信息，下载时从 IMAP 实时取，不落盘（2026-11-17 10:51 之前已缓存到磁盘的旧文件除外，保留在原处） |
 | 安全 | AES-256-GCM 邮箱密码加密；DOMPurify + JSDOM 消毒；沙盒 iframe（srcdoc）渲染正文 |
 
 **邮件怎么走：** 前端只跟 Node 后端建一个 WebSocket（Socket.io），不直连 IMAP。imapflow 给每个邮箱保持一条 IDLE 长连接；收到新邮件时后端经 WebSocket 推 JSON 给 Vue，更新未读数和列表。删信时先在服务器上做 IMAP 操作（移入已删除，或彻底删除时清掉），再改本地数据库——客户端和服务器始终一致。
@@ -92,6 +92,14 @@ PORT=8080 DATA_DIR=/path/to/data PUBLIC_DIR=backend/public KEY_FILE=/path/to/.ke
 
 数据在 `DATA_DIR` 里（`luck-mail.db` + `bodies/` + `attachments/`）。**升级前先备份这个目录。**
 
+## 部署
+
+生产环境用 systemd 服务 + 反向代理跑：
+
+- 服务：`luck-mail.service`，`node backend/dist/server.js`，监听 `127.0.0.1:8080`（`Restart=always`）。先构建：`cd backend && npm run build`，再 `cd ../frontend && npm run build`，把 `frontend/dist/` 拷到 `backend/public/`（后端从 `PUBLIC_DIR` 提供前端文件）。
+- 反向代理：把 `/` 和 `/socket.io/`（带 `Upgrade` 头走 WebSocket）反代到 `127.0.0.1:8080`，`proxy_read_timeout 120s`，`client_max_body_size 25m`。给域名签发 Let's Encrypt 证书，HTTP 跳转 HTTPS。证书自动续期见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)。
+- 备份：`.key` + `data/` 一起、每天、存到服务器之外（见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。站内**备份到本地**按钮不用停服务就能下载同一份包。
+
 ## 目录结构
 
 ```
@@ -123,7 +131,21 @@ LICENSE                  # AGPL-3.0
 - 登录：5 次失败锁定 15 分钟。“30 天内免登录”用轮换 token，只存 token 的哈希。
 - 邮件正文经 DOMPurify 消毒，在沙盒 iframe（`srcdoc`）里渲染。
 - 删信先在服务器上做 IMAP 操作、再改本地数据库，服务器删失败时本地不动，两边不会不一致。彻底删除的信记入墓碑表，同步抖动也不会把它复活回来。
-- 加邮箱时，解析到内网 / 保留地址的主机名会被拒绝。
+
+## 排障
+
+- 服务状态：`systemctl status luck-mail`；日志：`journalctl -u luck-mail -f`。
+- 健康检查：`GET /api/health`，服务正常时返回 `{ok:true}`（不用登录）。
+- 登不上：先看是不是 5 次失败锁定了 15 分钟，用户名不要带邮箱后缀；登录密码是登录密码，不是邮箱授权码。
+- 某邮箱显示离线/异常：进**邮箱管理 → 测试**测该邮箱，IMAP/SMTP 哪一步失败会直接显示。QQ 邮箱不推 IDLE 新邮件通知，新邮件最长 5 分钟才出现（5 分钟兜底轮询）。
+- 同步像卡住了：点刷新按钮（桌面端顶栏 / 手机端账号总览页）；看 `journalctl -u luck-mail` 里有没有同步报错。
+
+## 已知限制
+
+- 规模：最多 50 个邮箱，单 Node 进程 + SQLite。
+- QQ 邮箱 IMAP IDLE 不推新邮件通知，靠 5 分钟兜底轮询，新邮件最长 5 分钟才显示。
+- 删信后列表约 5–6 秒才反映变化（异步批量删除）。
+- TLS 证书要续期（Let's Encrypt，cron 自动续期，见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。
 
 ## 开发
 

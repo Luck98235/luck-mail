@@ -40,7 +40,7 @@ Single Node process + SQLite. No PostgreSQL, Redis, S3 or Elasticsearch.
 | Backend | Node 22 + Express + TypeScript (strict) + Socket.io + better-sqlite3 |
 | Mail | imapflow (IDLE + incremental sync) + Nodemailer (send) + mailparser (streaming parse) |
 | Frontend | Vue 3 + Vite + TypeScript (strict) + Pinia + Tailwind + socket.io-client |
-| Storage | SQLite (WAL + FTS5 trigram); sanitized HTML bodies as files; attachments are metadata-only — content is streamed live from IMAP on download, never stored on disk |
+| Storage | SQLite (WAL + FTS5 trigram); sanitized HTML bodies as files; attachments are metadata-only — content is streamed live from IMAP on download, not stored on disk (except files cached before 2026-11-17 10:51, which stay where they are) |
 | Security | AES-256-GCM mailbox password encryption; DOMPurify + JSDOM sanitization; sandboxed iframe (srcdoc) for bodies |
 
 **How mail flows:** the frontend talks only to the Node backend over one WebSocket (Socket.io). imapflow keeps an IDLE connection per mailbox; on new mail the backend pushes JSON to Vue, which updates unread counts and the list. Deleting a message performs the IMAP operation on the server first (move to trash, or expunge for permanent delete), then updates the local database — client and server stay in sync.
@@ -93,6 +93,14 @@ Environment variables:
 
 Data lives in `DATA_DIR` (`luck-mail.db` + `bodies/` + `attachments/`). **Back up this directory before upgrading.**
 
+## Deploy
+
+Production runs as a systemd service behind a reverse proxy:
+
+- Service: `luck-mail.service` — `node backend/dist/server.js` on `127.0.0.1:8080` (`Restart=always`). Build first: `cd backend && npm run build`, then `cd ../frontend && npm run build` and copy `frontend/dist/` to `backend/public/` (the backend serves the frontend from `PUBLIC_DIR`).
+- Reverse proxy: proxy `/` and `/socket.io/` (with the `Upgrade` header for WebSocket) to `127.0.0.1:8080`, `proxy_read_timeout 120s`, `client_max_body_size 25m`. Issue a Let's Encrypt certificate and redirect HTTP to HTTPS. Certificate auto-renewal: see [MIGRATION.md](MIGRATION.md).
+- Backups: back up `.key` + `data/` together, daily, off the server (see [MIGRATION.md](MIGRATION.md)). The in-app **Backup to local** button downloads the same tarball without stopping the service.
+
 ## Project structure
 
 ```
@@ -124,7 +132,21 @@ LICENSE                  # AGPL-3.0
 - Login: 5 failed attempts lock the account for 15 minutes. "Remember me for 30 days" uses a rotating token; only its hash is stored.
 - Message bodies are sanitized with DOMPurify and rendered in a sandboxed iframe (`srcdoc`).
 - Deleting a message first performs the IMAP operation on the server, then updates the local database, so a failed server operation never leaves the two out of sync. Permanently deleted messages are recorded in a tombstone table so a sync glitch can never resurrect them.
-- Adding a mailbox rejects hostnames that resolve to private/reserved addresses.
+
+## Troubleshooting
+
+- Service status: `systemctl status luck-mail`; logs: `journalctl -u luck-mail -f`.
+- Health check: `GET /api/health` → `{ok:true}` when the server is up (no login required).
+- Cannot log in: check the 5-failure lockout (15 minutes) and that the username has no email suffix; the password is the login password, not a mailbox authorization code.
+- A mailbox shows offline/error: open **Manage mailboxes → Test** for that mailbox; IMAP/SMTP errors are shown there. QQ Mail does not push IDLE notifications, so new mail can take up to 5 minutes to appear (periodic sync fallback).
+- Sync seems stuck: use the refresh button (desktop header / mobile account overview); check `journalctl -u luck-mail` for sync errors.
+
+## Known limitations
+
+- Scale: up to 50 mailboxes; single Node process + SQLite.
+- QQ Mail IMAP IDLE does not push new-mail notifications; a 5-minute periodic sync is the fallback, so new QQ mail can take up to 5 minutes to show.
+- After deleting mail, the list can take about 5–6 seconds to reflect the change (async batch delete).
+- TLS certificates must be renewed (Let's Encrypt, auto-renewal via cron — see [MIGRATION.md](MIGRATION.md)).
 
 ## Development
 

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   PORT, DATA_DIR, PUBLIC_DIR, initStorage, log, SESSION_COOKIE,
 } from './config.js';
-import { openDb, closeDb } from './db.js';
+import { openDb, closeDb, pruneExpiredRows, getDb } from './db.js';
 import { lookupSession, requireAuth } from './auth.js';
 import { SyncEngine } from './engine.js';
 import { attachIo } from './hub.js';
@@ -17,22 +17,55 @@ import { accountRoutes } from './routes/accountRoutes.js';
 import type { Ctx } from './routes/accountRoutes.js';
 import { messageRoutes } from './routes/messageRoutes.js';
 import { miscRoutes } from './routes/miscRoutes.js';
+import { draftRoutes } from './routes/draftRoutes.js';
 
 const masterKey = initStorage();
 openDb();
+// 启动时一次性清理：已过期会话 + 180 天以上的删除墓碑（S2/D5/L6）。
+pruneExpiredRows();
 const engine = new SyncEngine(masterKey);
 const ctx: Ctx = { engine, masterKey };
 
 const app = express();
+// S4: 信任本机回环反代的 X-Forwarded-For——不设时 req.ip 恒为 127.0.0.1，
+// IP 锁定变成全局锁定（任何人对不存在的用户名连错 5 次就锁全站登录）。
+app.set('trust proxy', 'loopback');
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.disable('x-powered-by');
+// D2: 基础安全响应头（HSTS 由 OpenResty 层加，这里只加应用层能管的；
+// CSP 不加——Vite 构建产物含内联样式/脚本，收紧的 CSP 未经浏览器
+// 验证有误伤风险，见报告）。
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  next();
+});
 
 // All API responses are JSON; never leak a stack trace to the client.
+// D1: /api 一律 no-store——/api/accounts/:id/password 的明文密码 JSON
+// 等敏感响应不能被浏览器启发式缓存落盘。
 app.use('/api', (_req, res, next) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
   next();
+});
+
+// 健康检查（部署轨第 8 项）：轻量状态，不需登录，供监控/探活。
+// 注意它挂在 requireAuth 之前，否则探活请求会被 401 挡住。
+app.get('/api/health', (_req, res) => {
+  try {
+    const db = getDb();
+    db.prepare('SELECT 1').get();
+    const online = (db.prepare(
+      "SELECT COUNT(*) c FROM accounts WHERE enabled=1 AND status='online'",
+    ).get() as { c: number }).c;
+    res.json({ ok: true, db: 'ok', accountsOnline: online });
+  } catch {
+    res.status(500).json({ ok: false, db: 'error', accountsOnline: 0 });
+  }
 });
 
 // Auth: only /api/auth/status, /api/auth/setup, /api/auth/login are public;
@@ -42,6 +75,7 @@ app.use('/api', requireAuth);
 app.use('/api', accountRoutes(ctx));
 app.use('/api', messageRoutes(ctx));
 app.use('/api', miscRoutes());
+app.use('/api', draftRoutes());
 
 // ---- Static frontend (Vite dist in PUBLIC_DIR; placeholder if absent) ----
 const indexHtml = path.join(PUBLIC_DIR, 'index.html');
@@ -118,8 +152,10 @@ async function main(): Promise<void> {
   // Start the sync engine (enabled accounts connect + IDLE).
   engine.startAll();
 
-  server.listen(PORT, () => {
-    log(`luck-mail backend listening on :${PORT} (DATA_DIR=${DATA_DIR})`);
+  // D3: 只监听回环——OpenResty 在本机反代，8080 不需要对外暴露。
+  // （之前 server.listen(PORT) 绑 0.0.0.0，靠云防火墙挡着才没暴露。）
+  server.listen(PORT, '127.0.0.1', () => {
+    log(`luck-mail backend listening on 127.0.0.1:${PORT} (DATA_DIR=${DATA_DIR})`);
   });
 
   const shutdown = (): void => {
@@ -130,7 +166,9 @@ async function main(): Promise<void> {
       closeDb();
       process.exit(0);
     });
-    setTimeout(() => process.exit(1), 5000).unref();
+    // L8: 关机宽限从 5 秒提到 30 秒——部署重启时 5 秒会直接砍掉
+    // 进行中的发信（systemd 默认 TimeoutStopSec 90 秒，30 秒安全）。
+    setTimeout(() => process.exit(1), 30000).unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

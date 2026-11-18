@@ -1,6 +1,6 @@
 // API 层：按 API_CONTRACT.md 封装。默认同源（Node 后端 serve dist + /api/*）。
 // 本地开发可用 VITE_API_BASE_URL 指向后端（见 vite.config.ts 的 dev proxy）。
-import type { Account, Folder, MessageDetail, MessageEnvelope, Preset, Settings } from './types'
+import type { Account, Draft, Folder, MessageDetail, MessageEnvelope, Preset, Settings } from './types'
 
 const BASE: string = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -21,21 +21,28 @@ interface RequestOptions {
   // 单次请求超时（毫秒），不传默认 30000；refresh-all 等后端要等
   // 全量同步的接口按调用方传更宽的值（见 refreshAll）。
   timeoutMs?: number
+  // 超时报错文案：不传用默认“请求超时，请重试”；发信超时要提示
+  // “可能已发出”，由调用方传（见 sendMessage/sendMessageJson）。
+  timeoutMessage?: string
 }
 
-// 登录态过期（401）：把 auth 置为未登录并跳回登录页。动态 import 避免循环依赖
-//（api 被 auth store 与 router 引用，静态 import 会成环；调用时模块早已加载完）。
+// 401 跳登录去重：多个请求同时 401 时只跳一次（以前并发 replace('/login')
+// 会触发两次导航，vue-router 报重复导航；无害但 noisy）。
+let loginRedirect: Promise<unknown> | null = null
 async function handleUnauthorized(): Promise<void> {
   try {
     const [{ useAuthStore }, routerModule] = await Promise.all([import('./stores/auth'), import('./router')])
     const auth = useAuthStore()
     auth.loggedIn = false
     const router = routerModule.default
-    if (router.currentRoute.value.path !== '/login') await router.replace('/login')
+    if (router.currentRoute.value.path !== '/login') {
+      if (!loginRedirect) loginRedirect = router.replace('/login').finally(() => { loginRedirect = null })
+      await loginRedirect
+    }
   } catch { /* 跳转失败也不影响本次请求的报错 */ }
 }
 
-async function request<T>(path: string, { method = 'GET', body, isForm = false, timeoutMs = 30000 }: RequestOptions = {}): Promise<T> {
+async function request<T>(path: string, { method = 'GET', body, isForm = false, timeoutMs = 30000, timeoutMessage }: RequestOptions = {}): Promise<T> {
   // 超时：挂起的请求不再无限等，超时按“请重试”报错。
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -57,7 +64,7 @@ async function request<T>(path: string, { method = 'GET', body, isForm = false, 
     }
     return (data ?? {}) as T
   } catch (e) {
-    if (e instanceof Error && e.name === 'AbortError') throw new ApiError(0, '请求超时，请重试', null)
+    if (e instanceof Error && e.name === 'AbortError') throw new ApiError(0, timeoutMessage || '请求超时，请重试', null)
     throw e
   } finally {
     clearTimeout(timer)
@@ -65,11 +72,13 @@ async function request<T>(path: string, { method = 'GET', body, isForm = false, 
 }
 
 // 三个文件下载共用：30 秒超时 + 统一的报错与文件名解析。
-async function downloadBlobFile(path: string, failLabel: string, defaultFilename: string): Promise<{ blob: Blob; filename: string }> {
+// method：备份与导出走 POST（防跨站顶层导航 CSRF 触发下载，后端只接受 POST）；
+// 导入模板仍走 GET。
+async function downloadBlobFile(path: string, failLabel: string, defaultFilename: string, method: 'GET' | 'POST' = 'GET'): Promise<{ blob: Blob; filename: string }> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 30000)
   try {
-    const res = await fetch(BASE + path, { credentials: 'include', signal: controller.signal })
+    const res = await fetch(BASE + path, { method, credentials: 'include', signal: controller.signal })
     if (!res.ok) {
       let msg = `${failLabel}失败（HTTP ${res.status}）`
       try { const data = await res.json() as { error?: string }; if (data?.error) msg = data.error } catch { /* 非 JSON 报错就用默认文案 */ }
@@ -95,8 +104,8 @@ export const api = {
   authStatus: () => request<AuthStatus>('/api/auth/status'),
   setup: (username: string, password: string, confirm: string) =>
     request<{ ok: boolean }>('/api/auth/setup', { method: 'POST', body: { username, password, confirm } }),
-  login: (username: string, password: string) =>
-    request<{ ok: boolean; username: string }>('/api/auth/login', { method: 'POST', body: { username, password } }),
+  login: (username: string, password: string, rememberMe?: boolean) =>
+    request<{ ok: boolean; username: string }>('/api/auth/login', { method: 'POST', body: { username, password, rememberMe } }),
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
   changePassword: (current: string, next: string) =>
     request<{ ok: boolean }>('/api/auth/change-password', { method: 'POST', body: { current, next } }),
@@ -152,36 +161,52 @@ export const api = {
   // 客户端 permanent 查询参数已废弃（后端已忽略），不再发（F12c）。
   deleteMessage: (id: number | string) =>
     request<{ ok: boolean }>(`/api/messages/${id}`, { method: 'DELETE' }),
-  // 批量删除：后端可能同步返回（{ deleted, failed }），也可能异步返回
-  //（{ taskId, status:'running' }，进度走 getDeleteStatus）；调用方须同时兼容。
-  batchDeleteMessages: (ids: Array<number | string>, permanent = false, view?: { kind: string; accountId: number | null; folderId: number | null }) =>
-    request<{ ok: boolean; deleted?: number[]; failed?: Array<{ id: number; error: string }>; taskId?: string; status?: string }>('/api/messages/batch-delete', { method: 'POST', body: { ids, permanent, view } }),
+  // 批量删除：后端永远异步返回 { ok, taskId, status:'running' }，
+  // 进度走 getDeleteStatus；请求体不带 permanent（彻底与否以后端实际
+  // 文件夹为准，后端忽略该字段）。同步返回分支仅作防御兼容。
+  batchDeleteMessages: (ids: Array<number | string>, view?: { kind: string; accountId: number | null; folderId: number | null }) =>
+    request<{ ok: boolean; deleted?: number[]; failed?: Array<{ id: number; error: string }>; taskId?: string; status?: string }>('/api/messages/batch-delete', { method: 'POST', body: { ids, view } }),
   // 批量删除任务状态：刷新/切页回来后查它，任务未完成时继续显示“删除中…”。
   // view 是发起删除的视图（后端记的），刷新后靠它只在该视图显示删除中。
   // taskId（可选）：本会话发起的异步任务传自己的 taskId，避免两标签页
   // 同时批量删除时轮询到对方的任务；不传时后端返回最近一个任务（兼容）。
+  // deleted 为数字计数（已删封数）；failed 为失败明细；finishedAt 为完成时间。
   getDeleteStatus: (taskId?: string) =>
-    request<{ ok: boolean; running: boolean; total: number; deleted: number; startedAt: number; view: { kind: string; accountId: number | null; folderId: number | null } | null }>(taskId ? `/api/messages/delete-status?taskId=${encodeURIComponent(taskId)}` : '/api/messages/delete-status'),
+    request<{ ok: boolean; running: boolean; total: number; deleted: number; startedAt: number; view: { kind: string; accountId: number | null; folderId: number | null } | null; taskId?: string; failed?: Array<{ id: number; error: string }>; finishedAt?: string }>(taskId ? `/api/messages/delete-status?taskId=${encodeURIComponent(taskId)}` : '/api/messages/delete-status'),
   // 正文翻译：英文 → 中文（后端调免费翻译接口），返回译文纯文本。
   translateMessage: (id: number | string) =>
     request<{ ok: boolean; translated: string; alreadyChinese: boolean }>(`/api/messages/${id}/translate`, { method: 'POST' }),
   // 发信返回：id 是本地已发送记录 id（有则前端据此打开）；
   // rejected 是被收件方服务器拒收的收件人；warning 表示已发出但未存入已发送文件夹。
+  // 超时 120 秒：后端一次发信可能耗时 50 秒以上（SMTP 超时 15+15+30 秒 +
+  // 4xx 重试 5 秒 + APPEND），30 秒会误报失败；超时文案提示“可能已发出”，
+  // 让用户先去已发送核对再重发，避免重复发信（审计 #5）。
   sendMessage: (formData: FormData) =>
-    request<{ ok: boolean; id: number; messageId: string; rejected?: string[]; warning?: string }>('/api/messages/send', { method: 'POST', body: formData, isForm: true }),
+    request<{ ok: boolean; id: number; messageId: string; rejected?: string[]; warning?: string }>('/api/messages/send', { method: 'POST', body: formData, isForm: true, timeoutMs: 120000, timeoutMessage: '发送超时，邮件可能已发出，请先到已发送查看再重发' }),
   sendMessageJson: (payload: Record<string, unknown>) =>
-    request<{ ok: boolean; id: number; messageId: string; rejected?: string[]; warning?: string }>('/api/messages/send', { method: 'POST', body: payload }),
+    request<{ ok: boolean; id: number; messageId: string; rejected?: string[]; warning?: string }>('/api/messages/send', { method: 'POST', body: payload, timeoutMs: 120000, timeoutMessage: '发送超时，邮件可能已发出，请先到已发送查看再重发' }),
+  // 草稿（服务端，2026-11-18 用户定夺：草稿进数据库，不再写 localStorage）
+  listDrafts: () => request<{ ok: boolean; drafts: Draft[] }>('/api/drafts'),
+  createDraft: (payload: { accountId: number | null; to: string; subject: string; text: string; idempotencyKey?: string }) =>
+    request<{ ok: boolean; draft: Draft }>('/api/drafts', { method: 'POST', body: payload }),
+  updateDraft: (id: number | string, payload: { accountId?: number | null; to?: string; subject?: string; text?: string }) =>
+    request<{ ok: boolean; draft: Draft }>(`/api/drafts/${encodeURIComponent(String(id))}`, { method: 'PUT', body: payload }),
+  deleteDraft: (id: number | string) =>
+    request<{ ok: boolean }>(`/api/drafts/${encodeURIComponent(String(id))}`, { method: 'DELETE' }),
+
   // 设置
   settings: () => request<{ ok: boolean; settings: Settings }>('/api/settings'),
   updateSettings: (payload: Settings) => request<{ ok: boolean }>('/api/settings', { method: 'PUT', body: payload }),
 
   // 备份到本地：下载 tar.gz（.key + data/），文件名从 Content-Disposition 取。
   // 文件下载走 blob，不走 request()（那是 JSON 的）。
-  downloadBackup: () => downloadBlobFile('/api/backup/download', '备份', 'luck-mail-backup.tar.gz'),
+  // POST：后端只接受 POST（防跨站顶层导航 CSRF 触发下载，审计 #5 安全轨 S1）。
+  downloadBackup: () => downloadBlobFile('/api/backup/download', '备份', 'luck-mail-backup.tar.gz', 'POST'),
   // 导出全部邮箱为 Excel（.xlsx）：文件名从 Content-Disposition 取。
-  exportAccounts: () => downloadBlobFile('/api/accounts/export', '导出', 'luck-mail-accounts.xlsx'),
-  // 下载导入模板：空的 .xlsx，只有表头一行。
-  downloadImportTemplate: () => downloadBlobFile('/api/accounts/import-template', '下载', 'luck-mail-import-template.xlsx'),
+  // POST：与备份同理，后端只接受 POST。
+  exportAccounts: () => downloadBlobFile('/api/accounts/export', '导出', 'luck-mail-accounts.xlsx', 'POST'),
+  // 下载导入模板：空的 .csv，只有表头一行。
+  downloadImportTemplate: () => downloadBlobFile('/api/accounts/import-template', '下载', 'luck-mail-import-template.csv'),
   // 批量导入邮箱：走统一 request()（30 秒 AbortController 超时 + 401 处理），
   // 不再用裸 fetch（F6）。
   importAccounts: async (file: File): Promise<{ added: number; skipped: number; failed: { row: number; email: string; reason: string }[]; addedEmails: string[]; skippedEmails: string[] }> => {

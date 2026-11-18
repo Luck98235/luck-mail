@@ -55,7 +55,7 @@ export interface ComposeInitial {
   subject?: string
   body?: string
   accountId?: number | null
-  draftId?: string | null
+  draftId?: number | string | null
 }
 
 const props = defineProps({
@@ -71,11 +71,10 @@ const cc = ref<string>('')
 const subject = ref<string>('')
 const body = ref<string>('')
 const accountId = ref<number | null>(null)
-const draftId = ref<string | null>(null)
+const draftId = ref<number | string | null>(null)
 const isEdit = ref<boolean>(false)
 const files = ref<File[]>([])
 const busy = ref<boolean>(false)
-const draftSaving = ref<boolean>(false) // 存草稿瞬时锁：防极快双击造两条草稿（F5）
 const error = ref<string>('')
 // 发信幂等键（F9）：每打开一次写信弹窗生成一个，同一封邮件重试发送复用
 // 同一个 key（后端去重），新开一封则重新生成。
@@ -87,21 +86,77 @@ function newIdempotencyKey(): string {
   return `lm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+// 服务端草稿自动保存（2026-11-18 用户定夺：草稿进数据库）：输入停约 1 秒
+// 后 PUT 更新，首次保存 POST 建草稿；发信成功后服务端按 draftId 自动删草稿。
+const draftSaving = ref<boolean>(false) // 存草稿锁：防并行 PUT 乱序，也防极快双击造两条草稿（F5）
+let autosaveTimer: ReturnType<typeof setTimeout> | null = null
+const lastSaved = ref<{ accountId: number | null; to: string; subject: string; text: string } | null>(null)
+function draftSnapshot(): { accountId: number | null; to: string; subject: string; text: string } {
+  return { accountId: accountId.value, to: to.value.trim(), subject: subject.value.trim(), text: body.value }
+}
+function sameSnapshot(a: { accountId: number | null; to: string; subject: string; text: string }, b: { accountId: number | null; to: string; subject: string; text: string }): boolean {
+  return a.accountId === b.accountId && a.to === b.to && a.subject === b.subject && a.text === b.text
+}
+async function autosaveDraft(): Promise<void> {
+  if (!props.open) return
+  const snap = draftSnapshot()
+  if (!snap.to && !snap.subject && !snap.text) return // 空内容不建草稿
+  if (lastSaved.value && sameSnapshot(lastSaved.value, snap)) return // 打开后没改过，不存
+  if (draftSaving.value) {
+    // 正在存：等它存完再存一次（避免并行 PUT 乱序），最多等 3 秒；
+    // 等不到就放弃本次，下次输入/关闭时再触发。
+    const deadline = Date.now() + 3000
+    while (draftSaving.value && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100))
+    if (draftSaving.value) return
+    if (lastSaved.value && sameSnapshot(lastSaved.value, draftSnapshot())) return
+  }
+  draftSaving.value = true
+  try {
+    const saved = draftId.value
+      ? (await api.updateDraft(draftId.value, draftSnapshot())).draft
+      : (await api.createDraft({ ...draftSnapshot(), idempotencyKey: idempotencyKey.value })).draft
+    if (saved?.id) {
+      draftId.value = saved.id
+      isEdit.value = true
+      if (saved.idempotencyKey) idempotencyKey.value = saved.idempotencyKey
+      mail.upsertDraft(saved)
+      lastSaved.value = draftSnapshot()
+    }
+  } catch { /* 自动保存失败不打扰用户：下次输入或关闭时再试 */ }
+  finally { draftSaving.value = false }
+}
+function scheduleAutosave(): void {
+  if (autosaveTimer) clearTimeout(autosaveTimer)
+  autosaveTimer = setTimeout(() => { autosaveTimer = null; void autosaveDraft() }, 1000)
+}
+
 watch(() => props.open, (v) => {
   if (!v) return
-  idempotencyKey.value = newIdempotencyKey()
+  if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null }
   const init = props.initial || {}
+  // 幂等键随草稿持久化（审计 #5）：重开已有草稿复用它存的 key，
+  // 发信时后端按 key 去重；新开一封才生成新 key。先查服务端草稿列表，
+  // 再查 openMessage 交来的 composeDraft（草稿视图外打开时用）。
+  const existingDraft = init.draftId
+    ? (mail.drafts.find((d) => d.id === init.draftId) || mail.composeDraft)
+    : null
+  idempotencyKey.value = existingDraft?.idempotencyKey || newIdempotencyKey()
   to.value = init.to || ''
   cc.value = init.cc || ''
   subject.value = init.subject || ''
   body.value = init.body || ''
-  draftId.value = init.draftId || null
-  isEdit.value = !!init.draftId
+  draftId.value = init.draftId ?? null
+  isEdit.value = init.draftId != null
   files.value = []
   error.value = ''
   busy.value = false
   accountId.value = init.accountId || mail.settings.defaultAccountId || mail.activeAccountId || mail.accounts[0]?.id || null
+  // 打开时的内容记为“已保存”：用户没改就不触发自动保存。
+  lastSaved.value = draftSnapshot()
 })
+
+// 输入防抖自动保存（约 1 秒）：cc 不进草稿契约，不监听。
+watch([to, subject, body, accountId], () => { if (props.open) scheduleAutosave() })
 
 function onFiles(e: Event): void {
   files.value = Array.from((e.target as HTMLInputElement).files || [])
@@ -126,6 +181,9 @@ async function send(): Promise<void> {
   if (!accountId.value) { error.value = '没有可用的发件邮箱，请先添加邮箱。'; return }
   busy.value = true
   try {
+    // 先把当前内容落盘成草稿（发信失败时草稿保留在服务端，可重开续发）；
+    // 发信成功后服务端按 draftId 自动删草稿，前端再清本地状态。
+    await autosaveDraft()
     let sent: { id?: number; warning?: string } | null = null
     if (files.value.length) {
       const fd = new FormData()
@@ -135,6 +193,7 @@ async function send(): Promise<void> {
       fd.append('subject', subject.value.trim() || '（无主题）')
       fd.append('text', buildText())
       fd.append('idempotencyKey', idempotencyKey.value)
+      if (draftId.value != null) fd.append('draftId', String(draftId.value))
       for (const f of files.value) fd.append('attachments', f)
       sent = await api.sendMessage(fd)
     } else {
@@ -144,10 +203,11 @@ async function send(): Promise<void> {
         cc: cc.value ? cc.value.split(',').map((s) => s.trim()).filter(Boolean) : [],
         subject: subject.value.trim() || '（无主题）',
         text: buildText(),
-        idempotencyKey: idempotencyKey.value
+        idempotencyKey: idempotencyKey.value,
+        ...(draftId.value != null ? { draftId: draftId.value } : {})
       })
     }
-    if (draftId.value) mail.deleteLocalDraft(draftId.value)
+    if (draftId.value != null) { mail.dropDraft(draftId.value); draftId.value = null }
     // 发信成功提示 4 秒；warning 表示已发出、但未存入已发送文件夹。
     mail.showToast(sent?.warning ? '已发送，但未存入已发送文件夹' : '发送成功', 4000)
     // 随后切视图触发的 loadMessages 若失败，别让失败 toast 盖掉“发送成功”。
@@ -165,24 +225,20 @@ async function send(): Promise<void> {
   }
 }
 
-function saveDraft(): void {
-  // 瞬时锁（F5）：极快双击“存草稿”只存一次，不造两条草稿。
-  if (draftSaving.value) return
-  draftSaving.value = true
-  try {
-    mail.saveLocalDraft({
-      id: draftId.value || undefined,
-      accountId: accountId.value,
-      to: to.value.trim(),
-      subject: subject.value.trim(),
-      text: body.value
-    })
-  } finally {
-    draftSaving.value = false
-  }
+async function saveDraft(): Promise<void> {
+  // 手动存草稿：先清掉待触发的自动保存，立刻存一次（走同一条 autosaveDraft，
+  // 首次 POST、之后 PUT），存完关弹窗并切到所有草稿。
+  if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null }
+  await autosaveDraft()
   close()
-  mail.setAggregate('all-drafts')
+  await mail.setAggregate('all-drafts')
 }
 
-function close(): void { emit('close') }
+function close(): void {
+  // 关闭前把未存的改动落盘（静默失败，不阻塞关闭；autosaveDraft 自己会
+  // 跳过空内容与未改动的内容）。
+  if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null }
+  void autosaveDraft()
+  emit('close')
+}
 </script>

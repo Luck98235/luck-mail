@@ -67,6 +67,15 @@ export function makeSnippet(text: string, len = 200): string {
   return String(text || '').replace(/\s+/g, ' ').trim().slice(0, len);
 }
 
+// Date 头 -> ISO 字符串，缺失/非法时返回 null（与 engine.ts 的信封路径
+// 同款守卫）。mailparser 对非法 Date 头会 fallback 成“现在”，
+// 不加守卫时打开的信日期会被写成今天、与信封路径存 null 不一致（R5）。
+export function toIsoDate(v: Date | string | undefined | null): string | null {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 // ---- IMAP BODYSTRUCTURE attachment parts (metadata-only downloads) ----
 export interface AttachmentPart {
   part: string | null;

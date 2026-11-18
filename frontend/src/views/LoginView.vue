@@ -89,15 +89,19 @@ onMounted(async () => {
 async function submit(): Promise<void> {
   error.value = ''
   if (!username.value.trim()) { error.value = '请输入用户名。'; return }
-  if (password.value.length < 8) { error.value = '密码至少 8 位。'; return }
+  // 密码 ≥8 位只在创建账号时校验（isSetup）：登录时不拦短密码，
+  // 老账号的密码可能短于 8 位，拦了就永远登不进去了。
+  if (isSetup.value && password.value.length < 8) { error.value = '密码至少 8 位。'; return }
+  if (!isSetup.value && !password.value) { error.value = '请输入密码。'; return }
   if (isSetup.value && password.value !== confirm.value) { error.value = '两次输入的密码不一致。'; return }
   busy.value = true
-  // “30天内免登录”是界面偏好，实际会话时长由服务端 lm_session Cookie 决定；
-  // 这里只记偏好，不多发契约外的字段。
+  // “30天内免登录”：勾选值随登录请求发给后端（rememberMe），后端据此建
+  // 30 天或 1 天会话；不勾选时后端默认 1 天（审计 #5：以前前端不传，
+  // 后端缺省恒为 30 天，复选框是摆设）。偏好仍记 localStorage 供下次回填。
   try { localStorage.setItem('luck-mail-remember', remember.value ? '1' : '0') } catch { /* 忽略 */ }
   const ok = isSetup.value
     ? await auth.setup(username.value.trim(), password.value, confirm.value)
-    : await auth.login(username.value.trim(), password.value)
+    : await auth.login(username.value.trim(), password.value, remember.value)
   busy.value = false
   if (ok) router.replace('/')
   else error.value = auth.lastError || '登录失败，请重试。'

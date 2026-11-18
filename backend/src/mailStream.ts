@@ -2,7 +2,7 @@ import { MailParser } from 'mailparser';
 import { pipeline } from 'node:stream/promises';
 import type { Readable } from 'node:stream';
 import { sanitizeBodyHtml } from './sanitize.js';
-import { makeSnippet } from './mailUtil.js';
+import { makeSnippet, toIsoDate } from './mailUtil.js';
 import type { ParsedMessage } from './mailUtil.js';
 
 // Core streaming parser (shared by the main thread and the parse worker).
@@ -98,9 +98,12 @@ export async function streamToParsed(
   };
   const from = getAddr('from');
   const dateVal = getHeader('date');
+  // R5: 非法 Date 头记 null（复用 toIsoDate 守卫）——mailparser 会把
+  // 非法日期 fallback 成“现在”，不加守卫打开的信日期就变成今天，
+  // 与信封路径（toIsoDate 存 null）不一致，排序/显示错位。
   const date = dateVal instanceof Date
-    ? dateVal.toISOString()
-    : (dateVal ? new Date(String(dateVal)).toISOString() : null);
+    ? toIsoDate(dateVal)
+    : (dateVal ? toIsoDate(String(dateVal)) : null);
   const subject = String(getHeader('subject') || '');
   const messageId = (getHeader('message-id') as string | undefined) || null;
 

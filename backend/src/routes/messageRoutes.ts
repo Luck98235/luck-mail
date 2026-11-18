@@ -11,7 +11,7 @@ import {
 import type { MessageRow, AttachmentRow } from '../db.js';
 import { envelopeOf } from '../engine.js';
 import { sendMail, buildRawMail } from '../smtpUtil.js';
-import { smtpResponseCode, isTransientSmtpError, isPermanentSmtpError } from '../imapUtil.js';
+import { smtpResponseCode, isTransientSmtpError, isPermanentSmtpError, isAuthError } from '../imapUtil.js';
 import { claimSendKey, completeSendKey, releaseSendKey } from '../idempotency.js';
 import { decryptSecret } from '../cryptoUtil.js';
 import { emit } from '../hub.js';
@@ -60,10 +60,12 @@ function pruneDeleteTasks(): void {
   for (const [id, t] of deleteTasks) {
     if (!t.running && t.finishedAt && now - t.finishedAt > 60 * 60 * 1000) deleteTasks.delete(id);
   }
-  // 兜底上限：只留最近 20 个任务。
+  // 兜底上限：只留最近 20 个任务。L5: 只删已完成的任务——正在跑的
+  // 任务删掉后前端轮询会 404，进度直接丢了。
   if (deleteTasks.size > 20) {
-    const ids = [...deleteTasks.keys()];
-    for (const id of ids.slice(0, deleteTasks.size - 20)) deleteTasks.delete(id);
+    const doneIds = [...deleteTasks.entries()].filter(([, t]) => !t.running).map(([id]) => id);
+    const excess = deleteTasks.size - 20;
+    for (const id of doneIds.slice(0, Math.max(0, excess))) deleteTasks.delete(id);
   }
 }
 
@@ -300,6 +302,28 @@ export function messageRoutes(ctx: Ctx): express.Router {
   r.delete('/messages/:id', async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
+    // L1（后端半边）：删信幂等键。响应丢失后用户重试同一动作时，
+    // 同一 key 直接返回第一次的结果，不再执行第二次删除——否则一次
+    // “移到已删除”重试后会变成永久删除。key 由前端每次删除动作生成
+    // 一个新 UUID 传下来（query 或 body 都认）；未传 key 时保持现有行为。
+    const rawKey = (req.query.idempotencyKey as string | undefined)
+      ?? (req.body as Record<string, unknown> | undefined)?.idempotencyKey;
+    const delKey = typeof rawKey === 'string' ? rawKey.trim() : '';
+    if (delKey && delKey.length > 128) {
+      res.status(400).json({ ok: false, error: 'idempotencyKey 过长' });
+      return;
+    }
+    if (delKey) {
+      const prior = db.prepare('SELECT message_db_id FROM delete_idempotency WHERE idempotency_key=?').get(delKey) as { message_db_id: number | null } | undefined;
+      if (prior) {
+        if (prior.message_db_id === id) {
+          res.json({ ok: true, duplicate: true });
+          return;
+        }
+        res.status(409).json({ ok: false, error: 'idempotencyKey 已用于另一封邮件' });
+        return;
+      }
+    }
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(id) as MessageRow | undefined;
     if (!row) {
       res.status(404).json({ ok: false, error: '邮件不存在' });
@@ -315,6 +339,10 @@ export function messageRoutes(ctx: Ctx): express.Router {
       log('delete failed', `account=${row.account_id} message=${id}`, (e as Error)?.message || e);
       res.status(502).json({ ok: false, error: `IMAP 删除失败：${String((e as Error)?.message || e).slice(0, 300)}` });
       return;
+    }
+    if (delKey) {
+      db.prepare('INSERT OR IGNORE INTO delete_idempotency (idempotency_key, message_db_id) VALUES (?,?)')
+        .run(delKey, id);
     }
     res.json({ ok: true });
   });
@@ -334,6 +362,27 @@ export function messageRoutes(ctx: Ctx): express.Router {
     if (ids.length > 200) {
       res.status(400).json({ ok: false, error: '一次最多删除 200 封' });
       return;
+    }
+    // L1（后端半边）：批量删信幂等键。同一 key 重复提交时直接返回
+    // 第一次的任务 id（前端继续轮询同一任务），不另起任务、不重复删。
+    // key 由前端每次批量删除动作生成一个新 UUID 传下来；未传时保持现有行为。
+    const batchKey = typeof req.body?.idempotencyKey === 'string' ? req.body.idempotencyKey.trim() : '';
+    if (batchKey && batchKey.length > 128) {
+      res.status(400).json({ ok: false, error: 'idempotencyKey 过长' });
+      return;
+    }
+    if (batchKey) {
+      const prior = getDb().prepare('SELECT task_id FROM delete_idempotency WHERE idempotency_key=?').get(batchKey) as { task_id: string | null } | undefined;
+      if (prior?.task_id) {
+        const priorTask = deleteTasks.get(prior.task_id);
+        res.json({
+          ok: true,
+          taskId: prior.task_id,
+          status: priorTask ? (priorTask.running ? 'running' : 'finished') : 'finished',
+          duplicate: true,
+        });
+        return;
+      }
     }
     // 记下发起删除的视图，供刷新后 delete-status 返回（前端据此只在该视图显示删除中）。
     const v = req.body?.view as { kind?: unknown; accountId?: unknown; folderId?: unknown } | undefined;
@@ -356,8 +405,14 @@ export function messageRoutes(ctx: Ctx): express.Router {
       view,
     };
     deleteTasks.set(task.taskId, task);
+    if (batchKey) {
+      getDb().prepare('INSERT OR IGNORE INTO delete_idempotency (idempotency_key, task_id) VALUES (?,?)')
+        .run(batchKey, task.taskId);
+    }
     // 后台跑：逐封走 engine.deleteMessage；跑完 running=false。
     // 注意不在请求上下文里抛错——失败记进 task.failed，前端轮询可见。
+    // L2: 循环本身抛错（非单封失败，如 getDb 异常）时也要把任务置完成，
+    // 否则前端永远轮询一个 running=true 的死任务。
     void (async () => {
       const db = getDb();
       for (const id of ids) {
@@ -372,7 +427,11 @@ export function messageRoutes(ctx: Ctx): express.Router {
       }
       task.running = false;
       task.finishedAt = Date.now();
-    })();
+    })().catch((e: unknown) => {
+      log('batch-delete task failed', task.taskId, (e as Error)?.message || e);
+      task.running = false;
+      task.finishedAt = Date.now();
+    });
     res.json({ ok: true, taskId: task.taskId, status: 'running' });
   });
 
@@ -491,7 +550,9 @@ export function messageRoutes(ctx: Ctx): express.Router {
     const sendHeaders = (): void => {
       res.setHeader('Content-Type', att.content_type || 'application/octet-stream');
       res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(att.filename)}`);
-      if (att.size) res.setHeader('Content-Length', String(att.size));
+      // D9: 不再按 DB 里记的 size 发 Content-Length——附件是 IMAP 实时流，
+      // DB 元数据里的 size 与实际流长度可能不符，错的 Content-Length
+      // 会让下载截断或挂起；改走 chunked，由流结束决定长度。
     };
     if (!att.part) {
       res.status(404).json({ ok: false, error: '该附件未缓存且无法从邮箱实时取回' });
@@ -605,15 +666,22 @@ export function messageRoutes(ctx: Ctx): express.Router {
       const mailInput = {
         to: toList, cc: ccList, bcc: bccList,
         subject: (b.subject as string) || '', text, html, attachments,
+        // 回复 threading 头（审计 #2 缺口，后端半边）：前端回复时传原信
+        // 的 Message-ID（inReplyTo）与 References 链；不传则不带头。
+        inReplyTo: b.inReplyTo as string | undefined,
+        references: b.references as string | string[] | undefined,
       };
       const failSend = (e: unknown): void => {
         if (claimed) releaseSendKey(accountId, idemKey);
         const code = smtpResponseCode(e);
         const detail = String((e as Error)?.message || e).slice(0, 400);
-        // B15: 5xx 直接失败并给可读文案；无响应码的错误走通用 502。
-        const error = isPermanentSmtpError(e)
-          ? `发信失败：对方服务器拒绝了这封邮件（${code}），请检查收件人地址或内容后重试`
-          : `发信失败：${detail}`;
+        // L1: 535（认证失败）先判——旧版先按 5xx 归类，报的是
+        // “收件人/内容问题”，用户会去改收件人，实际是密码/授权码错了。
+        const error = isAuthError(e)
+          ? 'SMTP 认证失败，请检查发件账号的密码/授权码'
+          : isPermanentSmtpError(e)
+            ? `发信失败：对方服务器拒绝了这封邮件（${code}），请检查收件人地址或内容后重试`
+            : `发信失败：${detail}`;
         res.status(502).json({ ok: false, error });
       };
       let sent: { messageId: string | null; raw: Buffer; rejected: string[] };
@@ -642,6 +710,12 @@ export function messageRoutes(ctx: Ctx): express.Router {
           failSend(e);
           return;
         }
+      }
+      // 草稿：发信成功后删除该草稿行（无论之后 APPEND/缓存是否 warning）；
+      // 发信失败时保留。draftId 不存在时忽略、不报错。
+      const draftId = Number((b as Record<string, unknown>).draftId);
+      if (Number.isFinite(draftId) && draftId > 0) {
+        db.prepare('DELETE FROM drafts WHERE id=?').run(draftId);
       }
       // APPEND a copy to Sent and cache it locally (bodies on disk, FTS indexed).
       // 邮件已发出：之后任何一步失败都只记 warning，仍返回 201，不让用户以为
@@ -703,6 +777,14 @@ export function messageRoutes(ctx: Ctx): express.Router {
                 const m = sentParts[i] || null;
                 db.prepare('INSERT INTO attachments (message_id, filename, content_type, size, path, cached, part) VALUES (?,?,?,?,?,?,?)')
                   .run(localId, f.filename, f.contentType || 'application/octet-stream', f.size, null, 0, m?.part || null);
+              }
+              // L9: part 没取到的附件不再静默记 NULL——用户发完才发现
+              // 下载不了；直接在 warning 里告诉他是哪几个附件。
+              const noPartNames = attachments
+                .filter((_f, i) => !(sentParts[i]?.part))
+                .map((f) => f.filename);
+              if (noPartNames.length) {
+                warnings.push(`附件 ${noPartNames.join('、')} 未能记录服务器位置，下载可能失败`);
               }
             }
             refreshFolderCounts(folder.id);

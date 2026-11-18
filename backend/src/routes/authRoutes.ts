@@ -6,6 +6,7 @@ import { hashPassword, verifyPassword, sha256Hex } from '../cryptoUtil.js';
 import {
   createSession, destroySession, setSessionCookie, clearSessionCookie,
   ipFail, ipReset, ipLockRemaining, userLocked, userFail, userReset, requireAuth,
+  parseSqliteUtc,
 } from '../auth.js';
 import type { AuthedRequest } from '../auth.js';
 
@@ -20,7 +21,7 @@ export function authRoutes(): express.Router {
     const session = token
       ? db.prepare(
           `SELECT u.username FROM sessions s JOIN users u ON u.id=s.user_id
-           WHERE s.token_hash=? AND s.expires_at > datetime('now')`,
+           WHERE s.token_hash=? AND datetime(s.expires_at) > datetime('now')`,
         ).get(sha256Hex(token)) as { username: string } | undefined
       : undefined;
     res.json({
@@ -49,10 +50,15 @@ export function authRoutes(): express.Router {
     if (!password || typeof password !== 'string' || password.length < 8) return fail('密码至少 8 位');
     if (password !== confirm) return fail('两次密码不一致');
     const { salt, hash } = hashPassword(password);
-    db.prepare('INSERT INTO users (username, password_hash, salt) VALUES (?,?,?)')
+    const info = db.prepare('INSERT INTO users (username, password_hash, salt) VALUES (?,?,?)')
       .run((username as string).trim(), hash, salt);
     ipReset(req, 'setup');
-    return res.status(201).json({ ok: true });
+    // D6: 建账号后直接建会话——旧版只返回 201 不建会话，前端 setup()
+    // 却置 loggedIn=true，随后 API 401 又跳回登录页。
+    const userId = Number(info.lastInsertRowid);
+    const { token, expiresAt } = createSession(userId, true);
+    setSessionCookie(res, token, expiresAt);
+    return res.status(201).json({ ok: true, username: (username as string).trim() });
   });
 
   r.post('/login', (req: Request, res: Response) => {
@@ -75,6 +81,14 @@ export function authRoutes(): express.Router {
     if (lockedSec > 0) {
       return res.status(429).json({ ok: false, error: '账号已锁定，请稍后再试', retryAfter: lockedSec });
     }
+    // D7: 锁已过期时先清零失败计数——旧版 failed_attempts 从不清零，
+    // 锁过期后一次输错立即再锁 15 分钟。locked_until 是 UTC 时间串，
+    // 须按 UTC 解析（new Date 直接解析会按本地时区，CST 下早 8 小时）。
+    if (user.locked_until && parseSqliteUtc(user.locked_until) <= new Date()) {
+      userReset(db, user.id);
+      user.failed_attempts = 0;
+      user.locked_until = null;
+    }
     if (!verifyPassword(String(password), user.salt, user.password_hash)) {
       const lockSec = userFail(db, user);
       if (lockSec > 0) {
@@ -84,7 +98,10 @@ export function authRoutes(): express.Router {
     }
     userReset(db, user.id);
     ipReset(req, 'login');
-    const { token, expiresAt } = createSession(user.id, rememberMe !== false);
+    // S3: rememberMe 缺省按 false（1 天会话）；只有明确传 true 才 30 天。
+    // 旧版 `rememberMe !== false` 在前端不传该字段（undefined）时恒为真，
+    // “30天内免登录”复选框成了摆设，每次登录都是 30 天。
+    const { token, expiresAt } = createSession(user.id, rememberMe === true);
     setSessionCookie(res, token, expiresAt);
     return res.json({ ok: true, username: user.username });
   });

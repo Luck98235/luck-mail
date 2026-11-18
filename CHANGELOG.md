@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Refresh-all button on the mobile/tablet account overview (same refresh-all as desktop)
 - Search results switch the reading pane to the first result on desktop
+- Drafts are now stored on the server (audit #5, 2026-11-18): new /api/drafts CRUD, auto-save while composing, sending a draft deletes it, and existing local drafts are migrated once on first load
 
 ### Changed
 - Search: FTS coverage backfilled to 100%, multi-word queries are AND, results ranked by bm25 relevance; search is global by default instead of view-scoped
@@ -20,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit #2 cleanup (2026-11-18): single delete asks for confirmation; delete/move-to-spam no longer trusts the current view — permanence is decided by the message's actual folder, and a missing trash folder errors instead of silently deleting permanently; delete-status polling no longer leaks; reconnect reconciles; send path reports partial rejections and APPEND failures instead of silently dropping them
 - Sent mail is now cached locally even when the server APPEND returns no UID: `appendToSent` looks the UID up by Message-ID in the same IMAP session (2026-11-18; 163 returns a UID via UIDPLUS, so the fallback is dormant for 163 and matters for other providers)
 - Draft search verified 5/5 (2026-11-18): a local draft is excluded from search, never pops the compose window, and survives clearing the search
+- Audit #3 (2026-11-18): folder sync no longer rebuilds on every sync — full refetch only when UIDVALIDITY is actually present and changed; SMTP connection pooling; send idempotency (the same key never sends twice); batch delete is now async with a taskId + status polling
+- Audit #4 (2026-11-18): sent-mail duplicates removed (same Message-ID deduplicated within a folder, deleting also removes the server's auto-saved copy); QQ `\NoSelect` folders are skipped (case-insensitive match); send falls back to a Message-ID lookup when APPEND returns no UID; switching folders clears the old list before loading
+- Audit #5 fixes (2026-11-18): backup/export downloads are POST-only with SameSite=Strict (CSRF); session expiry now compares correctly and remember-me is honored (default 1 day); trust proxy set; 163 accounts poll instead of IDLE; drafts API; CSV import (template also CSV, export stays xlsx); multer/nodemailer/imapflow upgraded; automatic daily backup; /api/health; backend listens on 127.0.0.1 only
 
 ### Removed
 - Dead-code cleanup across frontend, backend and config: unused functions, dead endpoints (`/api/search`, `/api/status`), SnappyMail scaffolding, old `frontend/main/` and `research/` references

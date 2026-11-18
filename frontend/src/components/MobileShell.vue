@@ -88,7 +88,8 @@
           <button class="w-9 h-9 flex items-center justify-center text-blue-500" title="写信" @click="$emit('compose')">
             <i class="fa-regular fa-pen-to-square text-xl"></i>
           </button>
-          <!-- 账号切换下拉 -->
+          <!-- 账号切换下拉：点空白处关闭（遮罩层，盖在下拉框之下、其他内容之上） -->
+          <div v-if="switcherOpen" class="fixed inset-0 z-30" @click="switcherOpen = false"></div>
           <div v-if="switcherOpen" class="absolute top-12 left-1/2 -translate-x-1/2 z-40 w-64 bg-white rounded-xl shadow-lg border border-slate-100 py-1 max-h-80 overflow-y-auto">
             <button class="w-full text-left px-4 py-2.5 text-sm hover:bg-blue-50" :class="{ 'text-blue-600 font-medium': !mail.mobileAccountId }" @click="pickAccount(null)">全部邮箱</button>
             <button
@@ -163,7 +164,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useMailStore, AGGREGATES, folderIcon } from '../stores/mail'
 import { initialOf, domainColor, domainShort } from '../utils'
@@ -179,6 +180,9 @@ const mail = useMailStore()
 const homeQ = ref<string>('')
 const switcherOpen = ref<boolean>(false)
 const shellRef = ref<HTMLElement | null>(null)
+
+// 回首页时清空首页搜索框：搜过的词留在框里，下次回首页会误以为还在搜（审计 #5 LOW）。
+watch(() => mail.mview, (v) => { if (v === 'home') homeQ.value = '' })
 
 // 手机/平板右滑返回上一屏（2026-11-18）：挂在 MobileShell 根元素上，
 // 覆盖首页、列表、阅读窗顶栏等主文档区域；邮件正文在 iframe 里，另见 ReadingPane。

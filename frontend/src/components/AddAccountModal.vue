@@ -28,8 +28,8 @@
         <div class="border-t border-slate-100 pt-3 space-y-3">
           <div class="font-medium text-slate-700 text-[13px]">接收服务器（IMAP）</div>
           <div class="grid grid-cols-[1fr_110px] gap-2">
-            <input v-model="form.imapHost" type="text" autocomplete="off" class="border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
-            <input v-model.number="form.imapPort" type="number" autocomplete="off" class="border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
+            <input v-model="form.imapHost" type="text" autocomplete="off" class="border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400" @input="markManualServerEdit">
+            <input v-model.number="form.imapPort" type="number" autocomplete="off" class="border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400" @input="markManualServerEdit">
           </div>
           <div class="flex items-center gap-4">
             <label class="flex items-center gap-1.5 text-xs text-slate-600"><input v-model="form.imapSecure" type="radio" value="SSL" class="accent-blue-500"> SSL</label>
@@ -38,8 +38,8 @@
 
           <div class="font-medium text-slate-700 text-[13px] pt-1">发送服务器（SMTP）</div>
           <div class="grid grid-cols-[1fr_110px] gap-2">
-            <input v-model="form.smtpHost" type="text" autocomplete="off" class="border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
-            <input v-model.number="form.smtpPort" type="number" autocomplete="off" class="border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
+            <input v-model="form.smtpHost" type="text" autocomplete="off" class="border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400" @input="markManualServerEdit">
+            <input v-model.number="form.smtpPort" type="number" autocomplete="off" class="border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400" @input="markManualServerEdit">
           </div>
           <div class="flex items-center gap-4">
             <label class="flex items-center gap-1.5 text-xs text-slate-600"><input v-model="form.smtpSecure" type="radio" value="SSL" class="accent-blue-500"> SSL</label>
@@ -100,6 +100,17 @@ const presetNote = ref<string>('')
 // 输完域名立刻就能填好服务器，不用等失焦、也不怕接口慢一拍。
 const presetsCache = ref<Record<string, { imapHost: string; imapPort: number; imapSecure: string; smtpHost: string; smtpPort: number; smtpSecure: string; note: string }> | null>(null)
 const lastAutofillDomain = ref<string>('')
+// 用户手工改过服务器的域名集合（审计 #5 LOW）：域名 A→B→A 时，A 若在集合里
+// 说明用户在 A 下手工改过服务器，自动填入不再覆盖；只在本次弹窗打开期间记，
+// 关弹窗即清（每次打开重新记）。
+const manualServerDomains = ref<Set<string>>(new Set())
+// 用户手工改服务器字段时记下当前域名：之后自动填入跳过这个域名，
+// 不把手工改过的服务器覆盖掉（v-model 的程序赋值不触发 @input，
+// 只有用户真动手改才记）。
+function markManualServerEdit(): void {
+  const domain = (form.value.email.trim().split('@')[1] || '').toLowerCase()
+  if (domain) manualServerDomains.value.add(domain)
+}
 
 watch(() => props.open, (v) => {
   if (!v) return
@@ -108,6 +119,7 @@ watch(() => props.open, (v) => {
   busy.value = false
   showPw.value = false
   lastAutofillDomain.value = ''
+  manualServerDomains.value = new Set()
   if (!props.editing && !presetsCache.value) {
     api.presets().then((d) => { presetsCache.value = d.presets || {} }).catch(() => { /* 拉不到就走单域名接口 */ })
   }
@@ -134,6 +146,11 @@ async function autofill(): Promise<void> {
   if (!domain || !domain.includes('.') || props.editing) return
   if (domain === lastAutofillDomain.value) return
   lastAutofillDomain.value = domain
+  // 该域名下用户手工改过服务器：不再自动填入，避免覆盖手工值。
+  if (manualServerDomains.value.has(domain)) {
+    presetNote.value = '该域名服务器为手工填写，未自动覆盖。'
+    return
+  }
   const apply = (p: { imapHost: string; imapPort: number; imapSecure: string; smtpHost: string; smtpPort: number; smtpSecure: string } | null, note: string): void => {
     if (p) {
       form.value.imapHost = p.imapHost; form.value.imapPort = p.imapPort; form.value.imapSecure = p.imapSecure as 'SSL' | 'STARTTLS'

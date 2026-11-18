@@ -47,17 +47,24 @@ export function createSession(userId: number, rememberMe: boolean): { token: str
   const db = getDb();
   const token = randomToken(32);
   const expiresAt = new Date(Date.now() + (rememberMe ? 30 : 1) * DAY_MS);
+  // S2: 存 SQLite datetime 格式（'YYYY-MM-DD HH:MM:SS'），不要 ISO 的 T/Z。
+  // 旧版存 toISOString()（'2026-11-18T05:40:19.455Z'），与 datetime('now')
+  // 做字符串比较时第 11 位 'T'(0x54) 恒大于空格(0x20)，同一天内无论几点
+  // 过期都判有效，会话最长多活 ~24 小时。
+  const expiresSqlite = expiresAt.toISOString().replace('T', ' ').slice(0, 19);
   db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?,?,?)')
-    .run(sha256Hex(token), userId, expiresAt.toISOString());
+    .run(sha256Hex(token), userId, expiresSqlite);
   return { token, expiresAt };
 }
 
 export function lookupSession(token: string | null | undefined): { user_id: number; username: string } | null {
   if (!token) return null;
   const db = getDb();
+  // datetime() 包一层：新格式直接比对；旧版 ISO 格式（T/Z）的遗留行
+  // 也能正确过期（datetime() 会把两种格式都归一化）。
   const row = db.prepare(
     `SELECT s.user_id, u.username FROM sessions s JOIN users u ON u.id=s.user_id
-     WHERE s.token_hash=? AND s.expires_at > datetime('now')`,
+     WHERE s.token_hash=? AND datetime(s.expires_at) > datetime('now')`,
   ).get(sha256Hex(token)) as { user_id: number; username: string } | undefined;
   return row || null;
 }
@@ -70,7 +77,10 @@ export function destroySession(token: string | null | undefined): void {
 export function setSessionCookie(res: Response, token: string, expiresAt: Date): void {
   res.cookie(SESSION_COOKIE, token, {
     httpOnly: true,
-    sameSite: 'lax',
+    // S1: SameSite=strict——本站是同源 SPA，所有 API 调用都是同站请求，
+    // Strict 不影响正常使用，但能挡住跨站顶层导航 GET 携带 Cookie
+    // （Lax 只挡 fetch/XHR 与跨站 POST，挡不住点链接/跳转触发的下载）。
+    sameSite: 'strict',
     path: '/',
     secure: COOKIE_SECURE,
     expires: expiresAt,
@@ -78,7 +88,8 @@ export function setSessionCookie(res: Response, token: string, expiresAt: Date):
 }
 
 export function clearSessionCookie(res: Response): void {
-  res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: 'lax', path: '/' });
+  // 清除时 sameSite 须与设置时一致，否则浏览器认不出是同一个 Cookie。
+  res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: 'strict', path: '/' });
 }
 
 // Express middleware: requires a valid session; sets req.user.
@@ -94,10 +105,18 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
   next();
 }
 
+// SQLite datetime('now') 存的是 UTC 的 'YYYY-MM-DD HH:MM:SS'；
+// new Date('YYYY-MM-DD HH:MM:SS') 会按本地时区解析（服务器在 CST 时
+// 会早 8 小时），锁会提前失效。凡是拿 SQLite 时间串跟现在比，都走
+// 这里按 UTC 解析；会话过期比较已在 SQL 里用 datetime()，不受影响。
+export function parseSqliteUtc(s: string): Date {
+  return new Date(s.replace(' ', 'T') + 'Z');
+}
+
 // Failed-login bookkeeping on the user row (5 fails -> lock 15 min).
 export function userLocked(user: UserRow): number {
-  if (user.locked_until && new Date(user.locked_until) > new Date()) {
-    return Math.ceil((new Date(user.locked_until).getTime() - Date.now()) / 1000);
+  if (user.locked_until && parseSqliteUtc(user.locked_until) > new Date()) {
+    return Math.ceil((parseSqliteUtc(user.locked_until).getTime() - Date.now()) / 1000);
   }
   return 0;
 }

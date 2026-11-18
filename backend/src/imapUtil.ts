@@ -93,7 +93,7 @@ export function makeSmtpTransporter(account: ImapAccount, password: string): Tra
     auth: { user: account.email, pass: password },
     // B5: 连接池——每次发信不再新建连接+重新登录。单账号同时只发一封
     // （maxConnections: 1），一个连接最多发 100 封后轮换，对服务器友好、
-    // 也不怕并发登录被限。nodemailer 6.10.1 支持 pool 选项；close() 仍
+    // 也不怕并发登录被限。nodemailer 10.x 仍支持 pool 选项；close() 仍
     // 可正常关闭池（dropTransporter 已验证）。
     pool: true,
     maxConnections: 1,

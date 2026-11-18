@@ -19,8 +19,8 @@ luck-mail 的所有数据都在服务器上的**两个地方**：
 设置、别名、排序、停用状态）、从各邮件服务器同步来的文件夹、邮件元信息
 （主题、发件人、收件人、日期、摘要、已读状态、UID、Message-ID）、附件元信
 息（文件名、大小、类型、IMAP 位置号——内容**不存**）、各文件夹的同步断点、
-已彻底删除邮件的墓碑（删掉的信不会再回来）、设置（签名、默认账号）、全文
-搜索索引（FTS5）和登录会话。
+已彻底删除邮件的墓碑（删掉的信不会再回来）、设置（签名、默认账号）、草稿
+（含幂等键）、全文搜索索引（FTS5）和登录会话。
 
 代码本身就是本仓库，**不需要另外备份**，新服务器上从 GitHub 重新部署即可。
 
@@ -41,16 +41,18 @@ luck-mail 的所有数据都在服务器上的**两个地方**：
 
 ## 哪些东西不会跟着迁移
 
-- **本地草稿** — 存在浏览器的 `localStorage` 里，按浏览器算。写在哪个浏览
-  器就留在哪个浏览器，换服务器不会带走。
 - **配色偏好** — 也是浏览器 `localStorage`。
 - **登录会话** — 迁移后需要重新登录。
 - **TLS 证书** — 新服务器上重新签发（Let's Encrypt）。
 
 ## 备份（在旧服务器上）
 
-先停服务，让 SQLite 数据库处于一致状态，再把**密钥和数据目录一起**打成
-一个包：
+首选：站内**备份到本地**按钮（设置里），经 `POST /api/backup/download`
+下载 `.key` + `data/` 的包——用一致的数据库快照（`db.backup()`），**不用停
+服务**。
+
+手动办法（网页打不开时）：先停服务，让 SQLite 数据库处于一致状态，再把
+**密钥和数据目录一起**打成一个包：
 
 ```bash
 sudo systemctl stop luck-mail
@@ -59,7 +61,8 @@ sudo tar -czf luck-mail-backup-$(date +%Y%m%d).tar.gz -C /opt/luck-mail .key dat
 scp luck-mail-backup-*.tar.gz root@<新服务器>:/tmp/
 ```
 
-整个数据目录很小（截至 2026-11-17 的参考值：27 个邮箱、374 封邮件，一共 5.5MB），
+整个数据目录很小（截至 2026-11-18 的参考值：27 个邮箱、228 封邮件，一共 7.8MB：
+DB 1.7MB + WAL 4.1MB + bodies 1.6MB + attachments 556KB），
 每天备一份也不贵。备份要放在**服务器之外**的地方。
 
 ## 迁移步骤（在新服务器上）
@@ -73,11 +76,15 @@ scp luck-mail-backup-*.tar.gz root@<新服务器>:/tmp/
 ### 2. 拉代码
 
 ```bash
-git clone https://github.com/Luck98235/luck-mail   # 私有仓库
+git clone https://github.com/Luck98235/luck-mail   # 私有仓库，需认证
 cd luck-mail/backend && npm ci && npm run build
 cd ../frontend && npm ci && npm run build
-# 再把构建好的 backend（含 dist/，前端 dist/ 作为 public/）拷到 /opt/luck-mail/backend
+cp -r dist ../backend/public   # 后端从 public/ 提供构建好的前端
+# 再把构建好的 backend 拷到 /opt/luck-mail/backend
 ```
+
+这里用 `npm ci`（按 `package-lock.json` 干净、可复现地安装）；`npm install`
+是本地开发加依赖、改依赖时用的。
 
 或者直接从旧服务器把 `/opt/luck-mail/backend` 整个拷过来。
 
@@ -131,6 +138,10 @@ sudo systemctl status luck-mail   # 应为 active
 把 `/`（以及 `/socket.io/`，带 `Upgrade` 头走 WebSocket）反代到
 `127.0.0.1:8080`，`proxy_read_timeout 120s`，`client_max_body_size 25m`。
 给域名签发 Let's Encrypt 证书，HTTP 跳转 HTTPS。
+
+证书自动续期：`/opt/acme/renew.sh` 每天 03:30 由 cron 跑，续 Let's Encrypt
+证书（ACME 挑战走 webroot），然后 reload `1Panel-openresty` 容器（反向代理），
+让新证书生效。看 `/opt/acme/renew.log` 查上次运行和下次续期时间。
 
 ### 6. 验证
 

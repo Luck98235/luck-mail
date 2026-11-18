@@ -94,6 +94,9 @@ export function openDb(): Db {
   db.pragma('busy_timeout = 5000');
   db.pragma('foreign_keys = ON');
   initSchema(db);
+  // S10: 数据库文件只允许属主读（旧版 0644，服务器上任何本地账号
+  // 都能读全部邮件内容——FTS5 表里就是全部正文明文）。
+  try { fs.chmodSync(DB_FILE, 0o600); } catch { /* ignore */ }
   return db;
 }
 
@@ -104,6 +107,29 @@ export function getDb(): Db {
 
 export function closeDb(): void {
   if (db) { db.close(); db = null; }
+}
+
+// 启动时一次性清理（S2/D5/L6）：已过期会话 + 180 天以上的删除墓碑。
+// datetime() 包一层：新格式直接比对；旧版 ISO 格式（T/Z）的遗留会话行
+// 也能正确过期。墓碑只清 180 天前的——须长于服务器端保留期，
+// 避免刚删的信在同步里复活。
+export function pruneExpiredRows(): { sessions: number; tombstones: number; deleteKeys: number } {
+  const db = getDb();
+  const s = db.prepare(
+    "DELETE FROM sessions WHERE datetime(expires_at) <= datetime('now')",
+  ).run();
+  const t = db.prepare(
+    "DELETE FROM deleted_messages WHERE deleted_at <= datetime('now', '-180 days')",
+  ).run();
+  // 删除幂等键只留 7 天：重试都在几分钟内发生，7 天足够；过期后同一 key
+  // 当作新动作（已删的信不会因此复活，只是不再挡重复执行）。
+  const d = db.prepare(
+    "DELETE FROM delete_idempotency WHERE created_at <= datetime('now', '-7 days')",
+  ).run();
+  if (s.changes || t.changes || d.changes) {
+    log(`pruned ${s.changes} expired session(s), ${t.changes} tombstone(s) older than 180 days, ${d.changes} delete key(s) older than 7 days`);
+  }
+  return { sessions: s.changes, tombstones: t.changes, deleteKeys: d.changes };
 }
 
 function initSchema(db: Db): void {
@@ -232,6 +258,33 @@ function initSchema(db: Db): void {
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (account_id, idempotency_key)
   );
+
+  -- 草稿（审计 #5 后用户定夺，后端接口）：只存本地草稿，不进 FTS、
+  -- 不进 messages 表、不参与同步；删账号时级联删除（FK + foreign_keys=ON）。
+  -- 列名用 to_addrs 而不用 to：to 是 SQLite 关键字，CREATE TABLE
+  -- 直接报 near "to" 语法错误（2026-11-18 实测）；API 字段仍叫 to。
+  CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    to_addrs TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 删除幂等键（审计 #2 L1 后端半边）：删信响应丢失后用户重试，
+  -- 同一 key 直接返回第一次的结果，不再执行第二次删除——否则一次
+  -- “移到已删除”重试后会变成永久删除。单删按 message_db_id 记，
+  -- 批量删按 task_id 记（轮询同一任务）。前端须每次删除动作生成
+  -- 一个新 key 传下来（未传 key 时保持现有行为）。
+  CREATE TABLE IF NOT EXISTS delete_idempotency (
+    idempotency_key TEXT PRIMARY KEY,
+    task_id TEXT,
+    message_db_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
   `);
 
   // ---- Migrations (dev DBs created by earlier revisions) ----
@@ -248,6 +301,31 @@ function initSchema(db: Db): void {
   }
   if (attColNames.length && !attColNames.includes('part')) {
     db.exec('ALTER TABLE attachments ADD COLUMN part TEXT');
+  }
+
+  // ---- Audit #5 (17): messages 按 Message-ID 唯一 ----
+  // 应用层去重（F1）是唯一防线；补唯一索引做纵深防御。SQLite 的 UNIQUE
+  // 允许多个 NULL，message_id 为空的信不受影响。线上已核实无重复
+  // （dup_mid 查询为空）。若某旧库里真有重复，索引建失败时只记警告、
+  // 不让服务器起不来（应用层去重仍在）。
+  try {
+    const dupMid = (db.prepare(
+      `SELECT COUNT(*) c FROM (
+         SELECT account_id, folder_id, message_id FROM messages
+         WHERE message_id IS NOT NULL
+         GROUP BY account_id, folder_id, message_id HAVING COUNT(*) > 1
+       )`,
+    ).get() as { c: number }).c;
+    if (dupMid === 0) {
+      db.exec(
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_account_folder_mid ' +
+        'ON messages(account_id, folder_id, message_id)',
+      );
+    } else {
+      log(`WARNING: ${dupMid} duplicate (account, folder, message_id) group(s); unique index skipped`);
+    }
+  } catch (e) {
+    log('WARNING: could not create messages Message-ID unique index:', (e as Error)?.message || e);
   }
 
   // ---- FTS5 (standalone table, maintained by the app, NOT triggers) ----
@@ -353,8 +431,11 @@ export function searchMessageIds(q: string): number[] | null {
   // FTS 命中集 + bm25 分（分越小越相关）。
   let ftsIds: Set<number> | null = null;
   const ftsRank = new Map<number, number>();
-  if (longTerms.length) {
-    const match = longTerms.map((t) => `"${t.replace(/"/g, '')}"`).join(' ');
+  // D4: 去引号后为空的词直接跳过——`"""` 会拼成 MATCH '""'，
+  // FTS 语法错误 500。matchTerms 为空时不做 FTS 约束（走 LIKE 或返回空）。
+  const matchTerms = longTerms.map((t) => t.replace(/"/g, '')).filter((t) => t.length > 0);
+  if (matchTerms.length) {
+    const match = matchTerms.map((t) => `"${t}"`).join(' ');
     const rows = db.prepare(
       'SELECT rowid AS id, bm25(messages_fts) AS rank FROM messages_fts WHERE messages_fts MATCH ? ORDER BY rank'
     ).all(match) as { id: number; rank: number }[];
@@ -424,4 +505,12 @@ export function readBodyFiles(messageId: number): { bodyText: string; bodyHtml: 
   try { bodyText = fs.readFileSync(bodyTextPath(messageId), 'utf8'); } catch { /* not parsed yet */ }
   try { bodyHtml = fs.readFileSync(bodyHtmlPath(messageId), 'utf8'); } catch { /* not parsed yet */ }
   return { bodyText, bodyHtml };
+}
+
+// 删掉一封信的正文磁盘文件（html + txt）。同步删行路径（R2）与
+// deleteMessage 同款调用——只删 DB 行不删文件时，已删邮件的全文仍以
+// 明文躺在磁盘上，还会被“备份到本地”一并打包。
+export function removeBodyFiles(messageId: number): void {
+  try { fs.rmSync(bodyHtmlPath(messageId), { force: true }); } catch { /* ignore */ }
+  try { fs.rmSync(bodyTextPath(messageId), { force: true }); } catch { /* ignore */ }
 }

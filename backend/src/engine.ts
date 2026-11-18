@@ -3,14 +3,14 @@ import { pipeline } from 'node:stream/promises';
 import type { ImapFlow, FetchMessageObject } from 'imapflow';
 import {
   getDb, refreshFolderCounts, indexMessageFts, indexMessageEnvelope, removeMessageFts,
-  removeMessagesFtsByFolder, bodyHtmlPath, bodyTextPath,
+  removeMessagesFtsByFolder, bodyHtmlPath, bodyTextPath, removeBodyFiles,
 } from './db.js';
 import type { AccountRow, FolderRow, MessageRow, AttachmentRow } from './db.js';
 import { decryptSecret } from './cryptoUtil.js';
 import { makeImapClient, accountToImap, logError, isAuthError } from './imapUtil.js';
 import {
   detectFolderType, displayNameOf, collectAttachmentParts, matchAttachmentParts,
-  isNonSelectable,
+  isNonSelectable, toIsoDate,
 } from './mailUtil.js';
 import type { ListEntry, AttachmentPart } from './mailUtil.js';
 import { streamToParsed } from './mailStream.js';
@@ -48,6 +48,15 @@ const FOLDER_DISPLAY_NAMES: Record<string, string> = {
   spam: '垃圾邮件',
 };
 
+// R1: 网易系邮箱（163/126/yeah/188，同属 Coremail）——服务器会在约
+// 206 秒后静默断掉 IDLE 连接（每账号每小时约 400 次登录），长连接 +
+// IDLE 在此基本无效；这类账号改固定轮询（短命连接，每 5 分钟同步全部
+// 文件夹），QQ 等其他服务商保留 IDLE。
+export function isNetEaseHost(host: string): boolean {
+  const h = (host || '').toLowerCase().trim();
+  return /(^|\.)(163\.com|126\.com|yeah\.net|188\.com)$/.test(h);
+}
+
 interface AccountState {
   account: AccountRow;
   client: ImapFlow | null;
@@ -66,6 +75,8 @@ interface AccountState {
   sharedTimer: NodeJS.Timeout | null;
   // B23: 上次 LIST 文件夹清单的时间；手动刷新 1 小时内复用缓存清单。
   lastFolderListAt: number | null;
+  // R1: 网易系账号不保持长连接 IDLE，改轮询（_pollAllFolders）。
+  pollOnly: boolean;
 }
 
 // Public envelope shape (contract): no body, no password, ever.
@@ -97,6 +108,9 @@ export class SyncEngine {
   private fullFetchInflight = new Map<number, Promise<MessageRow>>();
   // Last full flag comparison per folder id (M5 CONDSTORE fallback throttle).
   private lastFullFlagSync = new Map<number, number>();
+  // R3: F1 去重时被跳过的服务器副本 UID（按文件夹）。只记内存：
+  // 下次同步直接跳过，不再重复 FETCH；全量重取/文件夹删除时清空。
+  private skippedDupeUids = new Map<number, Set<number>>();
 
   constructor(masterKey: Buffer) {
     this.key = masterKey;
@@ -131,6 +145,7 @@ export class SyncEngine {
       sharedClient: null,
       sharedTimer: null,
       lastFolderListAt: null,
+      pollOnly: isNetEaseHost(account.imap_host),
     };
     this.states.set(accountId, state);
     void this._connectLoop(accountId);
@@ -174,12 +189,18 @@ export class SyncEngine {
     const state = this.states.get(accountId);
     if (!state) return; // stopped
     try {
+      // R1: 网易系账号先起轮询定时器——之后无论首连成功与否，轮询
+      // 都是同步的驱动力（首连失败时轮询每 5 分钟再试，不用等重连退避）。
+      if (state.pollOnly) this._startPeriodicSync(accountId);
       const password = decryptSecret(state.account.password_enc, this.key);
-      const client = makeImapClient(accountToImap(state.account), password, { disableAutoIdle: false });
+      // R1: 网易系禁用 auto-IDLE（服务器约 206 秒静默断线，IDLE 无效）。
+      const client = makeImapClient(accountToImap(state.account), password, { disableAutoIdle: state.pollOnly });
       state.client = client;
       client.on('exists', () => this._onExists(accountId));
       client.on('expunge', () => this._onExists(accountId));
       client.on('close', () => {
+        // R1: 轮询账号没有要维持的长连接——close 不停轮询、不重连。
+        if (state.pollOnly) return;
         this._stopPeriodicSync(accountId);
         // B2: 认证失败的账号不再重连（close 事件也会走到这里，同样拦截）。
         if (this.states.get(accountId) === state && !state.authFailed) {
@@ -218,10 +239,18 @@ export class SyncEngine {
       // Plus a periodic INBOX re-sync as a fallback for servers whose
       // IDLE never fires (notably QQ Mail): without it, new mail can sit
       // on the server unsynced until the next reconnect.
-      this._startPeriodicSync(accountId);
+      if (state.pollOnly) {
+        // R1: 网易系不保持长连接——首连同步完就登出，之后只靠轮询
+        // （短命连接）同步。不断开的话服务器约 206 秒后静默断线，
+        // state.client 成半死连接，还会触发无意义的重连。
+        try { await client.logout(); } catch { /* ignore */ }
+        state.client = null;
+      } else {
+        this._startPeriodicSync(accountId);
+      }
       getDb().prepare("UPDATE accounts SET last_sync_at=datetime('now') WHERE id=?").run(accountId);
     } catch (e) {
-      this._stopPeriodicSync(accountId);
+      if (!state.pollOnly) this._stopPeriodicSync(accountId);
       const msg = String((e as Error)?.message || e);
       // B2: 认证失败（密码/授权码错）不再无限重连：置 authFailed、写明原因、
       // 停在 error 状态，等用户在邮箱设置里重测/改密码/重新启用后
@@ -265,11 +294,41 @@ export class SyncEngine {
     // 避免多账号的定时同步永远在同一秒齐发。
     const interval = Math.round(PERIODIC_SYNC_MS * (0.9 + Math.random() * 0.2));
     state.syncTimer = setInterval(() => {
+      // R1: 轮询账号同步全部文件夹（短命连接）；其他账号仍是
+      // INBOX 增量同步（与 IDLE `exists` 同款），只作 IDLE 不触发的兜底。
+      if (state.pollOnly) {
+        void this._pollAllFolders(accountId);
+        return;
+      }
       // Same incremental INBOX sync as the IDLE `exists` path; _onExists
       // no-ops safely when the connection is down (its _runOp rejects and
       // the error is logged), so a stale timer cannot corrupt anything.
       this._onExists(accountId);
     }, interval);
+  }
+
+  // R1: 网易系轮询——每 5 分钟用短命连接同步全部文件夹（LIST + 逐文件夹
+  // 增量同步）。每次只登一次：24 个 163 账号每小时共约 288 次登录，
+  // 且间隔带抖动；比 IDLE 静默断线后的约 400 次/小时/账号少一个量级。
+  // 单个文件夹同步失败不拖垮整轮（记日志、跳过、继续下一个文件夹）。
+  private async _pollAllFolders(accountId: number): Promise<void> {
+    const state = this.states.get(accountId);
+    if (!state) return;
+    try {
+      await this.withClient(accountId, async (c) => {
+        await this._syncFolders(c, accountId);
+        for (const f of this._dbFolders(accountId)) {
+          try {
+            await this._syncFolder(c, accountId, f);
+          } catch (e) {
+            logError(`poll sync folder failed account ${accountId} folder ${f.path}:`, (e as Error)?.message || e);
+          }
+        }
+      });
+      getDb().prepare("UPDATE accounts SET status='online', last_sync_at=datetime('now'), error=NULL WHERE id=?").run(accountId);
+    } catch (e) {
+      logError(`poll sync failed account ${accountId}:`, (e as Error)?.message || e);
+    }
   }
 
   private _stopPeriodicSync(accountId: number): void {
@@ -425,8 +484,10 @@ export class SyncEngine {
     try {
       // B23: 手动刷新复用已缓存的文件夹清单——LIST 只在连接建立时做，
       // 或上次 LIST 已超过 1 小时（文件夹删除的发现降级为定期）。
+      // R1: 走 withClient 而不是 _runOp——轮询账号没有长连接，
+      // _runOp 会直接报“IMAP 未连接”，手动刷新永远失败。
       const needList = !state.lastFolderListAt || Date.now() - state.lastFolderListAt > 60 * 60 * 1000;
-      await this._runOp(accountId, async (c) => {
+      await this.withClient(accountId, async (c) => {
         if (needList) await this._syncFolders(c, accountId);
         for (const f of this._dbFolders(accountId)) {
           try {
@@ -506,8 +567,13 @@ export class SyncEngine {
     const local = db.prepare('SELECT id, path FROM folders WHERE account_id=?').all(accountId) as { id: number; path: string }[];
     for (const f of local) {
       if (!seen.has(f.path)) {
+        // R2: 删文件夹时一并删正文文件——只删 DB 行不删文件时，
+        // 已删邮件的全文仍以明文躺在磁盘上。
+        const ids = db.prepare('SELECT id FROM messages WHERE folder_id=?').all(f.id) as { id: number }[];
         removeMessagesFtsByFolder(f.id);
         db.prepare('DELETE FROM messages WHERE folder_id=?').run(f.id);
+        for (const m of ids) removeBodyFiles(m.id);
+        this.skippedDupeUids.delete(f.id);
         db.prepare('DELETE FROM folders WHERE id=?').run(f.id);
       }
     }
@@ -559,6 +625,14 @@ export class SyncEngine {
       // 不会留一个空文件夹；重插时不发 new-mail（不是新信，重发会让前端
       // 重复显示、未读角标膨胀）。
       const all = await this._fetchEnvelopes(client, '1:*');
+      // D5: 全量重取会删光重插，本地已读状态会被服务器 flags 覆盖——
+      // 先记下本地已读的 UID，重插后恢复（本地已读优先，与增量路径一致）。
+      const readUids = new Set(
+        (db.prepare('SELECT uid FROM messages WHERE folder_id=? AND is_read=1').all(folder.id) as { uid: number }[])
+          .map((r) => r.uid),
+      );
+      // R2: 重插前记下旧行 id，事务成功后删掉它们的正文文件。
+      const staleIds = db.prepare('SELECT id FROM messages WHERE folder_id=?').all(folder.id) as { id: number }[];
       const tx = db.transaction(() => {
         removeMessagesFtsByFolder(folder.id);
         db.prepare('DELETE FROM messages WHERE folder_id=?').run(folder.id);
@@ -571,6 +645,14 @@ export class SyncEngine {
         }
       });
       tx();
+      for (const m of staleIds) removeBodyFiles(m.id);
+      // R3: 全量重取后去重记录失效（行已重建），清空。
+      this.skippedDupeUids.delete(folder.id);
+      if (readUids.size) {
+        const placeholders = [...readUids].map(() => '?').join(',');
+        db.prepare(`UPDATE messages SET is_read=1 WHERE folder_id=? AND uid IN (${placeholders})`)
+          .run(folder.id, ...[...readUids]);
+      }
       db.prepare(`INSERT INTO sync_state (folder_id, uidvalidity, uidnext, modseq, last_sync_at)
                   VALUES (?,?,?,?,datetime('now'))
                   ON CONFLICT(folder_id) DO UPDATE SET uidvalidity=excluded.uidvalidity,
@@ -589,7 +671,10 @@ export class SyncEngine {
       }
       const localRows = db.prepare('SELECT id, uid FROM messages WHERE folder_id=?').all(folder.id) as { id: number; uid: number }[];
       const localUids = new Set(localRows.map((r) => r.uid));
-      const newUids = [...serverUids].filter((u) => !localUids.has(u));
+      // R3: 去重时被跳过的服务器副本 UID 不再参与“新邮件”判定，
+      // 否则每轮同步都重新 FETCH 它一次（只记内存，全量重取时清空）。
+      const skipped = this.skippedDupeUids.get(folder.id);
+      const newUids = [...serverUids].filter((u) => !localUids.has(u) && !(skipped && skipped.has(u)));
       if (newUids.length) {
         // 从最小的新 UID 取到末尾（中间已知的会被 upsert 覆盖，无害）。
         // range 是 UID，必须传 {uid:true}，否则当序号取、超范围返回空。
@@ -629,6 +714,8 @@ export class SyncEngine {
           if (!serverUids.has(row.uid)) {
             removeMessageFts(row.id);
             db.prepare('DELETE FROM messages WHERE id=?').run(row.id);
+            // R2: 对账删行时同样删正文文件（与 deleteMessage 同款）。
+            removeBodyFiles(row.id);
             emit('mail-deleted', { messageId: row.id });
           }
         }
@@ -733,14 +820,18 @@ export class SyncEngine {
   // F1 附带：删掉同文件夹内同一 Message-ID 的其他服务器副本。
   // 163/QQ 发信后会自动再往已发送存一份（与客户端 APPEND 的那份同一
   // Message-ID、不同 UID）；原件移走/删掉后另一份还留在原文件夹，
-  // 墓碑又挡着它不再显示、界面里永远删不掉。只删 keepUid 之外的命中。
+  // 墓碑又挡着它不再显示、界面里永远删不掉。只删 keepUid 之外的命中；
+  // keepUid 为 null 时全部命中都删（彻底删除时清扫已发送文件夹用）。
   // 失败只记日志、不让本次删除失败（主删除已成功）。
-  private async _deleteOtherCopiesInFolder(accountId: number, folder: FolderRow, messageId: string, keepUid: number): Promise<void> {
+  private async _deleteOtherCopiesInFolder(accountId: number, folder: FolderRow, messageId: string, keepUid: number | null): Promise<void> {
     try {
       const others = await this.withClient(accountId, async (client) => {
-        return this._findUidsByMessageId(client, folder.path, messageId, { centerUid: keepUid });
+        return this._findUidsByMessageId(
+          client, folder.path, messageId,
+          keepUid != null ? { centerUid: keepUid } : {},
+        );
       });
-      const targets = others.filter((u) => u !== keepUid);
+      const targets = keepUid != null ? others.filter((u) => u !== keepUid) : others;
       if (!targets.length) return;
       await this.withClient(accountId, async (client) => {
         await client.mailboxOpen(folder.path);
@@ -808,16 +899,33 @@ export class SyncEngine {
       const snippetChanged = !!snippet && snippet !== (existing.snippet || '');
       const flagsChanged = JSON.stringify(flags) !== (existing.flags_json || '[]');
       if (!readChanged && !snippetChanged && !flagsChanged) return existing.id;
-      db.prepare(`UPDATE messages SET is_read=?, snippet=?, flags_json=?,
-                  updated_at=datetime('now') WHERE id=?`)
-        .run(readChanged ? (isRead ? 1 : 0) : existing.is_read,
+      if (readChanged) {
+        // R7: MODSEQ 分支的已读更新也加 5 分钟守卫，与 _syncFlagsFull 一致——
+        // 本地刚改过的已读状态（updated_at 很新）不能被服务器滞后的 flags
+        // 翻回去。守卫挡住时只更新 snippet/flags（不碰 updated_at，不续期窗口）。
+        const info = db.prepare(
+          `UPDATE messages SET is_read=?, snippet=?, flags_json=?,
+           updated_at=datetime('now') WHERE id=? AND updated_at < datetime('now', '-5 minutes')`,
+        ).run(isRead ? 1 : 0,
           snippetChanged ? snippet : (existing.snippet || ''),
           JSON.stringify(flags), existing.id);
-      if (readChanged) {
-        // 带上 accountId/folderId：前端收到时若该邮件不在当前列表里，
-        // 仍能凭事件里的账号/文件夹把未读角标减掉，避免角标滞后。
-        emit('mail-updated', { messageId: existing.id, accountId, folderId: folder.id, changes: { isRead } });
+        if (info.changes) {
+          // 带上 accountId/folderId：前端收到时若该邮件不在当前列表里，
+          // 仍能凭事件里的账号/文件夹把未读角标减掉，避免角标滞后。
+          emit('mail-updated', { messageId: existing.id, accountId, folderId: folder.id, changes: { isRead } });
+          return existing.id;
+        }
+        if (snippetChanged || flagsChanged) {
+          db.prepare('UPDATE messages SET snippet=?, flags_json=? WHERE id=?')
+            .run(snippetChanged ? snippet : (existing.snippet || ''), JSON.stringify(flags), existing.id);
+        }
+        return existing.id;
       }
+      db.prepare(`UPDATE messages SET is_read=?, snippet=?, flags_json=?,
+                  updated_at=datetime('now') WHERE id=?`)
+        .run(existing.is_read,
+          snippetChanged ? snippet : (existing.snippet || ''),
+          JSON.stringify(flags), existing.id);
       return existing.id;
     }
     // 防复活：删掉的信不要再被同步加回来。
@@ -846,7 +954,17 @@ export class SyncEngine {
       const dup = db.prepare(
         'SELECT id FROM messages WHERE account_id=? AND folder_id=? AND message_id=? LIMIT 1',
       ).get(accountId, folder.id, mid) as { id: number } | undefined;
-      if (dup) return dup.id;
+      if (dup) {
+        // R3: 记下被跳过的服务器副本 UID——下次同步直接跳过，不再重复
+        // FETCH 它（否则该 UID 永远在 serverUids - localUids 里）。
+        let skipped = this.skippedDupeUids.get(folder.id);
+        if (!skipped) {
+          skipped = new Set<number>();
+          this.skippedDupeUids.set(folder.id, skipped);
+        }
+        skipped.add(msg.uid);
+        return dup.id;
+      }
     }
     const info = db.prepare(
       `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
@@ -944,10 +1062,12 @@ export class SyncEngine {
     parsed.attachments = matchAttachmentParts(parsed.attachments, outcome.partList || []);
     // Bodies on disk (contract): sanitized HTML + plain text; SQLite keeps
     // only the path. FTS indexes the searchable text.
+    // R6: 先跑 DB 事务、成功后再写正文文件——旧版先写文件后跑事务，
+    // 事务失败时正文文件成孤儿。文件写失败时把 body_path 指回 NULL
+    // 并删掉已写一半的文件，下次打开重取（附件行先清后插，事务幂等）。
     const bodyPath = `bodies/${row.id}.html`;
-    fs.writeFileSync(bodyHtmlPath(row.id), parsed.bodyHtml);
-    fs.writeFileSync(bodyTextPath(row.id), parsed.bodyText);
     const tx = db.transaction(() => {
+      db.prepare('DELETE FROM attachments WHERE message_id=?').run(row.id);
       db.prepare(`UPDATE messages SET body_path=?, snippet=?, subject=?,
                   has_attachments=?, updated_at=datetime('now') WHERE id=?`)
         .run(bodyPath, parsed.snippet, parsed.envelope.subject || row.subject,
@@ -959,6 +1079,15 @@ export class SyncEngine {
       indexMessageFts(row.id, parsed.envelope.subject || row.subject, parsed.envelope.fromAddr, parsed.bodyText);
     });
     tx();
+    try {
+      fs.writeFileSync(bodyHtmlPath(row.id), parsed.bodyHtml);
+      fs.writeFileSync(bodyTextPath(row.id), parsed.bodyText);
+    } catch (e) {
+      fs.rmSync(bodyHtmlPath(row.id), { force: true });
+      fs.rmSync(bodyTextPath(row.id), { force: true });
+      db.prepare('UPDATE messages SET body_path=NULL WHERE id=?').run(row.id);
+      throw e;
+    }
     return db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow;
   }
 
@@ -1016,7 +1145,9 @@ export class SyncEngine {
       .run(target.id, newUid, messageId);
     refreshFolderCounts(source.id);
     refreshFolderCounts(target.id);
-    emit('mail-updated', { messageId, changes: { folderId: target.id } });
+    // 带上 accountId：前端收到跨文件夹移信事件时能凭账号/文件夹
+    // 更新未读角标（只带 folderId 时聚合视图的角标算不对，见审计#2 L3）。
+    emit('mail-updated', { messageId, accountId, folderId: target.id, changes: { folderId: target.id } });
     return db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow;
   }
 
@@ -1052,6 +1183,13 @@ export class SyncEngine {
     // 服务器副本（两份副本先后被移进已删除的情形）。
     if (row.message_id) {
       await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid);
+      // L3: 彻底删除时也清扫同账号已发送文件夹里的同 Message-ID 副本
+      // （第一次清扫失败、或副本在已发送里时，墓碑会挡着它永不显示、
+      // 界面里永远删不掉，只占服务器空间）。
+      const sentFolder = db.prepare("SELECT * FROM folders WHERE account_id=? AND type='sent' LIMIT 1").get(accountId) as FolderRow | undefined;
+      if (sentFolder && sentFolder.id !== folder.id) {
+        await this._deleteOtherCopiesInFolder(accountId, sentFolder, row.message_id, null);
+      }
     }
     const folderId = row.folder_id;
     // 墓碑：记下彻底删除邮件的 Message-ID，同步时跳过它，删掉的信不再复活。
@@ -1150,16 +1288,6 @@ function hasAttachments(bodyStructure: FetchMessageObject['bodyStructure']): boo
     return false;
   };
   return walk(bodyStructure);
-}
-
-// Date header -> ISO string, or null when missing/invalid. A malformed
-// Date header parses to an Invalid Date whose toISOString() throws —
-// without this guard one bad message kills the whole folder sync and the
-// account reconnect-loops on the same message forever (H1).
-function toIsoDate(v: Date | string | undefined | null): string | null {
-  if (!v) return null;
-  const d = v instanceof Date ? v : new Date(v);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 function decodeSnippet(buf: Buffer, encoding?: string | null): string {

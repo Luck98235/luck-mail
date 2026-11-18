@@ -43,6 +43,10 @@ export function createMockServer() {
     { id: 3, accountId: 1, accountEmail: 'zm235@163.com', folderId: 13, folderPath: '已发送', uid: 102, subject: '已发送的邮件', from: 'zm235@163.com', fromName: '', to: ['zm235@163.com'], date: new Date().toISOString(), snippet: '已发送。', isRead: true, hasAttachments: false, size: 90 }
   ]
 
+  // 服务端草稿内存态（仅供冒烟测试；真实后端存数据库）
+  let draftSeq = 1
+  const drafts = []
+
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost')
     let raw = ''
@@ -86,6 +90,31 @@ export function createMockServer() {
     }
     if (url.pathname === '/api/settings' && req.method === 'GET') return send(200, { ok: true, settings: { signature: '', defaultAccountId: 1 } })
     if (url.pathname === '/api/settings' && req.method === 'PUT') return send(200, { ok: true })
+    // ---- 服务端草稿（内存态，仅供冒烟测试走通 drafts 接口路径）----
+    if (url.pathname === '/api/drafts' && req.method === 'GET') {
+      return send(200, { ok: true, drafts: [...drafts].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) })
+    }
+    if (url.pathname === '/api/drafts' && req.method === 'POST') {
+      const d = { id: draftSeq++, accountId: body?.accountId ?? null, to: body?.to || '', subject: body?.subject || '', text: body?.text || '', idempotencyKey: body?.idempotencyKey || `mock-key-${Date.now()}`, updatedAt: new Date().toISOString() }
+      drafts.unshift(d)
+      return send(200, { ok: true, draft: d })
+    }
+    const draftMatch = url.pathname.match(/^\/api\/drafts\/(\d+)$/)
+    if (draftMatch && req.method === 'PUT') {
+      const d = drafts.find((x) => String(x.id) === draftMatch[1])
+      if (!d) return send(404, { ok: false, error: '草稿不存在' })
+      if (body?.accountId !== undefined) d.accountId = body.accountId
+      if (body?.to !== undefined) d.to = body.to
+      if (body?.subject !== undefined) d.subject = body.subject
+      if (body?.text !== undefined) d.text = body.text
+      d.updatedAt = new Date().toISOString()
+      return send(200, { ok: true, draft: d })
+    }
+    if (draftMatch && req.method === 'DELETE') {
+      const idx = drafts.findIndex((x) => String(x.id) === draftMatch[1])
+      if (idx >= 0) drafts.splice(idx, 1)
+      return send(200, { ok: true })
+    }
     if (url.pathname === '/api/messages' && req.method === 'GET') {
       const view = url.searchParams.get('view') || 'all-inbox'
       const accountId = url.searchParams.get('accountId')
@@ -125,6 +154,12 @@ export function createMockServer() {
       return send(200, { ok: true })
     }
     if (url.pathname === '/api/messages/send' && req.method === 'POST') {
+      // 发信成功后服务端按 draftId 自动删草稿（JSON 发信时 body 里有 draftId；
+      // multipart 发信 mock 不解析，删草稿走不到，冒烟只覆盖 JSON 路径）。
+      if (body?.draftId != null) {
+        const di = drafts.findIndex((x) => String(x.id) === String(body.draftId))
+        if (di >= 0) drafts.splice(di, 1)
+      }
       // 发信成功后把已发送副本记进 mock 数据：前端切到所有已发送后能看到它，
       // 再按 201 返回的 id 打开（F2 的 openMessage(sent.id) 走 GET /api/messages/100）。
       // id 用 100，避免与 Socket.io 推送的新邮件（id 99）撞号。

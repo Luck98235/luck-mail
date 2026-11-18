@@ -35,10 +35,10 @@ export const useAuthStore = defineStore('auth', () => {
     return '网络异常，请检查连接后重试。'
   }
 
-  async function login(name: string, password: string): Promise<boolean> {
+  async function login(name: string, password: string, rememberMe = false): Promise<boolean> {
     lastError.value = ''
     try {
-      const data = await api.login(name, password)
+      const data = await api.login(name, password, rememberMe)
       loggedIn.value = true
       username.value = data.username || name
       return true

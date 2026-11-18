@@ -9,6 +9,8 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import Database from 'better-sqlite3';
@@ -100,8 +102,12 @@ try {
   check('setup rejects short password (400)', r.status === 400);
   r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'testpass123', confirm: 'testpass123' });
   check('setup creates single user (201)', r.status === 201 && r.json?.ok === true);
+  r = await api('GET', '/api/auth/status');
+  check('D6: setup creates a session (logged in immediately, no second login needed)', r.json?.loggedIn === true && r.json?.username === 'tester', JSON.stringify(r.json));
   r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'testpass123', confirm: 'testpass123' });
   check('second setup rejected (409)', r.status === 409);
+  // D6: setup 成功后直接建会话（登录态）——下面测 401 要先清掉 setup 发的 Cookie。
+  cookie = '';
   r = await api('GET', '/api/accounts');
   check('authed endpoints need login (401)', r.status === 401);
   r = await api('POST', '/api/auth/login', { username: 'tester', password: 'wrongpass' });
@@ -470,7 +476,7 @@ try {
       c4.status === 'claimed' && gone === undefined && c5.status === 'claimed');
   }
 
-  // B5: SMTP 连接池（nodemailer 6.10.1）+ dropTransporter 正常关闭。
+  // B5: SMTP 连接池（nodemailer 10.6.0）+ dropTransporter 正常关闭。
   {
     const { getTransporter, dropTransporter } = await import('../dist/smtpUtil.js');
     const fakeRow = {
@@ -814,6 +820,392 @@ try {
       engine.states.delete(accountId);
     }
   }
+  // ---------- 15. audit #5 backend fixes ----------
+  console.log('== audit #5 fixes ==');
+  const { openDb } = await import('../dist/db.js');
+  const vdb = openDb();
+
+  // 1: CSRF——备份/导出只接受 POST；Cookie SameSite=Strict。
+  r = await api('GET', '/api/backup/download');
+  check('S1: GET /api/backup/download -> 404 (POST only)', r.status === 404, `status=${r.status}`);
+  r = await api('GET', '/api/accounts/export');
+  check('S1: GET /api/accounts/export -> 404 (POST only)', r.status === 404, `status=${r.status}`);
+  r = await api('POST', '/api/backup/download');
+  check('S1: POST /api/backup/download -> 200', r.status === 200, `status=${r.status}`);
+  {
+    const loginRes = await fetch(BASE + '/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'tester', password: 'testpass123' }),
+    });
+    const sc = loginRes.headers.get('set-cookie') || '';
+    check('S1: session cookie SameSite=Strict + HttpOnly', /SameSite=Strict/i.test(sc) && /HttpOnly/i.test(sc), sc.slice(0, 140));
+  }
+
+  // 24: /api 响应 no-store。
+  r = await api('GET', '/api/accounts');
+  check('D1: /api responses carry Cache-Control: no-store', r.headers.get('cache-control') === 'no-store', String(r.headers.get('cache-control')));
+
+  // 21: 健康检查端点（无需登录）。
+  {
+    const savedCookie = cookie;
+    cookie = '';
+    const hr = await api('GET', '/api/health');
+    check('health: GET /api/health -> 200 {ok, db, accountsOnline} without login',
+      hr.status === 200 && hr.json?.ok === true && hr.json?.db === 'ok' && typeof hr.json?.accountsOnline === 'number',
+      `status=${hr.status} body=${JSON.stringify(hr.json)}`);
+    cookie = savedCookie;
+  }
+
+  // 2: 会话过期按 SQLite datetime 比较（过期 1 小时的行不再有效；旧 ISO 格式同理）。
+  {
+    const userRow = vdb.prepare("SELECT id FROM users WHERE username='tester'").get();
+    const mkToken = (expiresAt) => {
+      const tok = crypto.randomBytes(32).toString('hex');
+      const hash = crypto.createHash('sha256').update(tok).digest('hex');
+      vdb.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?,?,?)').run(hash, userRow.id, expiresAt);
+      return tok;
+    };
+    const fmt = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
+    const savedCookie = cookie;
+    cookie = `lm_session=${mkToken(fmt(new Date(Date.now() - 3600e3)))}`;
+    r = await api('GET', '/api/auth/status');
+    check('S2: session expired 1h ago (SQLite datetime) is NOT valid', r.json?.loggedIn === false, JSON.stringify(r.json));
+    cookie = `lm_session=${mkToken(new Date(Date.now() - 3600e3).toISOString())}`;
+    r = await api('GET', '/api/auth/status');
+    check('S2: legacy ISO-format expired session is NOT valid either', r.json?.loggedIn === false, JSON.stringify(r.json));
+    cookie = `lm_session=${mkToken(fmt(new Date(Date.now() + 3600e3)))}`;
+    r = await api('GET', '/api/auth/status');
+    check('S2: session expiring in 1h IS valid', r.json?.loggedIn === true, JSON.stringify(r.json));
+    cookie = savedCookie;
+  }
+
+  // 3: rememberMe 缺省 = 1 天；明确 true = 30 天（SQLite julianday 差值，时区无关）。
+  {
+    await api('POST', '/api/auth/login', { username: 'tester', password: 'testpass123' });
+    const h1 = vdb.prepare("SELECT (julianday(expires_at) - julianday('now')) * 24 AS h FROM sessions ORDER BY id DESC LIMIT 1").get().h;
+    check('S3: login without rememberMe -> ~1 day session', h1 > 23 && h1 < 25, `hours=${h1.toFixed(2)}`);
+    await api('POST', '/api/auth/login', { username: 'tester', password: 'testpass123', rememberMe: true });
+    const h2 = vdb.prepare("SELECT (julianday(expires_at) - julianday('now')) * 24 AS h FROM sessions ORDER BY id DESC LIMIT 1").get().h;
+    check('S3: login with rememberMe=true -> ~30 day session', h2 > 719 && h2 < 721, `hours=${h2.toFixed(2)}`);
+  }
+
+  // D7: 锁过期后一次正确登录即解锁（不再“一错就再锁 15 分钟”）。
+  {
+    vdb.prepare("UPDATE users SET failed_attempts=5, locked_until=datetime('now','-1 minute') WHERE username='tester'").run();
+    r = await api('POST', '/api/auth/login', { username: 'tester', password: 'testpass123' });
+    const row = vdb.prepare("SELECT failed_attempts, locked_until FROM users WHERE username='tester'").get();
+    check('D7: login succeeds after lock expired and resets failed_attempts/lock',
+      r.status === 200 && row.failed_attempts === 0 && row.locked_until === null,
+      `status=${r.status} row=${JSON.stringify(row)}`);
+  }
+
+  // 8: 163 轮询判定 + _pollAllFolders 存在；QQ 不走轮询。
+  {
+    const { isNetEaseHost, SyncEngine } = await import('../dist/engine.js');
+    check('R1: isNetEaseHost matches 163/126/yeah/188, not QQ/Gmail',
+      isNetEaseHost('imap.163.com') && isNetEaseHost('imap.126.com')
+      && isNetEaseHost('imap.yeah.net') && isNetEaseHost('imap.188.com')
+      && !isNetEaseHost('imap.qq.com') && !isNetEaseHost('imap.gmail.com'));
+    check('R1: SyncEngine has _pollAllFolders (163 polling path)',
+      typeof SyncEngine.prototype._pollAllFolders === 'function');
+  }
+
+  // 9: 同步删除对账时正文孤儿文件一并删。
+  {
+    const { SyncEngine } = await import('../dist/engine.js');
+    const { indexMessageFts } = await import('../dist/db.js');
+    const acc9 = vdb.prepare(
+      `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+        smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+    ).run('orphan9@163.com', 'O9', encryptSecret('FAKE', key),
+      'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+    const acc9Id = Number(acc9.lastInsertRowid);
+    const f9 = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, 'INBOX', '收件箱', 'inbox')").run(acc9Id);
+    const f9Id = Number(f9.lastInsertRowid);
+    const f9Row = vdb.prepare('SELECT * FROM folders WHERE id=?').get(f9Id);
+    const m9 = vdb.prepare(
+      `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date,
+        snippet, body_path, is_read, has_attachments, size, flags_json)
+       VALUES (?,?,?,?,?,?,?,?,?,NULL,0,0,123,'[]')`,
+    ).run(acc9Id, f9Id, 777, '<orphan9@x>', 'orphan body', 'a@163.com', '[]', new Date().toISOString(), 'orphan');
+    const m9Id = Number(m9.lastInsertRowid);
+    fs.mkdirSync(path.join(DATA_DIR, 'bodies'), { recursive: true });
+    fs.writeFileSync(path.join(DATA_DIR, 'bodies', `${m9Id}.html`), '<p>orphan</p>');
+    fs.writeFileSync(path.join(DATA_DIR, 'bodies', `${m9Id}.txt`), 'orphan');
+    vdb.prepare('UPDATE messages SET body_path=? WHERE id=?').run(`bodies/${m9Id}.html`, m9Id);
+    indexMessageFts(m9Id, 'orphan body', 'a@163.com', 'orphan');
+    const fakeClient9 = {
+      mailboxOpen: async () => ({ uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: 0 }),
+      search: async () => [],
+      fetch: async function* () { /* no server messages */ },
+    };
+    const engine9 = new SyncEngine(key);
+    await engine9._syncFolder(fakeClient9, acc9Id, f9Row);
+    const rowGone = vdb.prepare('SELECT COUNT(*) c FROM messages WHERE id=?').get(m9Id).c === 0;
+    const ftsGone = vdb.prepare('SELECT COUNT(*) c FROM messages_fts WHERE rowid=?').get(m9Id).c === 0;
+    const filesGone = !fs.existsSync(path.join(DATA_DIR, 'bodies', `${m9Id}.html`))
+      && !fs.existsSync(path.join(DATA_DIR, 'bodies', `${m9Id}.txt`));
+    check('R2: sync reconciliation deletes the row + FTS row + body files (html+txt)',
+      rowGone && ftsGone && filesGone, `row=${rowGone} fts=${ftsGone} files=${filesGone}`);
+  }
+
+  // 17: 唯一约束 + 20: FTS 空词不 500。
+  {
+    const idx = vdb.prepare('PRAGMA index_list(messages)').all();
+    const hasIdx = idx.some((x) => x.name === 'idx_messages_account_folder_mid' && x.unique === 1);
+    let dupThrew = false;
+    try {
+      const ins = vdb.prepare(
+        `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date,
+          snippet, body_path, is_read, has_attachments, size, flags_json)
+         VALUES (?,?,?,?,?,?,?,?,?,NULL,0,0,1,'[]')`,
+      );
+      ins.run(accountId, folderId, 424242, '<dup-mid@x>', 'dup1', 'a@163.com', '[]', new Date().toISOString(), 'd');
+      ins.run(accountId, folderId, 424243, '<dup-mid@x>', 'dup2', 'a@163.com', '[]', new Date().toISOString(), 'd');
+    } catch (e) {
+      dupThrew = String(e?.message || e).includes('UNIQUE constraint failed');
+    }
+    check('L4: UNIQUE(account_id, folder_id, message_id) index exists and rejects duplicates',
+      hasIdx && dupThrew, `index=${hasIdx} threw=${dupThrew}`);
+  }
+  r = await api('GET', '/api/messages?' + new URLSearchParams({ q: '""' }));
+  check('D4: search with only quotes does not 500', r.status === 200 && Array.isArray(r.json?.messages), `status=${r.status}`);
+  r = await api('GET', '/api/messages?' + new URLSearchParams({ q: '"' }));
+  check('D4: search with a single quote does not 500', r.status === 200 && Array.isArray(r.json?.messages), `status=${r.status}`);
+
+  // 依赖版本（5/6/7）：multer 2.0.1、nodemailer 10.6.0、imapflow 2.12.1。
+  {
+    const pkg = JSON.parse(fs.readFileSync(path.join(BACKEND, 'package.json'), 'utf8'));
+    const depVer = (name) => String(pkg.dependencies?.[name] || '').replace(/^\^/, '');
+    check('deps: multer 2.0.1 / nodemailer 10.6.0 / imapflow 2.12.1 in package.json',
+      depVer('multer') === '2.0.1'
+      && depVer('nodemailer') === '10.6.0'
+      && depVer('imapflow') === '2.12.1',
+      JSON.stringify({ m: depVer('multer'), n: depVer('nodemailer'), i: depVer('imapflow') }));
+    const lock = JSON.parse(fs.readFileSync(path.join(BACKEND, 'package-lock.json'), 'utf8'));
+    const lv = (name) => lock.packages?.[`node_modules/${name}`]?.version;
+    check('deps: package-lock.json matches (multer/nodemailer/imapflow)',
+      lv('multer') === '2.0.1' && lv('nodemailer') === '10.6.0' && lv('imapflow') === '2.12.1',
+      JSON.stringify({ m: lv('multer'), n: lv('nodemailer'), i: lv('imapflow') }));
+  }
+
+  // 28: CSV 导入 + 模板 + xlsx 拒绝。
+  async function apiMultipart(p, fileName, content, mime = 'text/csv') {
+    const fd = new FormData();
+    fd.append('file', new Blob([content], { type: mime }), fileName);
+    const res = await fetch(BASE + p, { method: 'POST', headers: { Cookie: cookie }, body: fd });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* non-JSON */ }
+    return { status: res.status, json, text, headers: res.headers };
+  }
+  {
+    // 注：fetch 的 text() 会按 Encoding 规范吞掉 UTF-8 BOM，所以 BOM
+    // 须按原始字节验（EF BB BF），不能用 text().charCodeAt(0)。
+    const tplRes = await fetch(BASE + '/api/accounts/import-template', { headers: { Cookie: cookie } });
+    const tplBuf = new Uint8Array(await tplRes.arrayBuffer());
+    const tplText = new TextDecoder('utf-8').decode(tplBuf);
+    const hasBom = tplBuf[0] === 0xef && tplBuf[1] === 0xbb && tplBuf[2] === 0xbf;
+    check('CSV: import-template returns text/csv + luck-mail-import-template.csv + BOM + 8 headers',
+      tplRes.status === 200
+      && String(tplRes.headers.get('content-type') || '').includes('text/csv')
+      && String(tplRes.headers.get('content-disposition') || '').includes('luck-mail-import-template.csv')
+      && hasBom
+      && tplText.includes('序号,邮箱名,授权码,接收服务器（IMAP）,IMAP端口,发送服务器（SMTP）,SMTP端口,备注'),
+      `status=${tplRes.status} ct=${tplRes.headers.get('content-type')} bom=${hasBom} body=${tplText.slice(0, 60)}`);
+    const csv = '\uFEFF序号,邮箱名,授权码,接收服务器（IMAP）,IMAP端口,发送服务器（SMTP）,SMTP端口,备注\r\n'
+      + '1,csv1@163.com,CODE1,imap.163.com,993,smtp.163.com,465,普通\r\n'
+      + '2,"csv2@163.com","CO,DE2",imap.163.com,993,smtp.163.com,465,"带,逗号"\r\n'
+      + '3,CSV1@163.com,CODE1X,imap.163.com,993,smtp.163.com,465,重复\r\n'
+      + '4,bad-email,CODE,imap.163.com,993,smtp.163.com,465,x\r\n'
+      + '5,csv5@unknown-domain-xyz.com,CODE5,,,,,x\r\n'
+      + '6,csv6@163.com,CODE6,imap.163.com,993,smtp.163.com,465,"多行\n备注"\r\n';
+    const imp = await apiMultipart('/api/accounts/import', 'import.csv', csv);
+    // resolvePreset 对未知域名也会造 imap./smtp.<domain>（与手动添加一致），
+    // 所以 csv5 同样入库（added=4）；只有格式错的 bad-email 进 failed。
+    check('CSV: import adds 4 (incl. quoted comma + quoted newline + unknown domain), skips 1 dup, fails 1',
+      imp.status === 200 && imp.json?.added === 4 && imp.json?.skipped === 1 && imp.json?.failed?.length === 1,
+      `status=${imp.status} body=${JSON.stringify(imp.json)}`);
+    // 清理：删掉刚导入的 4 个账号（API 删除会停 engine，避免假账号连真实 163）。
+    const listAfter = await api('GET', '/api/accounts');
+    const csvIds = (listAfter.json?.accounts || []).filter((a) => a.email.startsWith('csv')).map((a) => a.id);
+    for (const id of csvIds) await api('DELETE', `/api/accounts/${id}`);
+    const listClean = await api('GET', '/api/accounts');
+    check('CSV: imported accounts cleaned up via API delete',
+      !(listClean.json?.accounts || []).some((a) => a.email.startsWith('csv')), `left=${csvIds.length}`);
+    const xlsx = await apiMultipart('/api/accounts/import', 'old.xlsx',
+      new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0, 0, 0]), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    check('CSV: xlsx file rejected with a clear CSV message (400)',
+      xlsx.status === 400 && typeof xlsx.json?.error === 'string' && xlsx.json.error.includes('CSV'),
+      `status=${xlsx.status} error=${xlsx.json?.error}`);
+  }
+
+  // ---------- 16. drafts API + fake-SMTP send ----------
+  console.log('== drafts API ==');
+  // 草稿 CRUD（用第 5 节种子账号 accountId，存在即可）。
+  r = await api('POST', '/api/drafts', { accountId: 999999, to: 'x@163.com', subject: 'bad', text: '' });
+  check('drafts: POST with unknown accountId -> 400', r.status === 400, `status=${r.status}`);
+  r = await api('POST', '/api/drafts', { accountId, to: 'a@163.com', subject: 'first', text: 'hello' });
+  const draft1 = r.json?.draft;
+  check('drafts: POST creates draft, server generates idempotencyKey when missing',
+    r.status === 201 && typeof draft1?.id === 'number' && typeof draft1?.idempotencyKey === 'string' && draft1.idempotencyKey.length > 0
+    && draft1.to === 'a@163.com' && draft1.subject === 'first',
+    `status=${r.status} draft=${JSON.stringify(draft1)}`);
+  r = await api('POST', '/api/drafts', { accountId, to: 'b@163.com', subject: 'second', text: 'world', idempotencyKey: 'draft-key-1' });
+  const draft2 = r.json?.draft;
+  check('drafts: POST keeps a caller-provided idempotencyKey',
+    r.status === 201 && draft2?.idempotencyKey === 'draft-key-1', `status=${r.status}`);
+  r = await api('GET', '/api/drafts');
+  check('drafts: GET lists both, newest first (updatedAt DESC, id DESC)',
+    r.status === 200 && Array.isArray(r.json?.drafts) && r.json.drafts.length >= 2
+    && r.json.drafts[0].id === draft2.id && r.json.drafts.some((d) => d.id === draft1.id),
+    `count=${r.json?.drafts?.length} first=${r.json?.drafts?.[0]?.id}`);
+  r = await api('PUT', `/api/drafts/${draft2.id}`, { to: 'new@163.com', idempotencyKey: 'HACKED' });
+  check('drafts: PUT updates fields but idempotencyKey never changes',
+    r.status === 200 && r.json?.draft?.to === 'new@163.com' && r.json?.draft?.idempotencyKey === 'draft-key-1',
+    `status=${r.status} draft=${JSON.stringify(r.json?.draft)}`);
+  r = await api('PUT', '/api/drafts/999999', { to: 'x@163.com' });
+  check('drafts: PUT unknown id -> 404', r.status === 404, `status=${r.status}`);
+  r = await api('DELETE', '/api/drafts/999999');
+  check('drafts: DELETE unknown id -> 404', r.status === 404, `status=${r.status}`);
+  r = await api('DELETE', `/api/drafts/${draft1.id}`);
+  check('drafts: DELETE removes the draft', r.status === 200, `status=${r.status}`);
+  r = await api('GET', '/api/drafts');
+  check('drafts: deleted draft is gone from the list',
+    !(r.json?.drafts || []).some((d) => d.id === draft1.id) && (r.json?.drafts || []).some((d) => d.id === draft2.id));
+
+  // 发信删草稿：本地假 SMTP（nodemailer 10.x + MailComposer 真实走一遍）。
+  // 假 SMTP 只认 PLAIN/LOGIN + MAIL/RCPT/DATA/QUIT；不通告 STARTTLS，
+  // 账号用 smtp_secure='STARTTLS'（secure=false，走明文）。
+  let fakeSmtp = null;
+  let fakePort = 0;
+  let gotMail = false;
+  let lastRaw = '';
+  try {
+    fakeSmtp = await new Promise((resolve, reject) => {
+      const sockets = new Set();
+      const srv = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+        let buf = '';
+        let dataMode = false;
+        let authStep = 0; // 0 idle, 1 await user, 2 await pass
+        socket.write('220 localhost fake SMTP\r\n');
+        socket.on('data', (chunk) => {
+          buf += chunk.toString('utf8');
+          let idx;
+          while ((idx = buf.indexOf('\r\n')) >= 0) {
+            const line = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            if (dataMode) {
+              if (line === '.') { dataMode = false; gotMail = true; socket.write('250 OK: queued\r\n'); }
+              else lastRaw += line + '\r\n';
+              continue;
+            }
+            const up = line.toUpperCase();
+            if (up.startsWith('EHLO') || up.startsWith('HELO')) socket.write('250-localhost\r\n250 AUTH LOGIN PLAIN\r\n');
+            else if (up.startsWith('AUTH PLAIN')) { authStep = 0; socket.write('235 OK\r\n'); }
+            else if (up.startsWith('AUTH LOGIN')) { authStep = 1; socket.write('334 VXNlcm5hbWU6\r\n'); }
+            else if (authStep === 1) { authStep = 2; socket.write('334 UGFzc3dvcmQ6\r\n'); }
+            else if (authStep === 2) { authStep = 0; socket.write('235 OK\r\n'); }
+            else if (up.startsWith('MAIL FROM:')) socket.write('250 OK\r\n');
+            else if (up.startsWith('RCPT TO:')) socket.write('250 OK\r\n');
+            else if (up === 'DATA') { dataMode = true; lastRaw = ''; socket.write('354 Go ahead\r\n'); }
+            else if (up === 'RSET' || up === 'NOOP') socket.write('250 OK\r\n');
+            else if (up === 'QUIT') { socket.write('221 Bye\r\n'); socket.end(); }
+            else socket.write('250 OK\r\n');
+          }
+        });
+      });
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        srv._sockets = sockets;
+        resolve(srv);
+      });
+    });
+    fakePort = fakeSmtp.address().port;
+    const smtpAcc = vdb.prepare(
+      `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+        smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+    ).run('draftsend@163.com', 'DraftSend', encryptSecret('FAKEPASS', key),
+      '127.0.0.1', 9999, 'SSL', '127.0.0.1', fakePort, 'STARTTLS', 1);
+    const smtpAccId = Number(smtpAcc.lastInsertRowid);
+    r = await api('POST', '/api/drafts', { accountId: smtpAccId, to: 'x@163.com', subject: 'draft send', text: 'hi' });
+    const sendDraft = r.json?.draft;
+    r = await api('POST', '/api/messages/send', {
+      accountId: smtpAccId, to: 'x@163.com', subject: 'draft send', text: 'hi', draftId: sendDraft?.id,
+      inReplyTo: '<orig@x>', references: '<a@x> <b@x>',
+    });
+    check('drafts: send succeeds via fake SMTP (201) and the fake server got the DATA',
+      r.status === 201 && gotMail, `status=${r.status} gotMail=${gotMail} body=${JSON.stringify(r.json)?.slice(0, 160)}`);
+    check('threading: sent mail carries In-Reply-To + References headers',
+      lastRaw.includes('In-Reply-To: <orig@x>') && lastRaw.includes('References: <a@x> <b@x>'),
+      `raw-head=${lastRaw.split('\r\n').slice(0, 12).join(' | ')}`);
+    r = await api('GET', '/api/drafts');
+    check('drafts: draft is deleted after successful send',
+      !(r.json?.drafts || []).some((d) => d.id === sendDraft?.id), `left=${JSON.stringify((r.json?.drafts || []).map((d) => d.id))}`);
+    // 发信失败保留草稿：idemtest 账号走真实 smtp.163.com，假凭据 -> 502。
+    r = await api('POST', '/api/drafts', { accountId: smtpAccId, to: 'y@163.com', subject: 'keep me', text: 'hi' });
+    const keepDraft = r.json?.draft;
+    r = await api('POST', '/api/messages/send', {
+      accountId: idemAccountId, to: 'x@163.com', subject: 'will fail', text: 'hi', draftId: keepDraft?.id,
+    });
+    check('drafts: send failure (502) keeps the draft',
+      r.status === 502, `status=${r.status}`);
+    r = await api('GET', '/api/drafts');
+    check('drafts: failed-send draft still listed',
+      (r.json?.drafts || []).some((d) => d.id === keepDraft?.id));
+    // 级联：删账号时其草稿一并删（FK ON DELETE CASCADE）。
+    r = await api('DELETE', `/api/accounts/${smtpAccId}`);
+    const leftDrafts = vdb.prepare('SELECT COUNT(*) c FROM drafts WHERE account_id=?').get(smtpAccId).c;
+    check('drafts: deleting the account cascade-deletes its drafts',
+      r.status === 200 && leftDrafts === 0, `status=${r.status} left=${leftDrafts}`);
+    const { dropTransporter } = await import('../dist/smtpUtil.js');
+    dropTransporter(smtpAccId);
+  } finally {
+    if (fakeSmtp) {
+      try { for (const s of fakeSmtp._sockets || []) s.destroy(); } catch { /* ignore */ }
+      await new Promise((resolve) => fakeSmtp.close(resolve));
+    }
+  }
+
+  // ---------- 17. audit #2 L1: delete idempotency (backend half) ----------
+  console.log('== delete idempotency ==');
+  // 批量删：同一 key 两次提交返回同一 taskId，不另起任务。
+  // （种子信 m1 的账号没有 trash 文件夹，任务本身会逐封失败——
+  // 这里只验幂等键复用同一任务，不验删除成功。）
+  r = await api('POST', '/api/messages/batch-delete', { ids: [m1], idempotencyKey: 'del-batch-1' });
+  const delTaskA = r.json?.taskId;
+  check('L1: batch-delete with key returns a taskId',
+    r.status === 200 && typeof delTaskA === 'string' && r.json?.duplicate !== true,
+    `status=${r.status} taskId=${delTaskA}`);
+  r = await api('POST', '/api/messages/batch-delete', { ids: [m1], idempotencyKey: 'del-batch-1' });
+  check('L1: same key returns the SAME taskId with duplicate:true (no second task)',
+    r.status === 200 && r.json?.taskId === delTaskA && r.json?.duplicate === true,
+    `status=${r.status} taskId=${r.json?.taskId}`);
+  r = await api('POST', '/api/messages/batch-delete', { ids: [m1], idempotencyKey: 'del-batch-2' });
+  check('L1: a different key creates a different task',
+    r.status === 200 && typeof r.json?.taskId === 'string' && r.json.taskId !== delTaskA,
+    `taskId=${r.json?.taskId}`);
+  // 等两个任务跑完，避免后台任务拖到进程退出。
+  for (const tid of [delTaskA, r.json?.taskId]) {
+    for (let i = 0; i < 40; i++) {
+      const s = await api('GET', `/api/messages/delete-status?taskId=${encodeURIComponent(tid)}`);
+      if (s.json && s.json.running === false) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+  // 单删：key 已记为某 id 时，重复提交直接返回 duplicate，不再调 IMAP。
+  vdb.prepare('INSERT OR IGNORE INTO delete_idempotency (idempotency_key, message_db_id) VALUES (?,?)')
+    .run('del-single-1', 424242);
+  r = await api('DELETE', '/api/messages/424242?idempotencyKey=del-single-1');
+  check('L1: single delete with a used key returns duplicate:true without touching IMAP',
+    r.status === 200 && r.json?.duplicate === true, `status=${r.status} body=${JSON.stringify(r.json)}`);
+  r = await api('DELETE', '/api/messages/424243?idempotencyKey=del-single-1');
+  check('L1: same key for a different message -> 409', r.status === 409, `status=${r.status}`);
+  r = await api('DELETE', '/api/messages/424242?idempotencyKey=' + 'x'.repeat(129));
+  check('L1: over-long idempotencyKey -> 400', r.status === 400, `status=${r.status}`);
+
 } catch (e) {
   console.error('VERIFY ABORTED:', e);
   fail++;

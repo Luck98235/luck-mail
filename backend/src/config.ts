@@ -34,6 +34,10 @@ export const LARGE_PARSE_THRESHOLD: number = Number(
 /** Ensure data dirs exist. Returns the 32-byte master key (generated once, mode 0600). */
 export function initStorage(): Buffer {
   for (const d of [DATA_DIR, ATTACHMENTS_DIR, BODIES_DIR]) fs.mkdirSync(d, { recursive: true });
+  // S10: 正文与附件缓存目录只允许属主访问（旧版是默认 umask，0775/0755，
+  // 服务器上任何本地账号都能读全部邮件明文）。
+  try { fs.chmodSync(BODIES_DIR, 0o700); } catch { /* ignore */ }
+  try { fs.chmodSync(ATTACHMENTS_DIR, 0o700); } catch { /* ignore */ }
   const keyDir = path.dirname(KEY_FILE);
   if (keyDir) fs.mkdirSync(keyDir, { recursive: true });
 

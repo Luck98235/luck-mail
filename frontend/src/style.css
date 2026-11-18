@@ -82,6 +82,8 @@ body[data-theme] .border-blue-400 { border-color: var(--c-400) !important; }
 body[data-theme] .border-blue-100\/50 { border-color: var(--c-100-50) !important; }
 body[data-theme] .focus\:border-blue-400:focus { border-color: var(--c-400) !important; }
 body[data-theme] .focus\:ring-blue-400:focus { --tw-ring-color: var(--c-400) !important; }
+/* 复选框/单选框的 accent 颜色跟随主题（审计 #5 LOW：以前 accent-blue-500 恒为蓝色） */
+body[data-theme] .accent-blue-500 { accent-color: var(--c-500) !important; }
 body[data-theme] .from-blue-400 { --tw-gradient-from: var(--c-400) !important; }
 body[data-theme] .to-blue-600 { --tw-gradient-to: var(--c-600) !important; }
 

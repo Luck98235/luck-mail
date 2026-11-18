@@ -3,7 +3,9 @@ import { makeSmtpTransporter, accountToImap } from './imapUtil.js';
 import type { AccountRow } from './db.js';
 
 // MailComposer types come from @types/nodemailer.
-import MailComposer from 'nodemailer/lib/mail-composer/index.js';
+// nodemailer 10.x 的 exports map 只认 'nodemailer/lib/mail-composer'
+// （不带 /index.js）；6.x 下该路径同样解析到 lib/mail-composer/index.js。
+import MailComposer from 'nodemailer/lib/mail-composer';
 
 export interface SendMailInput {
   to: string | string[];
@@ -12,6 +14,11 @@ export interface SendMailInput {
   subject: string;
   text?: string;
   html?: string;
+  // 回复/转发 threading 头（审计 #2 缺口，后端半边）：前端回复时把
+  // 原信的 Message-ID 当 inReplyTo、把原信的 References 链传下来，
+  // 收件方才能把回复归入原会话线程。不传则不带这两个头。
+  inReplyTo?: string;
+  references?: string | string[];
   // 附件二选一：content（内存 Buffer，旧调用）或 path（磁盘临时文件，
   // 发信路由用 multer diskStorage 落盘后传 path，不再把大附件全放内存）。
   attachments?: { filename: string; content?: Buffer; path?: string; contentType?: string; size?: number }[];
@@ -58,6 +65,18 @@ function buildMailOptions(account: AccountRow, input: SendMailInput) {
   const from = account.display_name
     ? `"${account.display_name.replace(/"/g, '')}" <${account.email}>`
     : account.email;
+  // Threading 头先消毒：去 CR/LF（防头注入）、限长；格式不对的直接丢弃、
+  // 不让一封回复因为头格式问题发不出去。
+  const cleanHeader = (v: string, maxLen: number): string | undefined => {
+    const s = v.replace(/[\r\n]/g, '').trim();
+    return s.length > 0 && s.length <= maxLen ? s : undefined;
+  };
+  const inReplyTo = typeof input.inReplyTo === 'string' ? cleanHeader(input.inReplyTo, 2000) : undefined;
+  const refsRaw = Array.isArray(input.references)
+    ? input.references.filter((x): x is string => typeof x === 'string')
+    : (typeof input.references === 'string' ? [input.references] : []);
+  const refs = refsRaw.map((x) => cleanHeader(x, 2000)).filter((x): x is string => !!x);
+  const references = refs.length ? refs.join(' ').slice(0, 4000) : undefined;
   return {
     from,
     to: splitAddrs(input.to),
@@ -66,6 +85,8 @@ function buildMailOptions(account: AccountRow, input: SendMailInput) {
     subject: input.subject || '',
     text: input.text || undefined,
     html: input.html || undefined,
+    ...(inReplyTo ? { inReplyTo } : {}),
+    ...(references ? { references } : {}),
     attachments: (input.attachments || []).map((a) => ({
       filename: a.filename,
       content: a.content,
