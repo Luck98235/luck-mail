@@ -20,15 +20,17 @@ import { LARGE_PARSE_THRESHOLD, log } from './config.js';
 
 const RECONNECT_BASE_MS = 5000;
 const RECONNECT_MAX_MS = 5 * 60 * 1000;
-// Fallback INBOX re-sync interval. IMAP IDLE is the primary new-mail path,
+// Fallback re-sync interval. IMAP IDLE is the primary new-mail path,
 // but some servers (notably QQ Mail) do not reliably push `exists`
 // notifications — the connection stays up yet new mail never triggers a
 // sync, so it sits on the server until the next reconnect (hours/days).
-// A periodic INBOX sync bounds that delay to this interval.
+// A periodic re-sync bounds that delay to this interval. The fallback
+// syncs ALL folders (same _pollAllFolders as the NetEase poll); INBOX
+// real-time still comes from the IDLE `exists` events.
 const PERIODIC_SYNC_MS = 5 * 60 * 1000;
 // Full flag comparison (CONDSTORE fallback) runs at most this often per
 // folder — it is a whole-folder FETCH, so it must not run on every IDLE
-// event. Same cadence as the periodic INBOX sync.
+// event. Same cadence as the periodic fallback sync.
 const FLAG_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 // Fetch only the first bytes of the TEXT part for the list snippet; the full
 // source is fetched (and parsed) only when a message is opened.
@@ -236,9 +238,11 @@ export class SyncEngine {
       });
       await this._runOp(accountId, async (c) => { await this._openInbox(c, accountId); });
       // From here imapflow auto-IDLEs on INBOX (disableAutoIdle:false).
-      // Plus a periodic INBOX re-sync as a fallback for servers whose
+      // Plus a periodic re-sync as a fallback for servers whose
       // IDLE never fires (notably QQ Mail): without it, new mail can sit
-      // on the server unsynced until the next reconnect.
+      // on the server unsynced until the next reconnect. The fallback
+      // syncs ALL folders (same _pollAllFolders as the NetEase poll) —
+      // INBOX real-time still comes from the IDLE `exists` events.
       if (state.pollOnly) {
         // R1: 网易系不保持长连接——首连同步完就登出，之后只靠轮询
         // （短命连接）同步。不断开的话服务器约 206 秒后静默断线，
@@ -294,16 +298,14 @@ export class SyncEngine {
     // 避免多账号的定时同步永远在同一秒齐发。
     const interval = Math.round(PERIODIC_SYNC_MS * (0.9 + Math.random() * 0.2));
     state.syncTimer = setInterval(() => {
-      // R1: 轮询账号同步全部文件夹（短命连接）；其他账号仍是
-      // INBOX 增量同步（与 IDLE `exists` 同款），只作 IDLE 不触发的兜底。
-      if (state.pollOnly) {
-        void this._pollAllFolders(accountId);
-        return;
-      }
-      // Same incremental INBOX sync as the IDLE `exists` path; _onExists
-      // no-ops safely when the connection is down (its _runOp rejects and
-      // the error is logged), so a stale timer cannot corrupt anything.
-      this._onExists(accountId);
+      // R1: 轮询账号同步全部文件夹（短命连接）。IDLE 账号（QQ 等）的兜底
+      // 也走同一条全文件夹同步——收件箱实时性仍由 IDLE `exists` 事件
+      // 保障（_onExists 不变）；兜底原来只同步收件箱，非收件箱文件夹
+      // 只在连接时/手动刷新时更新。在 IDLE 连接上跑时 _pollAllFolders
+      // 末尾会重选收件箱，IDLE 继续盯收件箱；连接断开时 withClient 改
+      // 走短命共享连接，同样全量同步。仍是同一只定时器、同一约 5 分钟
+      // 节奏，不新增定时器、不提高请求频率。
+      void this._pollAllFolders(accountId);
     }, interval);
   }
 
@@ -311,6 +313,11 @@ export class SyncEngine {
   // 增量同步）。每次只登一次：24 个 163 账号每小时共约 288 次登录，
   // 且间隔带抖动；比 IDLE 静默断线后的约 400 次/小时/账号少一个量级。
   // 单个文件夹同步失败不拖垮整轮（记日志、跳过、继续下一个文件夹）。
+  // IDLE 账号（QQ 等）的兜底定时器也走这里：withClient 在长连接可用时
+  // 复用 IDLE 连接（_runOp 串行），断开时改走短命共享连接。末尾重选
+  // 收件箱——否则 IDLE 连接会停在最后同步的文件夹上，auto-IDLE 改盯
+  // 那个文件夹，收件箱的新邮件不再推 exists 事件（refreshAccount 同款
+  // 做法）。轮询账号的短命连接随后即登出，重选只是一次多余的命令，无害。
   private async _pollAllFolders(accountId: number): Promise<void> {
     const state = this.states.get(accountId);
     if (!state) return;
@@ -324,6 +331,7 @@ export class SyncEngine {
             logError(`poll sync folder failed account ${accountId} folder ${f.path}:`, (e as Error)?.message || e);
           }
         }
+        await this._openInbox(c, accountId);
       });
       getDb().prepare("UPDATE accounts SET status='online', last_sync_at=datetime('now'), error=NULL WHERE id=?").run(accountId);
     } catch (e) {

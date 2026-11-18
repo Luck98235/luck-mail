@@ -72,7 +72,7 @@ The whole data directory is small (6.1 MB as of 2026-11-18 — reference value �
 The repository ships `scripts/backup-cron.sh`, which takes a consistent
 database snapshot (`db.backup()` — no need to stop the service), packs the
 snapshot + `.key` + `bodies/` + `attachments/` into a tarball, and keeps the
-newest **7** copies under `/opt/luck-mail/backups/auto/`. Install it once:
+newest **3** copies under `/opt/luck-mail/backups/auto/`. Install it once:
 
 ```bash
 sudo cp scripts/backup-cron.sh /opt/luck-mail/backup-cron.sh

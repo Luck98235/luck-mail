@@ -66,7 +66,7 @@ scp luck-mail-backup-*.tar.gz root@<新服务器>:/tmp/
 
 ### 每日自动备份
 
-仓库自带 `scripts/backup-cron.sh`：先给在线库做一致性快照（`db.backup()`，不用停服务），再把快照 + `.key` + `bodies/` + `attachments/` 打成包，放在 `/opt/luck-mail/backups/auto/`，只保留最近 **7** 份。装一次即可：
+仓库自带 `scripts/backup-cron.sh`：先给在线库做一致性快照（`db.backup()`，不用停服务），再把快照 + `.key` + `bodies/` + `attachments/` 打成包，放在 `/opt/luck-mail/backups/auto/`，只保留最近 **3** 份。装一次即可：
 
 ```bash
 sudo cp scripts/backup-cron.sh /opt/luck-mail/backup-cron.sh

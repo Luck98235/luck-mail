@@ -916,6 +916,61 @@ try {
       && !isNetEaseHost('imap.qq.com') && !isNetEaseHost('imap.gmail.com'));
     check('R1: SyncEngine has _pollAllFolders (163 polling path)',
       typeof SyncEngine.prototype._pollAllFolders === 'function');
+    // QQ 兜底全文件夹同步：_pollAllFolders 在 IDLE 连接（usable）上跑时，
+    // 非收件箱文件夹也要同步进来，且结束后连接必须重选回收件箱
+    // （否则 auto-IDLE 改盯最后同步的文件夹，收件箱不再实时）。
+    {
+      const a = vdb.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run('qqpoll@qq.com', 'QP', encryptSecret('FAKE', key),
+        'imap.qq.com', 993, 'SSL', 'smtp.qq.com', 465, 'SSL', 0);
+      const accountId = Number(a.lastInsertRowid);
+      vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, 'INBOX', '收件箱', 'inbox')").run(accountId);
+      const fs2 = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已发送', '已发送', 'sent')").run(accountId);
+      const sentId = Number(fs2.lastInsertRowid);
+      const fakeList = [
+        { path: 'INBOX', name: 'INBOX', delimiter: '/', specialUse: '\\Inbox', flags: new Set(['\\HasNoChildren']), children: [] },
+        { path: '已发送', name: '已发送', delimiter: '/', specialUse: '\\Sent', flags: new Set(['\\HasNoChildren']), children: [] },
+      ];
+      let selected = null;
+      const fakeClient = {
+        usable: true,
+        mailbox: null,
+        list: async () => fakeList,
+        mailboxOpen: async (p) => {
+          selected = p;
+          fakeClient.mailbox = { path: p };
+          return { uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: p === '已发送' ? 1 : 0 };
+        },
+        search: async () => (selected === '已发送' ? [201] : []),
+        fetch: async function* () {
+          if (selected === '已发送') {
+            yield {
+              uid: 201,
+              envelope: {
+                messageId: '<qqpoll-sent@qq.com>', subject: 'QQ poll sent',
+                date: new Date('2026-11-18T10:00:00Z'),
+                from: [{ address: 'qqpoll@qq.com', name: 'QP' }], to: [],
+              },
+              flags: ['\\Seen'],
+              bodyStructure: null,
+              size: 100,
+              internalDate: new Date('2026-11-18T10:00:00Z'),
+              bodyParts: new Map([['TEXT', Buffer.from('plain snippet hello world')]]),
+            };
+          }
+        },
+      };
+      const engine = new SyncEngine(key);
+      engine.states.set(accountId, { client: fakeClient, queue: Promise.resolve(), opFailures: 0 });
+      await engine._pollAllFolders(accountId);
+      const sentRows = vdb.prepare('SELECT COUNT(*) c FROM messages WHERE folder_id=?').get(sentId).c;
+      check('QQ fallback: _pollAllFolders syncs a non-inbox folder (Sent) on the IDLE connection',
+        sentRows === 1, `sentRows=${sentRows}`);
+      check('QQ fallback: connection is re-selected to INBOX after the poll (IDLE keeps watching INBOX)',
+        fakeClient.mailbox && fakeClient.mailbox.path === 'INBOX', `mailbox=${JSON.stringify(fakeClient.mailbox)}`);
+    }
   }
 
   // 9: 同步删除对账时正文孤儿文件一并删。

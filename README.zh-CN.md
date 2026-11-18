@@ -98,7 +98,7 @@ PORT=8080 DATA_DIR=/path/to/data PUBLIC_DIR=backend/public KEY_FILE=/path/to/.ke
 
 - 服务：`luck-mail.service`，`node backend/dist/server.js`，监听 `127.0.0.1:8080`（`Restart=always`）。先构建：`cd backend && npm run build`，再 `cd ../frontend && npm run build`，把 `frontend/dist/` 拷到 `backend/public/`（后端从 `PUBLIC_DIR` 提供前端文件）。
 - 反向代理：把 `/` 和 `/socket.io/`（带 `Upgrade` 头走 WebSocket）反代到 `127.0.0.1:8080`，`proxy_read_timeout 120s`，`client_max_body_size 25m`。给域名签发 Let's Encrypt 证书，HTTP 跳转 HTTPS。证书自动续期见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)。
-- 备份：`.key` + `data/` 一起、每天、存到服务器之外（见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。站内**备份到本地**按钮不用停服务就能下载同一份包。每日自动备份：`scripts/backup-cron.sh`（cron 每天 03:00，只保留最近 7 份，见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。
+- 备份：`.key` + `data/` 一起、每天、存到服务器之外（见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。站内**备份到本地**按钮不用停服务就能下载同一份包。每日自动备份：`scripts/backup-cron.sh`（cron 每天 03:00，只保留最近 3 份，见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。
 
 ## 目录结构
 
@@ -125,7 +125,7 @@ frontend/                # Vue 3 + Vite + TypeScript + Pinia
     noautoopen-test.mjs  # 静态回归测试：没有任何地方自动打开邮件（全部手动点开）
     notify-test.mjs      # 浏览器通知逻辑测试（3 秒合并、仅页面不在前台、仅未读）
 API_CONTRACT.md          # 前后端 API 合同
-scripts/backup-cron.sh   # 每日自动备份（cron 每天 03:00，只保留最近 7 份）
+scripts/backup-cron.sh   # 每日自动备份（cron 每天 03:00，只保留最近 3 份）
 LICENSE                  # AGPL-3.0
 ```
 

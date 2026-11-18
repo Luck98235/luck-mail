@@ -5,7 +5,7 @@
 #   1. 用 better-sqlite3 的 db.backup() 给在线库做一致性快照
 #      （在线库直接 tar 会拷到一半的 WAL，备份不可用）；
 #   2. 打包快照库 + 主密钥 .key + bodies/ + attachments/；
-#   3. 保留最近 7 份，超出的删最旧。
+#   3. 保留最近 3 份，超出的删最旧。
 #
 # 安装（在服务器 134.175.136.13 上以 root 执行）：
 #   cp luck-mail-backup-cron.sh /opt/luck-mail/backup-cron.sh
@@ -29,7 +29,7 @@ BACKEND_DIR=/opt/luck-mail/backend
 DATA_DIR=/opt/luck-mail/data
 KEY_FILE=/opt/luck-mail/.key
 BACKUP_DIR=/opt/luck-mail/backups/auto
-RETENTION=7
+RETENTION=3
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 

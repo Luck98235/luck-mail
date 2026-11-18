@@ -99,7 +99,7 @@ Production runs as a systemd service behind a reverse proxy:
 
 - Service: `luck-mail.service` — `node backend/dist/server.js` on `127.0.0.1:8080` (`Restart=always`). Build first: `cd backend && npm run build`, then `cd ../frontend && npm run build` and copy `frontend/dist/` to `backend/public/` (the backend serves the frontend from `PUBLIC_DIR`).
 - Reverse proxy: proxy `/` and `/socket.io/` (with the `Upgrade` header for WebSocket) to `127.0.0.1:8080`, `proxy_read_timeout 120s`, `client_max_body_size 25m`. Issue a Let's Encrypt certificate and redirect HTTP to HTTPS. Certificate auto-renewal: see [MIGRATION.md](MIGRATION.md).
-- Backups: back up `.key` + `data/` together, daily, off the server (see [MIGRATION.md](MIGRATION.md)). The in-app **Backup to local** button downloads the same tarball without stopping the service. Automatic daily backup: `scripts/backup-cron.sh` (cron 03:00, keeps the newest 7 copies — see [MIGRATION.md](MIGRATION.md)).
+- Backups: back up `.key` + `data/` together, daily, off the server (see [MIGRATION.md](MIGRATION.md)). The in-app **Backup to local** button downloads the same tarball without stopping the service. Automatic daily backup: `scripts/backup-cron.sh` (cron 03:00, keeps the newest 3 copies — see [MIGRATION.md](MIGRATION.md)).
 
 ## Project structure
 
@@ -126,7 +126,7 @@ frontend/                # Vue 3 + Vite + TypeScript + Pinia
     noautoopen-test.mjs  # static regression test: nothing auto-opens a message (all opens are manual clicks)
     notify-test.mjs      # browser-notification logic test (3s merge window, hidden-tab only, unread only)
 API_CONTRACT.md          # backend/frontend API contract
-scripts/backup-cron.sh   # daily automatic backup (cron 03:00, keeps 7 copies)
+scripts/backup-cron.sh   # daily automatic backup (cron 03:00, keeps 3 copies)
 LICENSE                  # AGPL-3.0
 ```
 

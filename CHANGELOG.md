@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docs: migration sizes updated to measured values; automatic daily backup documented, and the backup script is now in the repo (scripts/backup-cron.sh)
 - No more auto-open (2026-11-18): clicking a folder, searching, clearing a search, or deleting the message being read no longer opens the first/next message automatically — everything opens on click; the reading pane shows an empty state until a message is chosen
 - Audit #6 fixes (2026-11-18, third pre-launch review): delete actions now send an idempotencyKey so the backend delete-idempotency protection actually applies; QQ accounts' last-sync time now updates on IDLE-driven syncs; login lockout messages no longer distinguish unknown usernames from known ones; graceful shutdown no longer hangs on open Socket.io connections (the old process used to exit 1 after 30s); docs corrected (stale search auto-open line removed, README mail-flow/IDLE wording, migration service template now includes UMask/MemoryMax and an EnvironmentFile for the DeepL key)
+- Automatic backup retention reduced from 7 to 3 copies (2026-11-18, user decision: cap the number of backups so the server disk does not fill up)
 
 ### Removed
 - Dead-code cleanup across frontend, backend and config: unused functions, dead endpoints (`/api/search`, `/api/status`), SnappyMail scaffolding, old `frontend/main/` and `research/` references
