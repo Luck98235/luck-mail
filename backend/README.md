@@ -57,10 +57,17 @@ npm start            # node dist/server.js
 首次启动会自动建 `data/`、生成 32 字节主密钥 `.key`（权限 0600）、建库开 WAL。
 `PUBLIC_DIR` 里没有 `index.html` 时，`/` 返回占位页说明后端已跑起来，不报错退出。
 
-## 验证结果（本地，`npm run verify`，46 项全过）
+## 验证结果（本地，`npm run verify`）
 
 验证脚本 `scripts/verify-all.mjs`：在临时 `DATA_DIR` 上起编译后的服务器，
-全程只用假账号/假授权码，不碰真实邮箱。2026-11-18 运行结果 **46 passed，0 failed**。
+脚本内共 169 处 `check()` 调用；最近一次完整运行（2026-11-18）**168 项通过，0 失败**
+（分支内断言按实际执行路径计入——import18b 的端到端断言与回退分支互斥，
+一次运行只走其中一条）。
+
+注意：并非全程只用假账号——第 7 节账号测试（`verify-all.mjs:286-296`，
+种子账号直连真实 `imap.163.com:993`）与 import18b 回退分支（`:1883-1895`，
+真实 163 坏凭证行）都会联网访问真实 163 服务器；用的都是假授权码，
+不会登录成功，但确实会产生真实 163 访问。其余部分用假账号/本地假 IMAP/SMTP。
 
 - **启动/构建**：`tsc` 严格模式编译通过；`node dist/server.js` 正常监听。
 - **认证**：setup（短密码 400、重复 409）、login（错密 401、未知用户 5 次后 429 +
@@ -122,8 +129,9 @@ npm start            # node dist/server.js
 ### 规模与技术栈
 
 - **规模**：最多 50 个邮箱。单 Node 进程 + SQLite（WAL + FTS5）就是定稿的最优解：
-  无 Redis / PostgreSQL / S3 / Elasticsearch / 微服务 / 集群；50 个邮箱全挂 IDLE，
-  无离线降级轮询。
+  无 Redis / PostgreSQL / S3 / Elasticsearch / 微服务 / 集群；同步方式：
+  网易系邮箱（163/126/yeah/188）走 5 分钟轮询（服务器约 206 秒静默断 IDLE，
+  长连接无效），其余账号 IDLE 为主、另有 5 分钟兜底全文件夹轮询。
 - **TypeScript 严格类型**：已落地。`tsconfig.json` 开 `strict: true`，
   `npm run build`（`tsc`）零错误；类型覆盖全部模块与路由（含 imapflow /
   better-sqlite3 / nodemailer / mailparser 的类型，MailComposer 类型来自 @types/nodemailer）。
@@ -138,14 +146,17 @@ npm start            # node dist/server.js
   的邮件重新索引（backfill）。
 - **FTS5 trigram 的已知限制**：trigram 查不到 <3 字的词（实测 2 字词 0 命中）。
   `searchMessageIds()` 对 <3 字的词自动走 `LIKE '%词%'` 兜底（查 FTS 表内存的
-  三列），长词走 `MATCH`，两路并集。中文 2 字搜索已验证能命中。
+  三列），长词走 `MATCH`，两路取交集（长词组与短词组必须同时满足；以前是并集）。
+  中文 2 字搜索已验证能命中。
 
 ## 尚未用真实账号验证收信/发信全流程
 
-诚实说明：以上验证全部用**假账号/假授权码**完成。以下须用户用真实 163
+诚实说明：以上验证主要用**假账号/假授权码**完成（例外见上：第 7 节与
+import18b 回退分支会用假凭证联网访问真实 163 服务器）。以下须用户用真实 163
 客户端授权码验证后才能算闭环（本机不向用户索要任何密码/授权码）：
 
-1. 加真实 163 邮箱：IMAP 登录 + 文件夹 LIST + 收件箱增量同步 + IDLE 新邮件推送。
+1. 加真实 163 邮箱：IMAP 登录 + 文件夹 LIST + 收件箱增量同步 + 5 分钟轮询新邮件
+   （163 不走 IDLE，新邮件最长约 5 分钟才出现）。
 2. 打开一封真实邮件：全文拉取、DOMPurify 清洗、附件（实时从 IMAP 流式）下载。
 3. 发一封真实邮件：Nodemailer 发送 + APPEND 副本到已发送 + 本地写库。
 4. 移动/删除/标已读等 IMAP 写操作回写服务器。

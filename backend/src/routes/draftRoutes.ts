@@ -57,16 +57,35 @@ export function draftRoutes(): express.Router {
     const key = typeof b.idempotencyKey === 'string' && b.idempotencyKey.trim()
       ? b.idempotencyKey.trim()
       : crypto.randomUUID();
-    const info = db.prepare(
-      `INSERT INTO drafts (account_id, to_addrs, subject, text, idempotency_key)
-       VALUES (?,?,?,?,?)`,
-    ).run(
-      accountId,
-      typeof b.to === 'string' ? b.to : '',
-      typeof b.subject === 'string' ? b.subject : '',
-      typeof b.text === 'string' ? b.text : '',
-      key,
-    );
+    // Audit #9 L19h：草稿 key 同发信/删信限 128 字符。
+    if (key.length > 128) {
+      return res.status(400).json({ ok: false, error: 'idempotencyKey 过长' });
+    }
+    // Audit #9 L8：先按 key 查已有草稿，有则直接返回（不重复建）；
+    // 并发下唯一索引冲突时重读返回同一行。db.ts 另有唯一索引兜底。
+    const existing = db.prepare('SELECT * FROM drafts WHERE idempotency_key=?').get(key) as DraftRow | undefined;
+    if (existing) {
+      return res.json({ ok: true, draft: publicDraft(existing), duplicate: true });
+    }
+    let info: { lastInsertRowid: number | bigint };
+    try {
+      info = db.prepare(
+        `INSERT INTO drafts (account_id, to_addrs, subject, text, idempotency_key)
+         VALUES (?,?,?,?,?)`,
+      ).run(
+        accountId,
+        typeof b.to === 'string' ? b.to : '',
+        typeof b.subject === 'string' ? b.subject : '',
+        typeof b.text === 'string' ? b.text : '',
+        key,
+      );
+    } catch (e) {
+      if (/UNIQUE constraint/i.test(String((e as Error)?.message || e))) {
+        const dup = db.prepare('SELECT * FROM drafts WHERE idempotency_key=?').get(key) as DraftRow | undefined;
+        if (dup) return res.json({ ok: true, draft: publicDraft(dup), duplicate: true });
+      }
+      return res.status(500).json({ ok: false, error: '服务器内部错误，请重试' });
+    }
     const row = db.prepare('SELECT * FROM drafts WHERE id=?').get(Number(info.lastInsertRowid)) as DraftRow;
     return res.status(201).json({ ok: true, draft: publicDraft(row) });
   });

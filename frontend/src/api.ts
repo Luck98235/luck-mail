@@ -79,6 +79,9 @@ async function downloadBlobFile(path: string, failLabel: string, defaultFilename
   const timer = setTimeout(() => controller.abort(), 30000)
   try {
     const res = await fetch(BASE + path, { method, credentials: 'include', signal: controller.signal })
+    // 401 也跳登录（审计 #9 L4）：与 request() 一致，会话过期时点导出/备份
+    // 回到登录页，而不是只报“导出失败（HTTP 401）”。
+    if (res.status === 401) await handleUnauthorized()
     if (!res.ok) {
       let msg = `${failLabel}失败（HTTP ${res.status}）`
       try { const data = await res.json() as { error?: string }; if (data?.error) msg = data.error } catch { /* 非 JSON 报错就用默认文案 */ }

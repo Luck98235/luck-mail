@@ -11,10 +11,10 @@
 - `GET /api/auth/status` → `{ok:true, setupRequired:boolean, loggedIn:boolean, username?:string}`
   - `setupRequired=true` 表示还没有任何用户（首次使用），前端显示“创建账号”页。
 - `POST /api/auth/setup` `{username, password, confirm}` → 201 `{ok:true}`。
-  - 仅当无用户时可用，否则 409。用户名必填（不要邮箱后缀）；密码 ≥8 位；两次一致。失败 5 次锁定 15 分钟（429 + `retryAfter` 秒）。
-- `POST /api/auth/login` `{username, password, rememberMe?}` → 200 `{ok:true, username}` + Set-Cookie。错 401；锁定 429。`rememberMe=true` 时建 30 天会话，否则 1 天（不传默认 1 天）。
+  - 仅当无用户时可用，否则 409。用户名必填（不要邮箱后缀，最多 64 位）；密码 8–128 位；两次一致。弱口令（只含一类字符）成功时响应带 `passwordHint` 提示，不强制。失败 5 次锁定 15 分钟（429 + `retryAfter` 秒）。
+- `POST /api/auth/login` `{username, password, rememberMe?}` → 200 `{ok:true, username}` + Set-Cookie。错 401；锁定 429。`rememberMe=true` 时建 30 天会话，否则 1 天（不传默认 1 天）。登录成功时吊销该用户全部旧会话（其他设备会被踢下线，本次会话保持有效；有旧会话被吊销时响应带 `revokedOtherSessions` 个数）。
 - `POST /api/auth/logout` → 200，清 Cookie。
-- `POST /api/auth/change-password` `{current, next}` → 200。`next` ≥8 位。
+- `POST /api/auth/change-password` `{current, next}` → 200。`next` 8–128 位；弱口令成功时响应带 `passwordHint` 提示。当前密码错 5 次锁定 15 分钟（429，与登录锁共用计数器）。改密码成功后全部会话（含当前）轮换一次并保留原过期时间，前端无感不用重登。
 
 ## 健康检查
 
@@ -39,7 +39,7 @@
 - `GET /api/accounts/:id/password` → `{ok:true, password: string}`。取单个邮箱的当前密码（明文）：仅供“邮箱设置”弹窗打开时回填密码框，点小眼睛查看。须登录；平时不随账号列表下发。
 - `POST /api/accounts/export` → 200，下载 `luck-mail-accounts-YYYYMMDD-HHmm.xlsx`（`Content-Disposition: attachment`）。导出全部邮箱为 Excel：表头 序号 / 邮箱名 / 授权码 / 接收服务器（IMAP）/ IMAP端口 / 发送服务器（SMTP）/ SMTP端口 / 备注，按当前排序导出；授权码为明文，文件请妥善保存。须登录。**只接受 POST**（GET 会被拒绝：防跨站顶层导航 CSRF 触发下载）。
 - `GET /api/accounts/import-template` → 200，下载 `luck-mail-import-template.csv`。导入模板：空的 .csv，只有表头一行（与导出相同的 8 列）。须登录。
-- `POST /api/accounts/import` (multipart，字段 `file`，限 5MB) → `{ok:true, added, skipped, failed: [{row, email, reason}], addedEmails, skippedEmails}`。批量导入邮箱：按导入模板的列顺序逐行读（第 1 行是表头）；空行跳过；同名邮箱（不区分大小写、含文件内重复）跳过不报错；格式不对、授权码为空、服务器信息不全（且该域名无自动预设）的行记入 failed，不中断其余行。服务器地址/端口留空时按域名自动取预设。新邮箱直接入库（sort_order 追加到最后，status 'offline'），并启动同步；**导入时不做连通测试**（批量测太慢），加完后可用管理列表每行的“测试”按钮逐个测。须登录。
+- `POST /api/accounts/import` (multipart，字段 `file`，限 5MB、数据行最多 200 行，超限行进 failed、原因“行数超限”) → `{ok:true, added, skipped, failed: [{row, email, reason}], addedEmails, skippedEmails}`。批量导入邮箱：按导入模板的列顺序逐行读（第 1 行是表头）；空行跳过；同名邮箱（不区分大小写、含文件内重复）跳过不报错；格式不对、授权码为空、服务器信息不全（且该域名无自动预设）的行记入 failed，不中断其余行。服务器地址/端口留空时按域名自动取预设。每行先测连通再入库（与单个添加同款，15 秒封顶；认证失败的行进 failed，不建库、不启动同步）；通过的行入库（sort_order 追加到最后，status 'offline'），并启动同步。须登录。
 - `POST /api/accounts/:id/refresh` → 200，触发该账号全量增量同步。
 - `POST /api/refresh-all` → 200，触发全部已启用账号同步。
 
@@ -61,7 +61,7 @@
 - `POST /api/messages/:id/move` `{folderId}` → 200（IMAP MOVE + 本地更新 + WS 推送）。
 - `DELETE /api/messages/:id` → 200。彻底删除与否以后端实际文件夹为准：邮件在已删除文件夹里就是彻底删除（IMAP 标记删除 + expunge + 本地删除），在其他文件夹里就是移到已删除（IMAP MOVE 到 Trash + 本地更新）。客户端 `permanent` 参数已废弃，不再发送。
 - `POST /api/messages/batch-delete` → 200，`{ ids: number[], view?: { kind, accountId, folderId } }`，逐封走与单封删除同一语义（移到已删除；邮件已在已删除文件夹里时彻底删除），一次最多 200 封。无 `permanent` 参数——彻底与否以后端实际文件夹为准。`view` 为发起删除的视图，后端记进批量删除任务，刷新后 `delete-status` 靠它恢复“只在该视图显示删除中”。**永远异步返回** `{ ok, taskId, status: 'running' }`（无同步返回），前端轮询 `GET /api/messages/delete-status` 到 running===false，再以状态接口的 `deleted`（数字计数）一次结算 toast。
-- `GET /api/messages/delete-status?taskId=` → `{ ok, running, total, deleted, startedAt, view: { kind, accountId, folderId } | null, taskId?, failed?, finishedAt? }`。批量删除任务状态（单进程内存）：任务在跑时前端每 1.5 秒轮询，显示“删除中（剩余数）”；跑完停轮询并刷新列表。`deleted` 为数字计数（已删封数，不是数组）；`total` 为任务总封数；`failed` 为失败明细（有失败时才出现）；`finishedAt` 为任务完成时间（跑完后才有）。`taskId`（可选）：本会话发起的任务传自己的 taskId，避免两标签页同时批量删除时轮询到对方的任务；不传时后端返回最近一个任务（兼容）。`view` 为发起删除的视图，刷新后前端优先用它恢复 deleteView，localStorage 的 `luck-mail-delete-view` 为兜底；两者都没有时按全局 batchDeleting 显示。
+- `GET /api/messages/delete-status?taskId=` → `{ ok, running, total, deleted, startedAt, view: { kind, accountId, folderId } | null, taskId?, failed?, finishedAt? }`。批量删除任务状态（单进程内存）：任务在跑时前端每 1.5 秒轮询，显示“删除中（剩余数）”；跑完停轮询并刷新列表。`deleted` 为数字计数（已删封数，不是数组）；`total` 为任务总封数；`failed` 为失败明细数组——任务对象始终带该字段（初始化即 `failed: []`，空数组时也在）；只有无任何任务时返回的兜底空任务才不带 `failed`（也不带 `taskId`/`finishedAt`）。`finishedAt` 为任务完成时间（跑完后才有）。`taskId`（可选）：本会话发起的任务传自己的 taskId，避免两标签页同时批量删除时轮询到对方的任务；不传时后端返回最近一个任务（兼容）。`view` 为发起删除的视图，刷新后前端优先用它恢复 deleteView，localStorage 的 `luck-mail-delete-view` 为兜底；两者都没有时按全局 batchDeleting 显示。
 - `POST /api/messages/:id/translate` → 200，`{ ok, translated: string, alreadyChinese: boolean }`。正文翻译：英文 → 中文（后端调 DeepL，密钥放服务器 `/opt/luck-mail/.deepl-env`（0600），经 systemd `EnvironmentFile=` 加载，绝不写进单元文件；免费 Key（`:fx` 结尾）走 `api-free.deepl.com`，付费 Key 走 `api.deepl.com`；未配密钥时报错）。正文取磁盘 `bodies/<id>.txt`（为空时先 fetchFullMessage 再读）；正文已基本是中文时直接返回 `alreadyChinese: true`，不调接口。后端先按段落、再按句子切成 ≤450 字节的小段逐段翻译再拼接。翻译失败返回 502。
 - `POST /api/backup/download` → 200，下载 `luck-mail-backup-YYYYMMDD-HHmm.tar.gz`（`Content-Disposition: attachment`）。内容为 `.key` + `data/`（含 luck-mail.db 一致性快照 + bodies/ + attachments/），与迁移指南的恢复布局一致（解压到 /opt/luck-mail 即可恢复）。须登录。**只接受 POST**（GET 会被拒绝：防跨站顶层导航 CSRF 触发下载）。
 - `POST /api/messages/send`（multipart/form-data）字段：`accountId`, `to`（逗号分隔）, `cc?`, `bcc?`, `subject`, `text?`, `html?`, `idempotencyKey?`（发信幂等键，字符串，≤128 字符，不校验 UUID 格式；同一封邮件重试复用同一个 key），`draftId?`（发信成功后服务端自动删这条草稿；发信失败草稿保留），文件字段 `attachments`（可多个）。→ 201 `{ok:true, id, messageId, rejected?: string[], warning?: string}`（`rejected` 为被收件方服务器拒收的收件人；`warning` 表示已发出、但未存入已发送文件夹）。发信后把副本 APPEND 到该账号已发送并写库。
@@ -123,7 +123,7 @@
 
 ## 技术栈与规模（用户 2026-11-17 00:42 定，规模定稿）
 
-- 规模：最多 50 个邮箱。单 Node 进程 + SQLite（WAL + FTS5）即最优解。不要分布式微服务、集群调度、Redis、PostgreSQL、S3/MinIO、Elasticsearch/Meilisearch、离线降级轮询（50 个邮箱全挂 IDLE）、前端 Web Worker。
+- 规模：最多 50 个邮箱。单 Node 进程 + SQLite（WAL + FTS5）即最优解。不要分布式微服务、集群调度、Redis、PostgreSQL、S3/MinIO、Elasticsearch/Meilisearch、前端 Web Worker。同步：网易系账号（163/126/yeah/188）走 5 分钟轮询（服务器约 206 秒静默断 IDLE，长连接无效），其余账号 IDLE 为主、另有 5 分钟兜底全文件夹轮询。
 - 前端：Vue 3 + Vite + TypeScript（严格类型）+ Pinia + Tailwind CSS（复用现有浅蓝色 3 栏布局类名）+ socket.io-client。
 - 后端：Express 或 Fastify 模块化架构 + TypeScript，不用 NestJS。
 - 虚拟滚动：只给邮件列表用（MailList.vue）；账号树最多 50 个，直接 v-for。

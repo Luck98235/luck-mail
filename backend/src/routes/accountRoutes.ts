@@ -27,6 +27,24 @@ export interface Ctx {
 const testResultCache = new Map<number, { at: number; result: { imapOk: boolean; smtpOk: boolean; error: string | null } }>();
 const TEST_CACHE_MS = 10 * 1000;
 
+// Audit #9 M3：Express 4.21.2、无 express-async-errors——async 路由
+// 处理器抛错不会进全局错误中间件，直接变未处理拒绝（请求挂起）。
+// 全部 async 处理器包一层：抛错记日志、走统一 500 JSON（不泄堆栈）。
+// 发信路由的外层 catch 是同款范本。
+function asyncHandler(fn: (req: Request, res: Response) => Promise<unknown>): (req: Request, res: Response) => void {
+  return (req, res) => {
+    fn(req, res).catch((e: unknown) => {
+      log('account route failed', req.method, req.path, (e as Error)?.message || e);
+      if (!res.headersSent) res.status(500).json({ ok: false, error: '服务器内部错误' });
+    });
+  };
+}
+
+// Audit #9 M10：CSV 导入行数上限（数据行，不含表头）——之前只限 5MB，
+// 数万行文件会顺序测连通、每行 15 秒封顶，可挂数小时。超限的行不处理、
+// 进 failed 清单带明确原因，不静默丢弃。
+const MAX_IMPORT_ROWS = 200;
+
 // 导出与导入模板共用的 8 列：序号 / 邮箱名 / 授权码 / 接收服务器（IMAP）/
 // IMAP 端口 / 发送服务器（SMTP）/ SMTP 端口 / 备注。
 const ACCOUNT_EXCEL_COLUMNS = [
@@ -115,7 +133,13 @@ export function accountRoutes(ctx: Ctx): express.Router {
   // ---- accounts ----
   r.get('/accounts', (_req: Request, res: Response) => {
     const db = getDb();
-    const rows = db.prepare('SELECT * FROM accounts ORDER BY sort_order, id').all() as AccountRow[];
+    // Audit #9 L19i：显式列，不 SELECT password_enc——旧版 SELECT *
+    // 把全账号的密码密文都读进内存再丢弃（publicAccount 并不返回它）。
+    const rows = db.prepare(
+      `SELECT id, email, display_name, imap_host, imap_port, imap_secure,
+        smtp_host, smtp_port, smtp_secure, enabled, sort_order, status,
+        last_sync_at, error FROM accounts ORDER BY sort_order, id`,
+    ).all() as AccountRow[];
     // Audit #8 LOW-4：一次 GROUP BY 查出全部账号的未读数，不再每账号一查。
     const unreadByAccount = new Map<number, number>(
       (db.prepare('SELECT account_id, COALESCE(SUM(unread_count),0) c FROM folders GROUP BY account_id').all() as { account_id: number; c: number }[])
@@ -142,7 +166,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
   // IMAP 端口 / 发送服务器（SMTP）/ SMTP 端口 / 备注，按当前排序导出。授权码为明文，
   // 文件请妥善保存。须登录。
   // S1: 只接受 POST（同 /api/backup/download，防跨站顶层导航 CSRF 下载）。
-  r.post('/accounts/export', async (_req: Request, res: Response) => {
+  r.post('/accounts/export', asyncHandler(async (_req: Request, res: Response) => {
     const db = getDb();
     const rows = db.prepare('SELECT * FROM accounts ORDER BY sort_order, id').all() as AccountRow[];
     const wb = new ExcelJS.Workbook();
@@ -169,7 +193,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="luck-mail-accounts-${stamp}.xlsx"`);
     res.send(Buffer.from(buf));
-  });
+  }));
 
   // 导入模板：空的 CSV，只有表头一行（与导出相同的 8 列），供用户填好后导入。
   // 须登录。带 UTF-8 BOM，Excel 打开中文表头不乱码。
@@ -228,10 +252,12 @@ export function accountRoutes(ctx: Ctx): express.Router {
   // testConnectivity，15 秒封顶）：授权码/密码错的账号不建库、不启动同步，
   // 直接进 failed（reason 为测试返回的具体原因，前端直接展示）。逐行顺序测、
   // 不并发——同一 IP 并发登录多家服务商会被当成撞服务器。服务器地址/端口留空
-  // 时按域名自动取预设，取不到则失败。须登录；文件限 5MB。exceljs 只留给导出
+  // 时按域名自动取预设，取不到则失败。须登录；文件限 5MB、数据行限
+  // 200 行（Audit #9 M10：超限的行不处理、进 failed 带明确原因）。
+  // exceljs 只留给导出
   // （只写不读），导入不再解析 xlsx。
   const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
-  r.post('/accounts/import', importUpload.single('file'), async (req: Request, res: Response) => {
+  r.post('/accounts/import', importUpload.single('file'), asyncHandler(async (req: Request, res: Response) => {
     const db = getDb();
     const f = (req as Request & { file?: Express.Multer.File }).file;
     if (!f || !f.buffer) return res.status(400).json({ ok: false, error: '请选择要导入的 CSV 文件' });
@@ -254,6 +280,8 @@ export function accountRoutes(ctx: Ctx): express.Router {
     // 列顺序与导入模板一致：0 序号（忽略），1 邮箱名，2 授权码，3 IMAP 服务器，
     // 4 IMAP 端口，5 SMTP 服务器，6 SMTP 端口，7 备注。第 1 行是表头。
     // 逐行顺序处理（for + await，不并发）；循环体内用 continue 跳行。
+    // 空行不计入行数上限。
+    let dataRows = 0;
     for (let idx = 0; idx < rows.length; idx++) {
       const cols = rows[idx];
       const rnum = idx + 1;
@@ -266,6 +294,12 @@ export function accountRoutes(ctx: Ctx): express.Router {
       const smtpPortRaw = cols[6];
       const displayName = String(cols[7] ?? '').trim();
       if (!email) continue;
+      // Audit #9 M10：超限的行不处理、进 failed（带明确原因），不静默丢弃。
+      dataRows += 1;
+      if (dataRows > MAX_IMPORT_ROWS) {
+        failed.push({ row: rnum, email, reason: `行数超限（单次导入最多 ${MAX_IMPORT_ROWS} 行），本行未处理` });
+        continue;
+      }
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         failed.push({ row: rnum, email, reason: '邮箱地址格式不正确' });
         continue;
@@ -320,9 +354,9 @@ export function accountRoutes(ctx: Ctx): express.Router {
       added.push(email);
     }
     res.json({ ok: true, added: added.length, skipped: skipped.length, failed, addedEmails: added, skippedEmails: skipped });
-  });
+  }));
 
-  r.post('/accounts', async (req: Request, res: Response) => {
+  r.post('/accounts', asyncHandler(async (req: Request, res: Response) => {
     const db = getDb();
     const b = (req.body || {}) as Record<string, unknown>;
     const email = String(b.email || '').trim().toLowerCase();
@@ -366,9 +400,9 @@ export function accountRoutes(ctx: Ctx): express.Router {
     engine.startAccount(row.id);
     emit('account', { action: 'added', account: publicAccount(row) });
     return res.status(201).json({ ok: true, account: publicAccount(row) });
-  });
+  }));
 
-  r.put('/accounts/:id', async (req: Request, res: Response) => {
+  r.put('/accounts/:id', asyncHandler(async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     const row = db.prepare('SELECT * FROM accounts WHERE id=?').get(id) as AccountRow | undefined;
@@ -376,6 +410,14 @@ export function accountRoutes(ctx: Ctx): express.Router {
     const b = (req.body || {}) as Record<string, unknown>;
     const err = validateServerFields(b as ServerFields);
     if (err) return res.status(400).json({ ok: false, error: err });
+    // Audit #9 L19c：sortOrder 须为有限整数——旧版 Number('abc') 得 NaN，
+    // better-sqlite3 把 NaN 绑为 NULL，sort_order 列 NOT NULL → 500 而非 400。
+    let newSortOrder = row.sort_order;
+    if (b.sortOrder !== undefined) {
+      const so = Number(b.sortOrder);
+      if (!Number.isInteger(so)) return res.status(400).json({ ok: false, error: 'sortOrder 须为整数' });
+      newSortOrder = so;
+    }
     const merged = {
       email: row.email,
       displayName: b.displayName !== undefined ? (b.displayName as string) : row.display_name,
@@ -410,12 +452,17 @@ export function accountRoutes(ctx: Ctx): express.Router {
         merged.imapHost, merged.imapPort, merged.imapSecure,
         merged.smtpHost, merged.smtpPort, merged.smtpSecure,
         newEnabled ? 1 : 0,
-        b.sortOrder !== undefined ? Number(b.sortOrder) : row.sort_order,
+        newSortOrder,
         id,
       );
     });
     tx();
-    if (passwordChanged || serverChanged) dropTransporter(id);
+    // Audit #9 L4：停用（enabled=false）时也释放 SMTP 连接池——旧版只在
+    // 密码/服务器变化时调 dropTransporter，停用路径没调。
+    if (passwordChanged || serverChanged || (enabledChanged && !newEnabled)) dropTransporter(id);
+    // Audit #9 L3：密码或服务器变化后测试缓存失效——旧版只有 DELETE 清缓存，
+    // PUT 改了密码/服务器后 10 秒内重测仍返回旧结果。
+    if (passwordChanged || serverChanged) testResultCache.delete(id);
     if (enabledChanged || passwordChanged || serverChanged) {
       engine.stopAccount(id, true);
       if (newEnabled) engine.startAccount(id);
@@ -424,7 +471,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
     const updated = db.prepare('SELECT * FROM accounts WHERE id=?').get(id) as AccountRow;
     emit('account', { action: 'updated', account: publicAccount(updated) });
     return res.json({ ok: true, account: publicAccount(updated) });
-  });
+  }));
 
   r.delete('/accounts/:id', (req: Request, res: Response) => {
     const db = getDb();
@@ -447,7 +494,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
     return res.json({ ok: true });
   });
 
-  r.post('/accounts/:id/test', async (req: Request, res: Response) => {
+  r.post('/accounts/:id/test', asyncHandler(async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     const row = db.prepare('SELECT * FROM accounts WHERE id=?').get(id) as AccountRow | undefined;
@@ -465,8 +512,23 @@ export function accountRoutes(ctx: Ctx): express.Router {
     const test = await testConnectivity(accountToImap(row), password);
     const result = { imapOk: test.imapOk, smtpOk: test.smtpOk, error: test.error };
     testResultCache.set(id, { at: Date.now(), result });
-    return res.json({ ok: true, imapOk: test.imapOk, smtpOk: test.smtpOk, ...(test.error ? { error: test.error } : {}) });
-  });
+    // Audit #9 M4：测试成功且账号处于认证失败（status='error'）时，
+    // 调 engine.startAccount(id) 恢复同步——旧版只调 testConnectivity，
+    // 不碰 engine、不清 authFailed，engine.ts:273 文案称“重新测试……
+    // 后恢复”与实际不符。startAccount 是公开方法（重建 state、
+    // authFailed 归零）；账号已停用时它直接返回，不会误启动。
+    // 缓存命中时不恢复：缓存结果对应的那次真实测试已在当时恢复过。
+    let recovered = false;
+    if (test.imapOk && test.smtpOk && row.status === 'error') {
+      engine.startAccount(id);
+      recovered = true;
+      log(`account ${id} test passed after auth failure, sync engine restarted`);
+    }
+    return res.json({
+      ok: true, imapOk: test.imapOk, smtpOk: test.smtpOk,
+      ...(test.error ? { error: test.error } : {}), ...(recovered ? { recovered: true } : {}),
+    });
+  }));
 
   r.post('/accounts/:id/refresh', (req: Request, res: Response) => {
     const db = getDb();

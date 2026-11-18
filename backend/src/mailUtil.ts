@@ -122,20 +122,16 @@ export interface ParsedAttachment {
 }
 
 // Match streamed-parse attachments (document order) to BODYSTRUCTURE parts.
-// Index-first (same rule as the send path): part[i] belongs to attachment
-// [i]. Filename is only a fallback/validation — same-name attachments must
-// not collapse onto one part.
+// Index-only (same rule as the send path): part[i] belongs to attachment
+// [i]. Audit #9 L13：去掉按名回退——byName 找第一个同名 part，会把
+// 同名附件 collapse 到同一个 part；缺失时记 part=NULL，调用方在返回里提示。
 export function matchAttachmentParts(
   parsedAttachments: ParsedAttachment[],
   parts: AttachmentPart[],
 ): ParsedAttachment[] {
   return (parsedAttachments || []).map((att, i) => {
     const byIndex = parts?.[i] || null;
-    const byName = !byIndex
-      ? (parts || []).find((p) => p.filename && att.filename && p.filename === att.filename)
-      : null;
-    const m = byIndex || byName || null;
-    return { ...att, part: m?.part || null };
+    return { ...att, part: byIndex?.part || null };
   });
 }
 

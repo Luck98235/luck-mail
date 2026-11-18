@@ -230,10 +230,31 @@ export function isAuthError(e: unknown): boolean {
 // 否则按通用错误 5 秒就重试，会延长服务器限流。网易 451（登录失败
 // 过多临时禁登）、421 HL:ICC（并发连接过大临时禁连）都在这里。
 export function isThrottleError(e: unknown): boolean {
-  const err = e as { message?: string; responseText?: string; code?: string; response?: string };
-  const text = `${err?.message || ''} ${err?.responseText || ''} ${err?.response || ''}`;
+  const err = e as { message?: string; responseText?: string; code?: string; response?: string | { attributes?: { section?: { value?: unknown }[] }[] } };
+  // Audit #9 M8：response 为对象时也提取响应码——之前只拼字符串，
+  // 对象经模板字符串变成 "[object Object]"，421/451 码丢失。
+  // 复用 isAuthError 的对象解析方式（attributes[0].section[0].value）。
+  const text = `${err?.message || ''} ${err?.responseText || ''} ${responseObjectText(err?.response)}`;
   if (/\b(421|451)\b/.test(text)) return true;
   return /too many connections|too frequent|temporarily blocked|temporarily banned|rate limit|throttl|login too frequent|too many login/i.test(text);
+}
+
+// 从 imapflow 的结构化 response 对象里提取可读文本（与 isAuthError
+// 同款解析：attributes[].section[].value），字符串 response 原样返回。
+function responseObjectText(resp: unknown): string {
+  if (typeof resp === 'string') return resp;
+  if (resp && typeof resp === 'object') {
+    const r = resp as { attributes?: { section?: { value?: unknown }[] }[]; text?: unknown };
+    const parts: string[] = [];
+    for (const attr of r.attributes || []) {
+      for (const s of attr?.section || []) {
+        if (typeof s?.value === 'string') parts.push(s.value);
+      }
+    }
+    if (typeof r.text === 'string') parts.push(r.text);
+    return parts.join(' ');
+  }
+  return '';
 }
 
 export function readableImapError(e: unknown): string {

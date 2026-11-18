@@ -78,7 +78,9 @@ export function accountErrorLabel(status: string | undefined, error: string | un
   return (error || '').startsWith('认证失败') ? '认证失败' : '连接异常'
 }
 
-// 下载 Blob：建临时 <a> 触发下载，点完立即回收对象 URL。
+// 下载 Blob：建临时 <a> 触发下载；对象 URL 延迟 500ms 再回收——
+// 立即回收可能抢在个别浏览器真正开始下载之前（审计 #9 L5），
+// 下载开始后再回收不影响进行中的下载。
 export function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -87,5 +89,5 @@ export function downloadBlob(blob: Blob, filename: string): void {
   document.body.appendChild(a)
   a.click()
   a.remove()
-  URL.revokeObjectURL(url)
+  setTimeout(() => URL.revokeObjectURL(url), 500)
 }

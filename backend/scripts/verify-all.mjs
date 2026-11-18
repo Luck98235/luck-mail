@@ -1127,6 +1127,22 @@ try {
     const scheduled = stM1b.timer !== null && stM1b.timer !== undefined;
     if (stM1b.timer) clearTimeout(stM1b.timer);
     check('audit8 MED-1 control: _scheduleReconnect still schedules for non-poll accounts', scheduled);
+    // Audit #9 H2：伪造客户端抛认证错后，_pollAllFolders 置 authFailed、
+    // 停轮询，下一轮不再建连（不再拿错凭证登录）。
+    const engineH2 = new SyncEngine(key);
+    let h2Calls = 0;
+    engineH2.withClient = async (...args) => {
+      h2Calls++;
+      const authErr = new Error('Command failed');
+      authErr.authenticationFailed = true;
+      throw authErr;
+    };
+    engineH2.states.set(h1Id, { authFailed: false, pollOnly: true, connecting: false, queue: Promise.resolve(), syncTimer: null });
+    await engineH2._pollAllFolders(h1Id);
+    await engineH2._pollAllFolders(h1Id);
+    const h2State = engineH2.states.get(h1Id);
+    check('audit9 H2: _pollAllFolders marks authFailed on auth error and makes no further login attempts',
+      h2Calls === 1 && h2State?.authFailed === true, `withClientCalls=${h2Calls} authFailed=${h2State?.authFailed}`);
   }
 
   // 9: 同步删除对账时正文孤儿文件一并删。
@@ -1458,18 +1474,21 @@ try {
   check('L1: over-long idempotencyKey -> 400', r.status === 400, `status=${r.status}`);
   // Audit #7 MED-1：并发同 key 单删——先占位后删除。两路并发 DELETE 带
   // 同一 key 时，只有一路真正执行删除（这里因种子账号无 trash 文件夹
-  // 而 502），另一路必须返回 duplicate:true、不执行第二次删除；
-  // 未修之前两路都会走到 IMAP 删除（都 502、无 duplicate）。
+  // 而 502），另一路不执行第二次删除。
+  // Audit #9 L14 之后：执行路失败会给占位行打 failed_at，第二路读到
+  // 失败标记后返回 502“上次删除失败，请用新的删除操作重试”，不再谎报
+  // duplicate:true——两路都是 502，但文案不同（执行路“IMAP 删除失败”，
+  // 第二路“上次删除失败”），且占位行只有一行，证明只执行了一次。
   const mConc = mkMsg(3, '并发删信测试', 'conc@163.com', '并发同 key 单删');
   {
     const [c1, c2] = await Promise.all([
       api('DELETE', `/api/messages/${mConc}?idempotencyKey=del-conc-1`),
       api('DELETE', `/api/messages/${mConc}?idempotencyKey=del-conc-1`),
     ]);
-    const dups = [c1, c2].filter((x) => x.json?.duplicate === true).length;
-    const fails = [c1, c2].filter((x) => x.status === 502).length;
-    check('MED-1: concurrent same-key single deletes -> exactly one duplicate:true, one 502',
-      dups === 1 && fails === 1, `c1=${c1.status}/${JSON.stringify(c1.json)} c2=${c2.status}/${JSON.stringify(c2.json)}`);
+    const executor = [c1, c2].filter((x) => /IMAP 删除失败：/.test(x.json?.error || '')).length;
+    const loser = [c1, c2].filter((x) => /上次删除失败/.test(x.json?.error || '')).length;
+    check('MED-1: concurrent same-key single deletes -> one executor 502, one failed-claim 502 (L14), no second execution',
+      executor === 1 && loser === 1, `c1=${c1.status}/${JSON.stringify(c1.json)} c2=${c2.status}/${JSON.stringify(c2.json)}`);
     const claimRows = vdb.prepare("SELECT COUNT(*) c FROM delete_idempotency WHERE idempotency_key='del-conc-1'").get().c;
     check('MED-1: claim row recorded exactly once', claimRows === 1, `rows=${claimRows}`);
   }

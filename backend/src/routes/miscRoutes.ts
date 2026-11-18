@@ -18,11 +18,14 @@ export function miscRoutes(): express.Router {
 
   r.get('/settings', (_req: Request, res: Response) => {
     const defaultAccountId = get('defaultAccountId');
+    // Audit #9 L19c：旧数据里若存了字面 'NaN'（见 PUT 校验），读回时按
+    // null 处理，不把 NaN 透传给前端。
+    const n = defaultAccountId ? Number(defaultAccountId) : NaN;
     res.json({
       ok: true,
       settings: {
         signature: get('signature') || '',
-        defaultAccountId: defaultAccountId ? Number(defaultAccountId) : null,
+        defaultAccountId: Number.isInteger(n) ? n : null,
       },
     });
   });
@@ -36,6 +39,27 @@ export function miscRoutes(): express.Router {
          ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
       ).run(k, String(v ?? ''));
     };
+    // 先校验 defaultAccountId 再写任何字段：校验失败返回 400 时签名
+    // 不应已被保存（旧顺序是先写签名、后校验，报错后签名已入库）。
+    let defaultAccountIdToPut: string | null = null;
+    if (b.defaultAccountId !== undefined) {
+      // Audit #9 L19c：defaultAccountId 须为已存在账号的 id——旧版
+      // String(Number('abc')) 得字面 'NaN' 存进库；非数字/不存在的 id
+      // 一律 400，不再入库。
+      if (b.defaultAccountId === null || b.defaultAccountId === '') {
+        defaultAccountIdToPut = '';
+      } else {
+        const n = Number(b.defaultAccountId);
+        if (!Number.isInteger(n) || n < 1) {
+          return res.status(400).json({ ok: false, error: 'defaultAccountId 须为已存在账号的 id' });
+        }
+        const exists = db.prepare('SELECT id FROM accounts WHERE id=?').get(n);
+        if (!exists) {
+          return res.status(400).json({ ok: false, error: 'defaultAccountId 须为已存在账号的 id' });
+        }
+        defaultAccountIdToPut = String(n);
+      }
+    }
     if (b.signature !== undefined) {
       // D10: 签名长度上限 10000 字符——旧版无上限（实际风险极低，
       // 1MB JSON 上限兜着），加个明确上限防误操作塞巨量文本。
@@ -44,16 +68,14 @@ export function miscRoutes(): express.Router {
       }
       put('signature', String(b.signature));
     }
-    if (b.defaultAccountId !== undefined) {
-      const v = b.defaultAccountId === null || b.defaultAccountId === '' ? '' : String(Number(b.defaultAccountId));
-      put('defaultAccountId', v);
-    }
+    if (defaultAccountIdToPut !== null) put('defaultAccountId', defaultAccountIdToPut);
     const defaultAccountId = get('defaultAccountId');
+    const n = defaultAccountId ? Number(defaultAccountId) : NaN;
     res.json({
       ok: true,
       settings: {
         signature: get('signature') || '',
-        defaultAccountId: defaultAccountId ? Number(defaultAccountId) : null,
+        defaultAccountId: Number.isInteger(n) ? n : null,
       },
     });
   });
@@ -68,7 +90,11 @@ export function miscRoutes(): express.Router {
   r.post('/backup/download', async (_req: Request, res: Response) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'luck-mail-backup-'));
     try {
-      fs.copyFileSync(KEY_FILE, path.join(tmp, '.key'));
+      const keyDest = path.join(tmp, '.key');
+      fs.copyFileSync(KEY_FILE, keyDest);
+      // Audit #9 L15：备份包内的 .key 强制 0600 再打包——旧版 copyFileSync
+      // 以默认模式复制（0644），tar 原样打包，包内密钥权限过宽。
+      fs.chmodSync(keyDest, 0o600);
       const dataDir = path.join(tmp, 'data');
       fs.mkdirSync(dataDir, { recursive: true });
       await getDb().backup(path.join(dataDir, 'luck-mail.db'));

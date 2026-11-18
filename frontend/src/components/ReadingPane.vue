@@ -92,7 +92,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { useMailStore } from '../stores/mail'
 import { useThemeStore } from '../stores/theme'
 import { api } from '../api'
@@ -239,11 +239,24 @@ function setupFrame(): void {
 }
 
 onUnmounted(() => {
+  window.removeEventListener('resize', onResize)
   bodyObserver?.disconnect()
   remeasureTimers.forEach((t) => clearTimeout(t))
   detachFrameSwipe?.()
   detachFrameSwipe = null
 })
+
+// 断点变化补挂（审计 #9 L6）：桌面宽度打开的信，窗口缩到 <1024px 后，
+// 正文 iframe 里的右滑返回要补挂上，否则只在下次打开信时才生效。
+// 只在“由宽变窄”那一次补调 setupFrame，拖动中不反复调；
+// 已挂着（窄屏打开的信）或当前没在读信时不重复挂。
+let wasNarrow = window.innerWidth < 1024
+function onResize(): void {
+  const narrow = window.innerWidth < 1024
+  if (narrow && !wasNarrow && mail.selectedMessage && !detachFrameSwipe) setupFrame()
+  wasNarrow = narrow
+}
+onMounted(() => { window.addEventListener('resize', onResize) })
 
 watch(() => mail.selectedMessage?.id, () => {
   // 换一封邮件时译文与复制态都清掉，回到原文。

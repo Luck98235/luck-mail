@@ -405,7 +405,7 @@ export const useMailStore = defineStore('mail', () => {
     page.value = 1
     mailList.value = []
     total.value = 0
-    if (window.innerWidth < 1024) backToMobileAccount()
+    if (window.innerWidth < 1024) await backToMobileAccount()
     await loadMessages()
   }
 
@@ -568,6 +568,7 @@ export const useMailStore = defineStore('mail', () => {
     // 只显示该账号的服务端草稿（不调 /api/messages）。
     if (view.value.kind === 'folder' && !view.value.folderId) {
       try { await loadDrafts() } catch { /* 草稿拉不到就显示旧列表 */ }
+      if (seq !== loadSeq) return // 已被更新的请求取代，丢弃旧响应（审计 #9 L2：与草稿分支一致）
       mailList.value = draftEnvelopes()
       total.value = mailList.value.length
       return
@@ -670,7 +671,12 @@ export const useMailStore = defineStore('mail', () => {
   async function setSearch(q: string): Promise<void> {
     searchQuery.value = q
     page.value = 1
+    // 请求序号（审计 #9 L1）：记下本次 loadMessages 入口将取到的序号；
+    // await 回来时若序号已变，说明已有更新的搜索在跑，本次的选中清理跳过、
+    // 由最新的那次负责——否则旧请求会按中间态的列表误删仍在新结果里的在读信。
+    const seq = loadSeq + 1
     await loadMessages()
+    if (seq !== loadSeq) return
     // 搜完（或清搜索）若正在读的信不在当前结果里，清掉选中，避免阅读窗
     // 留着不属于当前列表的旧信；在结果里就保持打开，由用户自己决定。
     if (selectedId.value !== null && !mailList.value.some((m) => m.id === selectedId.value)) {
@@ -693,12 +699,10 @@ export const useMailStore = defineStore('mail', () => {
       // 不覆盖新信的正文，也不切阅读窗。
       if (selectedId.value !== id) return
       selectedMessage.value = data.message
-      // 打开即标已读（后端 GET 详情已标已读并推 Socket.io 更新；这里同步本地列表与未读数）
-      const row = mailList.value.find((m) => m.id === id)
-      if (row && !row.isRead) {
-        row.isRead = true
-        bumpUnread(row.accountId, row.folderId, -1)
-      }
+      // 打开即标已读：后端 GET 详情不再带标已读副作用（审计 #9 后端 L16），
+      // 未读信在这里显式调 POST /read；setRead 幂等，重复标已读无害，
+      // 且会同步列表行、未读数与正文的已读态。
+      if (!data.message.isRead) await setRead(id, true)
       // 成功才切到阅读窗：失败时不切，留在列表（M18）。
       if (window.innerWidth < 1024) mview.value = 'read'
     } catch {
@@ -1066,13 +1070,30 @@ export const useMailStore = defineStore('mail', () => {
   // 切视图时回到列表级：若在阅读窗，走 history.back() 让 popstate 驱动回退，
   // 保持历史栈与界面同步（直接改 mview 会让栈顶多一个 read，
   // 下一次系统返回要多按一次才生效）；历史未初始化（init 恢复阶段）时直接改。
-  function backToMobileAccount(): void {
-    if (window.innerWidth >= 1024) return
+  // 返回 Promise：history.back() 的 popstate 是异步任务，发信后 setAggregate
+  // 再 openMessage 必须等它落定，否则 openMessage 刚把 mview 设回 'read'，
+  // 随后到达的 popstate 又盖回 'account'，用户看不到刚发的信（审计 #9 L3）。
+  // 超时兜底：popstate 正常情况下一个任务内就到；万一没来也不卡住列表加载。
+  function backToMobileAccount(): Promise<void> {
+    if (window.innerWidth >= 1024) return Promise.resolve()
     if (mview.value === 'read' && historyInitialized && typeof window !== 'undefined' && window.history) {
-      window.history.back()
-      return
+      return new Promise<void>((resolve) => {
+        let done = false
+        const finish = (): void => {
+          if (done) return
+          done = true
+          window.removeEventListener('popstate', onPop)
+          clearTimeout(timer)
+          resolve()
+        }
+        const onPop = (): void => { finish() }
+        const timer = setTimeout(finish, 500)
+        window.addEventListener('popstate', onPop)
+        window.history.back()
+      })
     }
     mview.value = 'account'
+    return Promise.resolve()
   }
   // 跨断点补初始化（审计 #5 前端轨 S4）：桌面端打开后把窗口缩到 1024 以下时，
   // initMobileHistory 在 init() 里已因宽度跳过（且未置位），靠这次 resize
@@ -1306,6 +1327,12 @@ export const useMailStore = defineStore('mail', () => {
   }
 
   async function init(): Promise<void> {
+    // 先读保存的移动端状态再清会话：resetSessionState 会把 selectedId 置空，
+    // watch 回写 localStorage 的时机就在第一个 await 处，读晚了便只剩 null，
+    // 正在读的信就恢复不了（审计 #9 M1 根因：此前读在 Promise.all 之后，
+    // 手机端 F5 恢复同样被这道竞态破坏；桌面端 F5 恢复也靠这份快照）。
+    let savedMobile: { mview?: string; mobileAccountId?: number | null; selectedId?: number | string | null } | null = null
+    try { savedMobile = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null') } catch { savedMobile = null }
     resetSessionState()
     // 懒加载：初始化只加载一级账号名，不预加载任何账号的文件夹；
     // 文件夹在点邮箱行 / 折叠箭头时才按需加载。
@@ -1313,16 +1340,15 @@ export const useMailStore = defineStore('mail', () => {
     // 旧本机草稿一次性迁移（见 migrateLocalDrafts）：要在恢复导航前做，
     // 落在草稿视图时迁移完的草稿能直接显示。
     await migrateLocalDrafts()
-    // 手机端状态先读出来存着，再恢复导航——restoreView 会改 mview 并触发保存，
-    // 若恢复完再读 localStorage，正在读信的状态已被“列表”盖掉，回不到正文。
-    let savedMobile: { mview?: string; mobileAccountId?: number | null; selectedId?: number | string | null } | null = null
-    if (window.innerWidth < 1024) {
-      try { savedMobile = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null') } catch { savedMobile = null }
-    }
     // 恢复上次选中的导航（无记录/记录失效时默认所有收件箱）。
     await restoreView()
     // 手机/平板再恢复在哪一级（列表/正在读的信），桌面端这步直接跳过。
     await restoreMobileState(savedMobile)
+    // 桌面端 F5 后也恢复在读的信（审计 #9 M1）：restoreView 之后读到的列表里
+    // 若还有这封信就打开；不在当页就不恢复（不跨页翻找）。
+    if (window.innerWidth >= 1024 && savedMobile?.selectedId != null && mailList.value.some((m) => m.id === savedMobile.selectedId)) {
+      await openMessage(savedMobile.selectedId)
+    }
     // 跨断点补初始化（见 watchMobileBreakpoint）：桌面端打开后缩窗时补搭历史栈。
     watchMobileBreakpoint()
     // 手机/平板浏览器历史：按恢复到的 mview 搭好 home → account → read，

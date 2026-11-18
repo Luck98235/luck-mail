@@ -13,22 +13,47 @@ export interface AuthedRequest extends Request {
 
 // In-memory lockout for login attempts against unknown usernames and for
 // setup (no user row exists yet to carry the counters).
-const ipAttempts = new Map<string, { count: number; lockedUntil: number }>();
+// Audit #9 L18：记录带 updatedAt；锁过期时清零计数（见 ipLocked/ipFail），
+// 另有定时清理扫掉过期/陈旧记录——旧版 Map 常驻内存、无 TTL，
+// 未知用户名锁定计数永不衰减。
+const ipAttempts = new Map<string, { count: number; lockedUntil: number; updatedAt: number }>();
+const IP_ATTEMPT_TTL_MS = 24 * 60 * 60 * 1000;
 
 function ipKey(req: Request, scope: string): string {
   return `${scope}:${req.ip || req.socket?.remoteAddress || 'unknown'}`;
 }
 
+// 锁过期即清零计数并删记录：下一次失败从 count=1 重新计，不再
+// “锁过期后一次输错立即再锁 15 分钟”（已知用户侧 D7 同款语义）。
 function ipLocked(req: Request, scope: string): number {
   const rec = ipAttempts.get(ipKey(req, scope));
-  if (rec && rec.lockedUntil > Date.now()) return rec.lockedUntil;
+  if (!rec) return 0;
+  if (rec.lockedUntil > Date.now()) return rec.lockedUntil;
+  if (rec.lockedUntil) ipAttempts.delete(ipKey(req, scope));
   return 0;
 }
 
+// 定时清理：过期锁已在 ipLocked/ipFail 里清零；这里扫掉无有效锁且
+// 超过 24 小时未更新的陈旧记录，避免 Map 无限增长。unref，不挡进程退出。
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, rec] of ipAttempts) {
+    if (rec.lockedUntil && rec.lockedUntil <= now) ipAttempts.delete(k);
+    else if (!rec.lockedUntil && now - rec.updatedAt > IP_ATTEMPT_TTL_MS) ipAttempts.delete(k);
+  }
+}, 60 * 60 * 1000).unref();
+
 export function ipFail(req: Request, scope: string): { count: number; lockedUntil: number } {
   const k = ipKey(req, scope);
-  const rec = ipAttempts.get(k) || { count: 0, lockedUntil: 0 };
+  const rec = ipAttempts.get(k) || { count: 0, lockedUntil: 0, updatedAt: Date.now() };
+  // 锁已过期：先清零再计本次失败（与 ipLocked 同款语义），否则锁过期后
+  // 下一次失败立即重新锁定 15 分钟。
+  if (rec.lockedUntil && rec.lockedUntil <= Date.now()) {
+    rec.count = 0;
+    rec.lockedUntil = 0;
+  }
   rec.count += 1;
+  rec.updatedAt = Date.now();
   if (rec.count >= MAX_FAILED_ATTEMPTS) rec.lockedUntil = Date.now() + LOCKOUT_MS;
   ipAttempts.set(k, rec);
   return rec;
@@ -43,18 +68,26 @@ export function ipLockRemaining(req: Request, scope: string): number {
   return until ? Math.ceil((until - Date.now()) / 1000) : 0;
 }
 
-export function createSession(userId: number, rememberMe: boolean): { token: string; expiresAt: Date } {
+export function createSession(
+  userId: number,
+  rememberMe: boolean,
+  expiresAt?: Date,
+): { token: string; expiresAt: Date } {
   const db = getDb();
   const token = randomToken(32);
-  const expiresAt = new Date(Date.now() + (rememberMe ? 30 : 1) * DAY_MS);
+  // Audit #9 L17：改密码轮换会话时可传入原会话的过期时间，保留剩余
+  // 有效期（不传时按 rememberMe 算 30 天/1 天，与旧行为一致）。
+  const exp = expiresAt && expiresAt.getTime() > Date.now()
+    ? expiresAt
+    : new Date(Date.now() + (rememberMe ? 30 : 1) * DAY_MS);
   // S2: 存 SQLite datetime 格式（'YYYY-MM-DD HH:MM:SS'），不要 ISO 的 T/Z。
   // 旧版存 toISOString()（'2026-11-18T05:40:19.455Z'），与 datetime('now')
   // 做字符串比较时第 11 位 'T'(0x54) 恒大于空格(0x20)，同一天内无论几点
   // 过期都判有效，会话最长多活 ~24 小时。
-  const expiresSqlite = expiresAt.toISOString().replace('T', ' ').slice(0, 19);
+  const expiresSqlite = exp.toISOString().replace('T', ' ').slice(0, 19);
   db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?,?,?)')
     .run(sha256Hex(token), userId, expiresSqlite);
-  return { token, expiresAt };
+  return { token, expiresAt: exp };
 }
 
 export function lookupSession(token: string | null | undefined): { user_id: number; username: string } | null {
@@ -89,7 +122,10 @@ export function setSessionCookie(res: Response, token: string, expiresAt: Date):
 
 export function clearSessionCookie(res: Response): void {
   // 清除时 sameSite 须与设置时一致，否则浏览器认不出是同一个 Cookie。
-  res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: 'strict', path: '/' });
+  // Audit #9 L19a：secure 也须与设置时一致——生产 COOKIE_SECURE=1 时
+  // Chrome 会拒绝用不带 Secure 的 Set-Cookie 覆盖/删除 Secure Cookie，
+  // 登出后浏览器可能残留已失效的会话 Cookie（服务端会话已删，仅为残留）。
+  res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: 'strict', path: '/', secure: COOKIE_SECURE });
 }
 
 // Express middleware: requires a valid session; sets req.user.

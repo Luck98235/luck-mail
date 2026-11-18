@@ -243,6 +243,9 @@ async function confirm(): Promise<void> {
       error.value = '部分排序未保存，请重试。'
       return
     }
+    // 保存成功：rows 与服务器已一致，重建一次再关，避免 close() 的
+    // 未保存检查把刚存好的改动（_deleted 标记还在行上）又当成未保存。
+    rows.value = mail.accounts.map((a) => ({ ...a, displayName: a.displayName || '', _deleted: false }))
     mail.showToast('邮箱管理已保存')
     close()
   } catch (e) {
@@ -318,5 +321,10 @@ async function onImportFile(ev: Event): Promise<void> {
   }
 }
 
-function close(): void { emit('close') }
+async function close(): Promise<void> {
+  // 未保存的改动被静默丢弃过（审计 #9 L7）：点取消/X 前先确认放弃，
+  // 已保存/无改动时直接关。
+  if (hasUnsavedEdits() && !await mail.requestConfirm('邮箱管理里的改动尚未保存，确定放弃吗？')) return
+  emit('close')
+}
 </script>

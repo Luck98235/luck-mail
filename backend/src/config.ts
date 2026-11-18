@@ -42,6 +42,19 @@ export function initStorage(): Buffer {
   if (keyDir) fs.mkdirSync(keyDir, { recursive: true });
 
   if (fs.existsSync(KEY_FILE)) {
+    // Audit #9 L15：已存在的 .key 也要强制 0600——旧版只在新建时写
+    // 0600，已存在时直接读、不校验不纠正；若线上文件实际是 0644，
+    // 会一直保持。stat 校验，不符则纠正并记告警（纠正失败也记告警，
+    // 不阻塞启动——读密钥本身不受权限位影响）。
+    try {
+      const st = fs.statSync(KEY_FILE);
+      if ((st.mode & 0o777) !== 0o600) {
+        fs.chmodSync(KEY_FILE, 0o600);
+        log(`[warn] KEY_FILE ${KEY_FILE} mode was 0${(st.mode & 0o777).toString(8)}, chmod to 0600`);
+      }
+    } catch (e) {
+      log('[warn] failed to enforce KEY_FILE mode 0600:', (e as Error)?.message || e);
+    }
     const key = fs.readFileSync(KEY_FILE);
     if (key.length !== 32) throw new Error(`KEY_FILE ${KEY_FILE} is not 32 bytes`);
     return key;

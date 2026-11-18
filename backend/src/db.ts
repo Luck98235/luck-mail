@@ -224,7 +224,7 @@ function initSchema(db: Db): void {
     content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
     size INTEGER NOT NULL DEFAULT 0,
     path TEXT,
-    cached INTEGER NOT NULL DEFAULT 1,
+    cached INTEGER NOT NULL DEFAULT 0, -- Audit #9 L7：由 1 改为 0（见下迁移注释）
     part TEXT
   );
 
@@ -303,7 +303,9 @@ function initSchema(db: Db): void {
   const attCols = db.prepare('PRAGMA table_info(attachments)').all() as { name: string }[];
   const attColNames = attCols.map((c) => c.name);
   if (attColNames.length && !attColNames.includes('cached')) {
-    db.exec('ALTER TABLE attachments ADD COLUMN cached INTEGER NOT NULL DEFAULT 1');
+    // Audit #9 L7：新列默认值由 1 改为 0。只改默认值、不删残留代码：
+    // 线上是否确无 cached=1 行无法核实（不能碰线上数据库），残留代码暂留。
+    db.exec('ALTER TABLE attachments ADD COLUMN cached INTEGER NOT NULL DEFAULT 0');
   }
   if (attColNames.length && !attColNames.includes('part')) {
     db.exec('ALTER TABLE attachments ADD COLUMN part TEXT');
@@ -317,6 +319,13 @@ function initSchema(db: Db): void {
   const idemCols = db.prepare('PRAGMA table_info(sent_idempotency)').all() as { name: string }[];
   if (idemCols.length && !idemCols.map((c) => c.name).includes('planned_message_id')) {
     db.exec('ALTER TABLE sent_idempotency ADD COLUMN planned_message_id TEXT');
+  }
+
+  // ---- Audit #9 L14：delete_idempotency 加 failed_at ----
+  // 单删失败时占位行打失败标记，同一 key 重试返回 502 而非谎报 duplicate。
+  const delIdemCols = db.prepare('PRAGMA table_info(delete_idempotency)').all() as { name: string }[];
+  if (delIdemCols.length && !delIdemCols.map((c) => c.name).includes('failed_at')) {
+    db.exec('ALTER TABLE delete_idempotency ADD COLUMN failed_at TEXT');
   }
 
   // ---- Audit #5 (17): messages 按 Message-ID 唯一 ----
@@ -367,6 +376,29 @@ function initSchema(db: Db): void {
     'CREATE INDEX IF NOT EXISTS idx_delete_idempotency_created_at ' +
     'ON delete_idempotency(created_at)',
   );
+  // ---- Audit #9 M5（数据库）：邮件列表热查询 ORDER BY m.date DESC 无对应
+  // 索引——大文件夹下每翻一页都要全文件夹扫描 + 排序。复合索引覆盖列表
+  // 查询（聚合视图走 account_id 索引，见下）。
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_messages_folder_date ' +
+    'ON messages(folder_id, date DESC, id DESC)',
+  );
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_messages_account_date ' +
+    'ON messages(account_id, date DESC, id DESC)',
+  );
+
+  // ---- Audit #9 L8：drafts.idempotency_key 唯一索引 ----
+  // SQLite UNIQUE 允许多个 NULL，key 为空的旧行不受影响；若旧库已有
+  // 重复 key，建索引失败只记警告、不让服务器起不来（路由先查后插仍在）。
+  try {
+    db.exec(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_idempotency_key ' +
+      'ON drafts(idempotency_key)',
+    );
+  } catch (e) {
+    log('WARNING: could not create drafts idempotency unique index:', (e as Error)?.message || e);
+  }
 
   // ---- FTS5 (standalone table, maintained by the app, NOT triggers) ----
   // The searchable text lives here (subject / from / plain-text body);
@@ -461,7 +493,7 @@ export function removeMessagesFtsByFolder(folderId: number): void {
 //   3. FTS5 trigram 匹配不了 1-2 字词：>=3 字走 FTS MATCH（引号短语，隐含 AND），
 //      <3 字走 LIKE '%词%'（subject / from_addr / body_text）。
 // 返回按相关度排好序的 id 列表（调用方直接按此顺序分页、展示，不再按时间重排）。
-export function searchMessageIds(q: string): number[] | null {
+export function searchMessageIds(q: string): { ids: number[]; truncated: boolean } | null {
   const db = getDb();
   const terms = String(q || '').split(/\s+/).map((t) => t.trim()).filter(Boolean);
   if (!terms.length) return null; // no filtering
@@ -473,6 +505,8 @@ export function searchMessageIds(q: string): number[] | null {
   const ftsRank = new Map<number, number>();
   // D4: 去引号后为空的词直接跳过——`"""` 会拼成 MATCH '""'，
   // FTS 语法错误 500。matchTerms 为空时不做 FTS 约束（走 LIKE 或返回空）。
+  // Audit #9 L5：任一分支命中达 LIMIT 2000 即截断，置 truncated 透传给调用方。
+  let truncated = false;
   const matchTerms = longTerms.map((t) => t.replace(/"/g, '')).filter((t) => t.length > 0);
   if (matchTerms.length) {
     const match = matchTerms.map((t) => `"${t}"`).join(' ');
@@ -481,6 +515,7 @@ export function searchMessageIds(q: string): number[] | null {
     const rows = db.prepare(
       'SELECT rowid AS id, bm25(messages_fts) AS rank FROM messages_fts WHERE messages_fts MATCH ? ORDER BY rank LIMIT 2000'
     ).all(match) as { id: number; rank: number }[];
+    if (rows.length >= 2000) truncated = true;
     ftsIds = new Set(rows.map((r) => r.id));
     for (const r of rows) ftsRank.set(r.id, r.rank);
   }
@@ -501,6 +536,7 @@ export function searchMessageIds(q: string): number[] | null {
       // 单次短词搜索的扫描量有界，正常搜索（命中 <2000）不受影响。
       `SELECT rowid AS id FROM messages_fts WHERE ${likeClauses.join(' AND ')} LIMIT 2000`
     ).all(...params) as { id: number }[];
+    if (rows.length >= 2000) truncated = true;
     likeIds = new Set(rows.map((r) => r.id));
   }
   // 交集：必须同时满足长词组与短词组（以前是并集，任一组命中就算，太宽）。
@@ -512,17 +548,17 @@ export function searchMessageIds(q: string): number[] | null {
   } else if (likeIds) {
     ids = likeIds;
   } else {
-    return [];
+    return { ids: [], truncated };
   }
   // 按相关度排序：FTS 命中按 bm25 升序；纯 LIKE 命中无分，排在后面、按 id 倒序（越新越前）。
-  return [...ids].sort((a, b) => {
+  return { ids: [...ids].sort((a, b) => {
     const ra = ftsRank.get(a);
     const rb = ftsRank.get(b);
     if (ra !== undefined && rb !== undefined) return ra - rb;
     if (ra !== undefined) return -1;
     if (rb !== undefined) return 1;
     return b - a;
-  });
+  }), truncated };
 }
 
 export function refreshFolderCounts(folderId: number): void {

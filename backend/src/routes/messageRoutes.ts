@@ -70,6 +70,25 @@ function pruneDeleteTasks(): void {
   }
 }
 
+// Audit #9 M3：async 路由处理器统一兜底——Express 4.21.2 无
+// express-async-errors，async 处理器返回 rejected promise 时 Express 4
+// 不接管，会变成未处理 rejection。wrapAsync 把它转成统一 500 JSON。
+// 已有内层 try/catch 的逻辑不动，只在外层兜底未覆盖的异常。
+function wrapAsync(fn: (req: Request, res: Response) => Promise<void>): (req: Request, res: Response) => void {
+  return (req: Request, res: Response) => {
+    void fn(req, res).catch((e: unknown) => {
+      log('async route failed', req.method, req.path, (e as Error)?.message || e);
+      if (!res.headersSent) res.status(500).json({ ok: false, error: '服务器内部错误，请重试' });
+    });
+  };
+}
+
+// Audit #9 L10：发信前基本邮箱格式校验（只拦明显非法格式，不做
+// MX/DNS 校验；SMTP 侧仍是最终判定）。
+function isValidEmail(addr: string): boolean {
+  return /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(addr);
+}
+
 // multer/busboy 把 multipart 文件名按 Latin-1 解码，中文等非 ASCII 文件名会变成乱码
 // （UTF-8 字节被当成 Latin-1 读，如“门槛”变成“é—¨æ§”）。把 Latin-1 再转回 UTF-8
 // 即可还原；用往返校验兜底：只有“转回 UTF-8 再按 Latin-1 读回去等于原值”时才采用，
@@ -145,15 +164,20 @@ function listMessages(req: Request, res: Response): void {
     // 永远搜不到，用户会以为搜索坏了。搜到后结果里带 folder_path，
     // 用户能看到每封信在哪个文件夹。
     // searchMessageIds 已按相关度排好序：直接按此顺序分页、展示，不再按时间重排。
-    const ids = searchMessageIds(String(q));
+    // Audit #9 L5：命中达 2000 时 searchMessageIds 截断并置 truncated，
+    // 这里原样透传；total 仍是本次返回的 id 列表长度（不悄悄改语义），
+    // 前端凭 truncated:true 提示“仅显示前 2000 条”。
+    const searchResult = searchMessageIds(String(q));
+    const ids = searchResult?.ids ?? null;
+    const truncated = searchResult?.truncated ?? false;
     if (!ids || ids.length === 0) {
-      res.json({ ok: true, messages: [], total: 0 });
+      res.json({ ok: true, messages: [], total: 0, ...(truncated ? { truncated: true } : {}) });
       return;
     }
     const total = ids.length;
     const pageIds = ids.slice(off, off + lim);
     if (!pageIds.length) {
-      res.json({ ok: true, messages: [], total });
+      res.json({ ok: true, messages: [], total, ...(truncated ? { truncated: true } : {}) });
       return;
     }
     const placeholders = pageIds.map(() => '?').join(',');
@@ -162,7 +186,7 @@ function listMessages(req: Request, res: Response): void {
     ).all(...(pageIds as never[])) as MessageRow[];
     const order = new Map(pageIds.map((id, i) => [id, i]));
     rows.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
-    res.json({ ok: true, messages: rows.map((row) => envelopeOf(row, row.account_email || '')), total });
+    res.json({ ok: true, messages: rows.map((row) => envelopeOf(row, row.account_email || '')), total, ...(truncated ? { truncated: true } : {}) });
     return;
   }
   const whereSql = where ? `WHERE ${where}` : '';
@@ -228,7 +252,7 @@ export function messageRoutes(ctx: Ctx): express.Router {
     res.json({ ok: true, ...latest });
   });
 
-  r.get('/messages/:id', async (req: Request, res: Response) => {
+  r.get('/messages/:id', wrapAsync(async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     const row0 = db.prepare('SELECT * FROM messages WHERE id=?').get(id) as MessageRow | undefined;
@@ -258,34 +282,27 @@ export function messageRoutes(ctx: Ctx): express.Router {
         large: false, // 附件默认不下载、无“较大”之分；下载一律从 IMAP 实时取
         cached: !!a.cached,
       }));
-    // Open marks as read (contract). IMAP failure must not break the open:
-    // fall back to a local-only mark.
-    if (!row.is_read) {
-      try {
-        await engine.setRead(row.account_id, id, true);
-      } catch (e) {
-        log('mark-read on open failed', id, (e as Error)?.message || e);
-        db.prepare('UPDATE messages SET is_read=1 WHERE id=?').run(id);
-        if (row.folder_id) refreshFolderCounts(row.folder_id);
-        emit('mail-updated', { messageId: id, accountId: row.account_id, folderId: row.folder_id, changes: { isRead: true } });
-      }
-    }
-    const fresh = db.prepare(`${messageRowQuery()} WHERE m.id=?`).get(id) as MessageRow;
+    // Audit #9 L16：GET 只读返回，不再标已读（GET 有写副作用违反安全语义）。
+    // 部署依赖：前端侧同步改 openMessage——拿到正文后显式调 POST
+    // /messages/:id/read（setRead），两边同一批部署、无窗口期。
+    // Audit #9 L2：复用上面已查到的 row，不再第 3 次查同一封信
+    // （第 1 次 SELECT *、第 2 次 messageRowQuery 已够；fetchFullMessage
+    // 只补正文文件，不改行内容）。
     // Bodies live on disk (contract): read the sanitized HTML + plain text.
     const { bodyText, bodyHtml } = readBodyFiles(id);
     res.json({
       ok: true,
       message: {
-        ...envelopeOf(fresh, fresh.account_email || ''),
-        cc: JSON.parse(fresh.cc_json || '[]') as string[],
+        ...envelopeOf(row, row.account_email || ''),
+        cc: JSON.parse(row.cc_json || '[]') as string[],
         bodyText,
         bodyHtml,
         attachments,
       },
     });
-  });
+  }));
 
-  r.post('/messages/:id/read', async (req: Request, res: Response) => {
+  r.post('/messages/:id/read', wrapAsync(async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(id) as MessageRow | undefined;
@@ -306,9 +323,9 @@ export function messageRoutes(ctx: Ctx): express.Router {
       emit('mail-updated', { messageId: id, accountId: row.account_id, folderId: row.folder_id, changes: { isRead: read } });
     }
     res.json({ ok: true });
-  });
+  }));
 
-  r.post('/messages/:id/move', async (req: Request, res: Response) => {
+  r.post('/messages/:id/move', wrapAsync(async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(id) as MessageRow | undefined;
@@ -328,9 +345,9 @@ export function messageRoutes(ctx: Ctx): express.Router {
       return;
     }
     res.json({ ok: true });
-  });
+  }));
 
-  r.delete('/messages/:id', async (req: Request, res: Response) => {
+  r.delete('/messages/:id', wrapAsync(async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     // L1（后端半边）：删信幂等键。响应丢失后用户重试同一动作时，
@@ -345,8 +362,14 @@ export function messageRoutes(ctx: Ctx): express.Router {
       return;
     }
     if (delKey) {
-      const prior = db.prepare('SELECT message_db_id FROM delete_idempotency WHERE idempotency_key=?').get(delKey) as { message_db_id: number | null } | undefined;
+      const prior = db.prepare('SELECT message_db_id, failed_at FROM delete_idempotency WHERE idempotency_key=?').get(delKey) as { message_db_id: number | null; failed_at: string | null } | undefined;
       if (prior) {
+        // Audit #9 L14：占位行带 failed_at 时表示上次删除失败过——重试
+        // 不再谎报 duplicate:true，返回 502 让用户用新 key 再删。
+        if (prior.failed_at) {
+          res.status(502).json({ ok: false, error: '上次删除失败（IMAP 删除未成功），请用新的删除操作重试' });
+          return;
+        }
         if (prior.message_db_id === id) {
           res.json({ ok: true, duplicate: true });
           return;
@@ -366,14 +389,19 @@ export function messageRoutes(ctx: Ctx): express.Router {
     // await（IMAP），两路并发带同一 key 时都会查不到、都执行删除，
     // 第二路会把第一路刚移进已删除的信彻底删除。占位用 INSERT OR IGNORE
     //（key 是 PRIMARY KEY，原子抢占）：抢不到的重读返回 duplicate/409，
-    // 不执行删除。占位即使删除失败也保留（删信记录保留 7 天才清）：
-    // 重试返回 duplicate:true，前端按成功对账、行还在列表里会回来，
-    // 用户用新 key 再删即可——比“重试变彻底删除”的不可逆误删安全。
+    // 不执行删除。占位即使删除失败也保留（删信记录保留 7 天才清），但 Audit #9 L14
+    // 给失败占位行打 failed_at 标记：同一 key 重试时不再谎报
+    // duplicate:true（见上面 prior 检查，返回 502），用户用新 key
+    // 再删即可——比“重试变彻底删除”的不可逆误删安全，也比谎报成功诚实。
     if (delKey) {
       const claim = db.prepare('INSERT OR IGNORE INTO delete_idempotency (idempotency_key, message_db_id) VALUES (?,?)')
         .run(delKey, id);
       if (claim.changes === 0) {
-        const prior2 = db.prepare('SELECT message_db_id FROM delete_idempotency WHERE idempotency_key=?').get(delKey) as { message_db_id: number | null } | undefined;
+        const prior2 = db.prepare('SELECT message_db_id, failed_at FROM delete_idempotency WHERE idempotency_key=?').get(delKey) as { message_db_id: number | null; failed_at: string | null } | undefined;
+        if (prior2?.failed_at) {
+          res.status(502).json({ ok: false, error: '上次删除失败（IMAP 删除未成功），请用新的删除操作重试' });
+          return;
+        }
         if (prior2?.message_db_id === id) {
           res.json({ ok: true, duplicate: true });
           return;
@@ -385,14 +413,25 @@ export function messageRoutes(ctx: Ctx): express.Router {
     try {
       await engine.deleteMessage(row.account_id, id);
     } catch (e) {
+      // Audit #9 M1：另一路正在删同一封信——报 409 冲突，不当作删除失败
+      //（不打 failed_at、不走 502），前端可稍后用新 key 重试。
+      const ec = e as Error & { status?: number; code?: string };
+      if (ec?.status === 409 || ec?.code === 'DELETE_IN_FLIGHT') {
+        res.status(409).json({ ok: false, error: ec.message || '该邮件正在删除中，请稍后再试' });
+        return;
+      }
       // B19: 删除失败可观测性——记下账号、消息 id 与错误，否则 502 只在
       // 前端闪一下，服务端日志里查不到是哪封、哪个账号失败。
       log('delete failed', `account=${row.account_id} message=${id}`, (e as Error)?.message || e);
+      // Audit #9 L14：删除失败给占位行打 failed_at，同一 key 重试不再谎报成功。
+      if (delKey) {
+        try { db.prepare("UPDATE delete_idempotency SET failed_at=datetime('now') WHERE idempotency_key=?").run(delKey); } catch { /* ignore */ }
+      }
       res.status(502).json({ ok: false, error: `IMAP 删除失败：${String((e as Error)?.message || e).slice(0, 300)}` });
       return;
     }
     res.json({ ok: true });
-  });
+  }));
 
   // 批量删除：一次删多封（移到已删除；已在已删除里的彻底删除）。
   // B13: 不再队头阻塞——立即返回 {ok, taskId, status:'running'}，删除在
@@ -401,7 +440,15 @@ export function messageRoutes(ctx: Ctx): express.Router {
   // 多个批量删除互不覆盖。
   r.post('/messages/batch-delete', (req: Request, res: Response) => {
     const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
-    const ids = raw.map((x: unknown) => Number(x)).filter((n: number) => Number.isFinite(n) && n > 0);
+    // Audit #9 H1：同一请求内 id 重复会确定性永久删除（第 1 轮移入已删除，
+    // 第 2 轮读到已在 trash 走彻底删除分支）——循环前先去重。
+    // 注：不用 [...new Set(raw.map(...))] 的写法——tsc 在此会把结果推断为
+    // unknown[]（TS2322），改用显式循环去重。
+    const ids: number[] = [];
+    for (const x of raw as unknown[]) {
+      const n = Number(x);
+      if (Number.isFinite(n) && n > 0 && !ids.includes(n)) ids.push(n);
+    }
     if (!ids.length) {
       res.status(400).json({ ok: false, error: 'ids 不能为空' });
       return;
@@ -490,7 +537,12 @@ export function messageRoutes(ctx: Ctx): express.Router {
     // 否则前端永远轮询一个 running=true 的死任务。
     void (async () => {
       const db = getDb();
+      // Audit #9 H1（第二道防线）：本次任务内已处理过的 id 直接跳过，
+      // 不再执行第二次删除（即使上游某处又传进重复 id）。
+      const seen = new Set<number>();
       for (const id of ids) {
+        if (seen.has(id)) continue;
+        seen.add(id);
         // Audit #5b：单行 SELECT 也包进按行 try/catch——之前只有
         // deleteMessage 在 try 里，某行 SELECT 一抛错（如表损坏/锁），
         // 剩余 id 不进 failed 列表，任务直接置 finished，前端以为
@@ -558,7 +610,14 @@ export function messageRoutes(ctx: Ctx): express.Router {
   // DeepL 无百度式敏感词过滤，白宫类邮件也能翻；且实测从国内服务器可直连
   // api-free.deepl.com。免费 Key（:fx 结尾）走 api-free，付费 Key 走 api。
   // 外贸站密钥为 100 万字符免费额度，有效期至 2027-11-01；邮件翻译量小够用。
-  async function translateWithDeepL(text: string): Promise<string> {
+  // Audit #9 M6：翻译总预算与上限——单段 15 秒不变，另加总预算 25 秒、
+  // 正文 20000 字符 / 200 段 / 300 小段上限，超限直接 413 不调接口。
+  const TRANSLATE_TOTAL_TIMEOUT_MS = 25 * 1000;
+  const TRANSLATE_MAX_CHARS = 20000;
+  const TRANSLATE_MAX_PARAS = 200;
+  const TRANSLATE_MAX_CHUNKS = 300;
+
+  async function translateWithDeepL(text: string, attempt = 0): Promise<string> {
     const key = process.env.DEEPL_API_KEY;
     if (!key) throw new Error('未配置 DeepL 密钥');
     const host = key.endsWith(':fx') ? 'api-free.deepl.com' : 'api.deepl.com';
@@ -569,7 +628,24 @@ export function messageRoutes(ctx: Ctx): express.Router {
       body,
       signal: AbortSignal.timeout(15000),
     });
-    if (!resp.ok) throw new Error(`DeepL 返回 ${resp.status}`);
+    // Audit #9 M6：429 按 Retry-After 退避一次再试（封顶 5 秒）；仍 429
+    // 或 5xx 时带 code 抛出，由调用方区分返回，不再一律通用错。
+    if (resp.status === 429) {
+      if (attempt === 0) {
+        const retryAfter = Number(resp.headers.get('retry-after') || '1');
+        const waitMs = Math.min(Math.max(Number.isFinite(retryAfter) ? retryAfter * 1000 : 1000, 1000), 5000);
+        await new Promise((r) => setTimeout(r, waitMs));
+        return translateWithDeepL(text, 1);
+      }
+      const err = new Error('DeepL 限流') as Error & { code?: string };
+      err.code = 'RATE_LIMITED';
+      throw err;
+    }
+    if (!resp.ok) {
+      const err = new Error(`DeepL 返回 ${resp.status}`) as Error & { code?: string };
+      err.code = resp.status >= 500 ? 'UPSTREAM_5XX' : 'UPSTREAM_ERROR';
+      throw err;
+    }
     const data = await resp.json() as { message?: string; translations?: { text?: string }[] };
     if ((data as { message?: string }).message) throw new Error(`DeepL 错误：${(data as { message?: string }).message}`);
     const t = data?.translations?.[0]?.text;
@@ -577,7 +653,7 @@ export function messageRoutes(ctx: Ctx): express.Router {
     return t;
   }
 
-  r.post('/messages/:id/translate', async (req: Request, res: Response) => {
+  r.post('/messages/:id/translate', wrapAsync(async (req: Request, res: Response) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ ok: false, error: 'id 无效' }); return; }
     const db = getDb();
@@ -599,27 +675,66 @@ export function messageRoutes(ctx: Ctx): express.Router {
       res.json({ ok: true, translated: '', alreadyChinese: true });
       return;
     }
+    if (text.length > TRANSLATE_MAX_CHARS) {
+      res.status(413).json({ ok: false, error: `正文过长（超过 ${TRANSLATE_MAX_CHARS} 字符），无法翻译` });
+      return;
+    }
+    const paras = splitForTranslate(text);
+    const totalChunks = paras.reduce((n, p) => n + p.length, 0);
+    if (paras.length > TRANSLATE_MAX_PARAS || totalChunks > TRANSLATE_MAX_CHUNKS) {
+      res.status(413).json({ ok: false, error: '正文段落过多，无法翻译' });
+      return;
+    }
+    // Audit #9 M6：总预算 25 秒 + 监听请求断开——客户端已断开或超时
+    // 时取消后续段落，不再白做功。
+    const deadline = Date.now() + TRANSLATE_TOTAL_TIMEOUT_MS;
+    let cancelled = false;
+    req.on('close', () => { cancelled = true; });
     try {
-      const paras = splitForTranslate(text);
       const outParas: string[] = [];
       // DeepL 不限流，无需段间延迟（1.1 秒延迟是为百度 QPS=1 加的，DeepL 为主后已去掉）。
       for (const chunks of paras) {
+        if (cancelled) return;
+        if (Date.now() > deadline) {
+          const err = new Error('翻译超时') as Error & { code?: string };
+          err.code = 'TIMEOUT';
+          throw err;
+        }
         const parts: string[] = [];
-        for (const c of chunks) parts.push(await translateWithDeepL(c));
+        for (const c of chunks) {
+          if (cancelled) return;
+          if (Date.now() > deadline) {
+            const err = new Error('翻译超时') as Error & { code?: string };
+            err.code = 'TIMEOUT';
+            throw err;
+          }
+          parts.push(await translateWithDeepL(c));
+        }
         outParas.push(parts.join(' '));
       }
+      if (cancelled) return;
       res.json({ ok: true, translated: outParas.join('\n\n'), alreadyChinese: false });
     } catch (e) {
+      if (cancelled) return;
       log('translate failed', id, (e as Error)?.message || e);
+      const code = (e as { code?: string })?.code;
+      if (code === 'RATE_LIMITED') {
+        res.status(429).json({ ok: false, error: '翻译服务限流，请稍后重试' });
+        return;
+      }
+      if (code === 'TIMEOUT') {
+        res.status(504).json({ ok: false, error: '翻译超时（超过 25 秒），请缩短正文后重试' });
+        return;
+      }
       res.status(502).json({ ok: false, error: '翻译服务暂时不可用，请稍后重试' });
     }
-  });
+  }));
 
   // 附件下载：附件是元数据-only（不落盘），一律从 IMAP 按 part 号实时流式取回。
   // B18: 磁盘缓存分支已删——生产库查证：attachments 表 0 行、cached=1 的行
   // 0 行（mailStream 从不写 cached 文件，旧分支永远走不到）；磁盘上残留
   // 的 20 个孤儿文件无任何行引用，删分支不影响任何可下载附件。
-  r.get('/messages/:id/attachments/:attId', async (req: Request, res: Response) => {
+  r.get('/messages/:id/attachments/:attId', wrapAsync(async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     const attId = Number(req.params.attId);
@@ -654,7 +769,7 @@ export function messageRoutes(ctx: Ctx): express.Router {
       }
       res.end();
     }
-  });
+  }));
 
   // Send: accepts multipart/form-data (attachments) or JSON (no attachments).
   // B14: 附件经 multer diskStorage 落到 os.tmpdir()，发完（无论成功失败）
@@ -671,6 +786,10 @@ export function messageRoutes(ctx: Ctx): express.Router {
     let accountId = NaN;
     let claimed = false;
     let idemKey = '';
+    let generatedIdemKey = false;
+    // Audit #9 M7（选方案 a）：过期占位重认领后查不到已发送时置 true，
+    // 成功响应里标 duplicateUnverified（见下）。
+    let reclaimedUnverified = false;
     let effectiveMessageId: string | null = null;
     let smtpSucceeded = false;
     let sentMessageId: string | null = null;
@@ -697,6 +816,13 @@ export function messageRoutes(ctx: Ctx): express.Router {
       }
       const ccList = Array.isArray(b.cc) ? (b.cc as string[]) : String(b.cc || '').split(',').map((s) => s.trim()).filter(Boolean);
       const bccList = Array.isArray(b.bcc) ? (b.bcc as string[]) : String(b.bcc || '').split(',').map((s) => s.trim()).filter(Boolean);
+      // Audit #9 L10：收件人基本格式校验——"not-an-email" 以前能通过
+      // 校验直至 SMTP 550 才报 502；非法地址现在前置 400。
+      const invalidAddrs = [...toList, ...ccList, ...bccList].filter((a) => !isValidEmail(a));
+      if (invalidAddrs.length) {
+        res.status(400).json({ ok: false, error: `收件人地址格式无效：${invalidAddrs.slice(0, 5).join('、')}${invalidAddrs.length > 5 ? ' 等' : ''}` });
+        return;
+      }
       // B16: 收件人上限——to+cc+bcc 合计 50 人，前置校验（防一次发信被
       // 服务器按群发/滥用拒收，也防误操作群发）。
       if (toList.length + ccList.length + bccList.length > 50) {
@@ -729,19 +855,39 @@ export function messageRoutes(ctx: Ctx): express.Router {
           return;
         }
       }
+      // Audit #9 L8 连带：duplicate 认领等提前 return 路径也要删掉本次
+      // 发送认领到的那一行草稿（只删 draftId 这一行，绝不删用户仍在
+      // 编辑的另一行草稿）；草稿不存在时忽略。
+      const deleteClaimedDraft = (): void => {
+        if (Number.isFinite(draftIdEarly) && draftIdEarly > 0) {
+          try { db.prepare('DELETE FROM drafts WHERE id=?').run(draftIdEarly); } catch { /* ignore */ }
+        }
+      };
       // B12: 发信幂等键——前端每封新邮件生成一个 UUID 随请求传，同一封
       // 重试复用同一 key。占位冲突时：已发过直接返回原结果；进行中返回 409。
       const rawKey = b.idempotencyKey;
       idemKey = typeof rawKey === 'string' ? rawKey.trim() : '';
-      if (typeof rawKey === 'string' && rawKey.trim() && idemKey.length > 128) {
+      if (idemKey.length > 128) {
         res.status(400).json({ ok: false, error: 'idempotencyKey 过长' });
         return;
       }
-      if (idemKey) {
+      // Audit #9 M2：前端核查——ComposeModal.vue 每次打开写信弹窗都生成
+      // 一个 key（新开 newIdempotencyKey()、重开草稿复用草稿存的 key），
+      // FormData 与 JSON 两路发信都必带 idempotencyKey；无 key 的只剩
+      // 直调 API 的客户端。不要直接 400 打断现有前端：缺失时服务端
+      // 生成一个 key 并随 201 响应返回（向后兼容），约定客户端保存它、
+      // 重试时复用同一 key；无 key 的单次发送同样走完整流程
+      // （planned_message_id + completeIfAlreadySent），不再现生成 Message-ID。
+      if (!idemKey) {
+        idemKey = crypto.randomUUID();
+        generatedIdemKey = true;
+      }
+      {
         // Audit #5b：认领时预生成 Message-ID 并存进行（重认领沿用），
         // 本次发送全程用它，不再每次请求现生成。
         const claim = claimSendKey(accountId, idemKey, newPlannedMessageId());
         if (claim.status === 'duplicate') {
+          deleteClaimedDraft();
           res.status(200).json({
             ok: true,
             id: claim.row.message_db_id,
@@ -762,6 +908,7 @@ export function messageRoutes(ctx: Ctx): express.Router {
           const already = await findAlreadySent(engine, accountId, claim.plannedMessageId);
           if (already) {
             try { completeSendKey(accountId, idemKey, already.localId, claim.plannedMessageId); } catch { /* ignore */ }
+            deleteClaimedDraft();
             res.status(200).json({
               ok: true,
               id: already.localId,
@@ -770,6 +917,12 @@ export function messageRoutes(ctx: Ctx): express.Router {
             });
             return;
           }
+          // Audit #9 M7（选方案 a：文档化 + 标注，不做延迟再查）：
+          // 查不到不等于没发过——不自动保存已发送副本的服务商在已发送
+          // 文件夹里永远查不到，且 engine.findSentByMessageId 默认只查
+          // 最近 100 个 UID；本次若重发可能重复。继续发送，但在成功
+          // 响应里标 duplicateUnverified:true，供客户端/用户核对已发送。
+          reclaimedUnverified = true;
         }
         // 本次发送用的 Message-ID：新认领是刚生成的，重认领沿用旧行的。
         effectiveMessageId = claim.plannedMessageId;
@@ -809,7 +962,9 @@ export function messageRoutes(ctx: Ctx): express.Router {
       // （返回 duplicate，不让用户以为失败而重发）；查不到再释放，
       // 真失败仍可快速重试。复用 findAlreadySent（本地+服务器两路）。
       // 注意：只有对方自动保存已发送副本的服务商（163/QQ）才能查到；
-      // 不自动保存的服务商查不到，仍会释放后重发（残留窗口，见报告）。
+      // 不自动保存的服务商查不到，仍会释放后重发。Audit #9 M7 选方案 a：
+      // 该残留窗口已文档化（见重认领处的 reclaimedUnverified 注释），
+      // 重认领查不到时成功响应标 duplicateUnverified:true，不做延迟再查。
       const completeIfAlreadySent = async (): Promise<{ localId: number | null } | null> => {
         if (!claimed || !effectiveMessageId) return null;
         const already = await findAlreadySent(engine, accountId, effectiveMessageId);
@@ -820,6 +975,7 @@ export function messageRoutes(ctx: Ctx): express.Router {
       const failSend = async (e: unknown): Promise<void> => {
         const already = await completeIfAlreadySent();
         if (already) {
+          deleteClaimedDraft();
           res.status(200).json({ ok: true, id: already.localId, messageId: effectiveMessageId, duplicate: true });
           return;
         }
@@ -867,6 +1023,7 @@ export function messageRoutes(ctx: Ctx): express.Router {
             // 再释放（见 completeIfAlreadySent）。
             const already = await completeIfAlreadySent();
             if (already) {
+              deleteClaimedDraft();
               res.status(200).json({ ok: true, id: already.localId, messageId: effectiveMessageId, duplicate: true });
               return;
             }
@@ -979,6 +1136,10 @@ export function messageRoutes(ctx: Ctx): express.Router {
         ok: true,
         id: localId,
         messageId: sent.messageId,
+        // Audit #9 M2：服务端生成的 key 随响应返回，客户端重试时复用它。
+        ...(generatedIdemKey ? { idempotencyKey: idemKey } : {}),
+        // Audit #9 M7（方案 a）：重认领后查不到已发送、仍重发的成功响应。
+        ...(reclaimedUnverified ? { duplicateUnverified: true } : {}),
         ...(sent.rejected.length ? { rejected: sent.rejected } : {}),
         ...(warnings.length ? { warning: warnings.join('；') } : {}),
       });

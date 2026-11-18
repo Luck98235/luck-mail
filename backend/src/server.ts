@@ -76,6 +76,41 @@ app.get('/api/health', (_req, res) => {
   }
 });
 
+// Audit #9 L16：/api 写接口（POST/PUT/DELETE）同源 Origin/Referer 校验——
+// CSRF 防御此前完全依赖 SameSite=Strict Cookie。策略：只校验 Origin/
+// Referer 存在时的情形；缺失时放行（curl、健康检查、非浏览器客户端
+// 不带 Origin，不能误拦）。存在时必须与请求的 Host 一致（只比 Host，
+// 不比协议：反代终结 TLS 后未必透传 X-Forwarded-Proto，按协议比会
+// 误拦正常同源请求；Host 由浏览器按 URL 生成，跨站伪造不了）。
+// 被拦的记告警日志。GET 不校验（读接口无写副作用；GET /messages/:id
+// 的读副作用由另一路在路由层去掉）。
+app.use('/api', (req, res, next) => {
+  if (req.method !== 'POST' && req.method !== 'PUT' && req.method !== 'DELETE') return next();
+  const src = req.headers.origin || req.headers.referer || '';
+  if (!src) return next();
+  let srcHost = '';
+  try {
+    srcHost = new URL(src).host;
+  } catch {
+    log('[warn] CSRF check: malformed Origin/Referer rejected', req.method, req.path, src);
+    res.status(403).json({ ok: false, error: '跨站请求被拒绝' });
+    return;
+  }
+  // 接受的 Host：直连 Host 头，或反代透传的 X-Forwarded-Host（本服务只
+  // 监听 127.0.0.1，只能经本机反代到达，XFH 只可能来自反代）。
+  // 前提（未核查 OpenResty 配置）：反代须透传 Host（`proxy_set_header
+  // Host $host;`）或 X-Forwarded-Host；若两者都没透传，浏览器同源请求
+  // 会因 Host=127.0.0.1:8080 对不上而被 403——verify-all 测不出来
+  // （Node fetch 不带 Origin），须经真实浏览器走反代验证。
+  const expectedHosts = [req.get('host') || '', (req.get('x-forwarded-host') || '').split(',')[0].trim()].filter(Boolean);
+  if (!expectedHosts.includes(srcHost)) {
+    log('[warn] CSRF check: cross-origin write rejected', req.method, req.path, `origin-host=${srcHost} host=${req.get('host')} xfh=${req.get('x-forwarded-host') || ''}`);
+    res.status(403).json({ ok: false, error: '跨站请求被拒绝' });
+    return;
+  }
+  next();
+});
+
 // Auth: only /api/auth/status, /api/auth/setup, /api/auth/login are public;
 // everything else under /api/* requires a valid lm_session cookie.
 app.use('/api/auth', authRoutes());
@@ -195,6 +230,14 @@ async function main(): Promise<void> {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // Audit #9 M3：unhandledRejection 兜底——记告警级别日志，不让进程
+  // 直接崩溃；不静默吞掉：日志含原因，便于排查。注意这只是最后一道
+  // 防线：各 async 路由须各自 try/catch 走统一 500 JSON（见
+  // accountRoutes/messageRoutes 的 asyncHandler），全局错误中间件
+  // 仍处理同步抛错。uncaughtException 不兜底（崩溃才是正确行为）。
+  process.on('unhandledRejection', (reason: unknown) => {
+    log('[warn] unhandledRejection:', (reason as Error)?.message || reason);
+  });
 }
 
 const isMain = process.argv[1] === fileURLToPath(import.meta.url);
