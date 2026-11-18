@@ -1,5 +1,5 @@
 <template>
-  <main class="flex-1 bg-white flex flex-col min-w-0" :class="$attrs.class">
+  <main class="flex-1 min-h-0 bg-white flex flex-col min-w-0" :class="$attrs.class">
     <!-- 手机端返回栏（MobileShell 里用 showBack 时显示） -->
     <div v-if="showBack" class="flex items-center gap-2 h-12 px-3 border-b border-blue-100 bg-white shrink-0">
       <button class="w-8 h-8 rounded-full flex items-center justify-center text-blue-500 bg-blue-50" aria-label="返回邮件列表" @click="$emit('back')">
@@ -30,8 +30,8 @@
       </div>
     </div>
 
-    <!-- 正文 -->
-    <div class="flex-1 overflow-y-auto p-8 max-w-4xl w-full" :class="{ '!p-4': showBack }">
+    <!-- 正文：不限宽，100% 铺满阅读窗（用户要求不固定死宽度） -->
+    <div class="flex-1 min-h-0 overflow-y-auto p-8 w-full" :class="{ '!p-4': showBack }">
       <div v-if="mail.readingLoading" class="flex items-center justify-center h-full text-slate-400 text-sm">加载中…</div>
       <div v-else-if="!mail.selectedMessage" class="flex items-center justify-center h-full text-slate-400 text-sm">在此查看列表中选中的邮件。</div>
       <div v-else>
@@ -81,7 +81,7 @@
           :srcdoc="srcdocHtml"
           sandbox="allow-same-origin allow-popups"
           class="w-full border-0 bg-white block"
-          style="min-height: 200px"
+          style="min-height: 200px; touch-action: pan-y"
           title="邮件正文"
           @load="setupFrame"
         ></iframe>
@@ -185,7 +185,7 @@ const srcdocHtml = computed<string>(() => {
     : m.bodyHtml
       ? forceBlankTarget(m.bodyHtml)
       : `<div style="white-space:pre-wrap">${escapeHtml(m.bodyText || '')}</div>`
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><base target="_blank">`
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><base target="_blank">`
     + `<style>body{margin:0;padding:2px;font:14px/1.7 ui-sans-serif,system-ui,sans-serif;color:#334155;background:#fff;word-wrap:break-word}img{max-width:100%;height:auto}a{color:#2563eb}`
     + `::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:${c300};border-radius:10px}::-webkit-scrollbar-thumb:hover{background:${c400}}`
     + `html{scrollbar-color:${c300} transparent;scrollbar-width:thin}</style>`
@@ -193,18 +193,33 @@ const srcdocHtml = computed<string>(() => {
 })
 
 let bodyObserver: ResizeObserver | null = null
+let remeasureTimers: ReturnType<typeof setTimeout>[] = []
+
+// 正文 iframe 高度：多取几个量取最大，避免个别浏览器在手机上量不准导致底部被截。
+function measureDocHeight(doc: Document): number {
+  const de = doc.documentElement
+  const body = doc.body
+  if (!body) return 0
+  return Math.max(
+    de.scrollHeight, body.scrollHeight,
+    de.offsetHeight, body.offsetHeight,
+    de.clientHeight, body.clientHeight,
+    body.getBoundingClientRect().height
+  )
+}
 
 function resizeFrame(): void {
   const f = frameRef.value
   const doc = f?.contentDocument
   if (!f || !doc) return
-  const h = Math.max(doc.documentElement.scrollHeight, doc.body?.scrollHeight || 0)
+  const h = measureDocHeight(doc)
   if (h > 0) f.style.height = h + 'px'
 }
 
-// iframe 高度自适应：只靠 @load 量一次不够（图片加载、内容变化后高度会变），
-// 用 ResizeObserver 盯着正文 body，高度一变就重算；图片未加载完的也补 load 监听。
-// 这样 iframe 本身基本不需要自己的滚动条，只有外层容器一条滚动条。
+// iframe 高度自适应：只靠 @load 量一次不够（图片加载、字体加载、内容变化后高度会变），
+// 用 ResizeObserver 盯着正文 html + body，高度一变就重算；图片未加载完的也补 load 监听；
+// 再加两次延迟复量，兜底字体/图片晚到的重排。这样 iframe 本身基本不需要自己的滚动条，
+// 只有外层容器一条滚动条，手机上才能一路拖到底。
 function setupFrame(): void {
   resizeFrame()
   const doc = frameRef.value?.contentDocument
@@ -212,12 +227,19 @@ function setupFrame(): void {
   bodyObserver?.disconnect()
   bodyObserver = new ResizeObserver(() => resizeFrame())
   bodyObserver.observe(doc.body)
+  bodyObserver.observe(doc.documentElement)
   doc.querySelectorAll('img').forEach((img) => {
     if (!img.complete) img.addEventListener('load', resizeFrame, { once: true })
   })
+  // 延迟复量：字体、图片晚到会引起重排，load 时量的高度可能偏小。
+  remeasureTimers.forEach((t) => clearTimeout(t))
+  remeasureTimers = [300, 1200].map((ms) => setTimeout(resizeFrame, ms))
 }
 
-onUnmounted(() => bodyObserver?.disconnect())
+onUnmounted(() => {
+  bodyObserver?.disconnect()
+  remeasureTimers.forEach((t) => clearTimeout(t))
+})
 
 watch(() => mail.selectedMessage?.id, () => {
   // 换一封邮件时译文与复制态都清掉，回到原文。

@@ -6,7 +6,7 @@
         <button class="text-slate-400 hover:text-slate-600" aria-label="关闭" @click="close"><i class="fa-solid fa-xmark"></i></button>
       </div>
 
-      <div class="p-5 overflow-y-auto">
+      <div class="flex-1 min-h-0 p-5 overflow-y-auto">
         <table class="w-full text-sm">
           <thead>
             <tr class="text-xs text-slate-400 border-b border-slate-100">

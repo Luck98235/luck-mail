@@ -1,5 +1,5 @@
 <template>
-  <section class="bg-white border-r border-blue-100 flex flex-col flex-shrink-0" :class="variant === 'qq' ? 'w-full border-r-0' : 'w-[300px]'">
+  <section class="bg-white border-r border-blue-100 flex flex-col min-h-0 lg:shrink-0" :class="variant === 'qq' ? 'w-full border-r-0' : 'w-[300px] min-[1600px]:w-[340px] min-[2400px]:w-[380px]'">
     <!-- 列表头部 -->
     <div v-if="variant === 'desktop'" class="h-16 border-b border-blue-50 flex items-center justify-between px-4 bg-white">
       <div class="font-bold text-slate-700 text-base truncate">{{ mail.view.label }}</div>
@@ -39,7 +39,7 @@
     <!-- 邮件列表（虚拟滚动：只渲染可视窗口内的行；账号树不用虚拟滚动） -->
     <!-- 删除中：列表半透明示意、仍可滚动；查看（openMessage）与勾选（toggleCheck/toggleCheckAll）
          由 store 里的 isDeletingHere 守卫挡住，只锁发起删除的那个视图，别的视图不受影响 -->
-    <div ref="scrollEl" class="flex-1 overflow-y-auto" :class="mail.isDeletingHere ? 'opacity-60' : ''" @scroll="onScroll">
+    <div ref="scrollEl" class="flex-1 min-h-0 overflow-y-auto" :class="mail.isDeletingHere ? 'opacity-60' : ''" @scroll="onScroll">
       <div v-if="mail.loading && !mail.mailList.length" class="p-6 text-center text-xs text-slate-400">加载中…</div>
       <div v-else-if="!mail.mailList.length" class="p-6 text-center text-xs text-slate-400">这里没有邮件</div>
       <template v-else>
@@ -110,7 +110,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useMailStore } from '../stores/mail'
 import { fmtListTime, initialOf } from '../utils'
 
@@ -136,26 +136,55 @@ const scrollTop = ref<number>(0)
 const viewportH = ref<number>(600)
 
 const visibleStart = computed<number>(() => Math.max(0, Math.floor(scrollTop.value / rowHeight.value) - OVERSCAN))
-const visibleEnd = computed<number>(() =>
-  Math.min(mail.mailList.length, Math.ceil((scrollTop.value + viewportH.value) / rowHeight.value) + OVERSCAN)
-)
+// 兜底：量不到可视高度（viewportH<=0）时全量渲染，不再只显示 OVERSCAN=5 行。
+// 列表最多 50 条/页，全量渲染也没有性能问题。
+const visibleEnd = computed<number>(() => {
+  if (viewportH.value <= 0) return mail.mailList.length
+  return Math.min(mail.mailList.length, Math.ceil((scrollTop.value + viewportH.value) / rowHeight.value) + OVERSCAN)
+})
 const visibleRows = computed(() => mail.mailList.slice(visibleStart.value, visibleEnd.value))
 const totalHeight = computed<number>(() => mail.mailList.length * rowHeight.value)
 
 function onScroll(): void {
   if (scrollEl.value) {
     scrollTop.value = scrollEl.value.scrollTop
+    measureViewport()
+  }
+}
+
+// 量可视高度：clientHeight 为 0 时不覆盖（手机端列表挂载时父级 display:none，
+// 高度为 0；若直接写入 0，虚拟滚动只会渲染 OVERSCAN=5 行，看起来永远只有 5 封）。
+function measureViewport(): void {
+  if (scrollEl.value && scrollEl.value.clientHeight > 0) {
     viewportH.value = scrollEl.value.clientHeight
   }
 }
 
+// ResizeObserver：尺寸变化时重测（手机端从账号总览切到列表时 display:none→flex，
+// 高度从 0 变为真实值，靠它把 viewportH 纠回来；桌面端窗口缩放也受益）。
+let ro: ResizeObserver | null = null
+
 onMounted(() => {
-  if (scrollEl.value) viewportH.value = scrollEl.value.clientHeight
+  measureViewport()
+  if (scrollEl.value && typeof ResizeObserver !== 'undefined') {
+    ro = new ResizeObserver(() => measureViewport())
+    ro.observe(scrollEl.value)
+  }
+})
+
+onUnmounted(() => {
+  if (ro) { ro.disconnect(); ro = null }
 })
 
 // 切视图时回到顶部
 watch(() => mail.view, () => {
   if (scrollEl.value) scrollEl.value.scrollTop = 0
   scrollTop.value = 0
+})
+
+// 列表数据变化后重测可视高度（手机端切进未读视图时数据刚回来、布局刚展开，
+// 靠这次重测量到真实高度；nextTick 等 DOM 落定后再量）。
+watch(() => mail.mailList.length, () => {
+  void nextTick(() => measureViewport())
 })
 </script>

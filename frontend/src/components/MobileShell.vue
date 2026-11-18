@@ -19,8 +19,11 @@
           </div>
           <div class="text-[13px] text-slate-400 truncate mt-0.5">{{ defaultAccountEmail || '还没有邮箱账号' }}</div>
         </div>
-        <button class="w-9 h-9 rounded-full text-blue-500 hover:bg-blue-50 flex items-center justify-center shrink-0" title="添加邮箱" @click="$emit('add-account')">
-          <i class="fa-solid fa-circle-plus text-xl"></i>
+        <button class="w-9 h-9 rounded-full text-blue-500 hover:bg-blue-50 flex items-center justify-center shrink-0" title="刷新全部邮箱" @click="mail.refreshAll()">
+          <i class="fa-solid fa-arrow-rotate-left text-lg" :class="{ 'fa-spin': mail.refreshingAll }"></i>
+        </button>
+        <button class="w-9 h-9 rounded-full text-slate-400 hover:bg-slate-100 flex items-center justify-center shrink-0" title="退出登录" @click="$emit('logout')">
+          <i class="fa-solid fa-power-off text-lg"></i>
         </button>
       </div>
 
@@ -65,14 +68,7 @@
           <span v-if="mail.unreadOfAccount(a.id) > 0" class="text-sm text-slate-400">{{ mail.unreadOfAccount(a.id) }}</span>
           <i class="fa-solid fa-chevron-right text-xs text-slate-300"></i>
         </button>
-        <div v-if="!mail.accounts.length" class="px-3 py-3 text-sm text-slate-400">还没有邮箱，点右上角 + 添加。</div>
-      </div>
-
-      <!-- 底部系统操作 -->
-      <div class="mt-auto border-t border-slate-100 px-4 py-3 flex items-center justify-around text-slate-400">
-        <button class="flex flex-col items-center gap-1 text-[11px] hover:text-blue-500" @click="$emit('settings')"><i class="fa-solid fa-gear text-lg"></i>设置</button>
-        <button class="flex flex-col items-center gap-1 text-[11px] hover:text-blue-500" @click.stop="onPalette"><i class="fa-solid fa-palette text-lg"></i>配色</button>
-        <button class="flex flex-col items-center gap-1 text-[11px] hover:text-blue-500" @click="$emit('logout')"><i class="fa-solid fa-power-off text-lg"></i>退出</button>
+        <div v-if="!mail.accounts.length" class="px-3 py-3 text-sm text-slate-400">还没有邮箱，请在电脑端添加。</div>
       </div>
     </div>
 
@@ -82,7 +78,7 @@
       <div class="m-list flex-col">
         <!-- 顶部：返回 + 切换账号 + 写信 -->
         <div class="flex items-center gap-2 h-14 px-3 border-b border-slate-100 shrink-0 relative">
-          <button class="w-9 h-9 flex items-center justify-center text-slate-500" aria-label="返回账号总览" @click="mail.goMobileHome()">
+          <button class="w-9 h-9 flex items-center justify-center text-slate-500 md:hidden" aria-label="返回账号总览" @click="mail.goMobileHome()">
             <i class="fa-solid fa-chevron-left"></i>
           </button>
           <button class="flex-1 flex items-center justify-center gap-1.5 font-bold text-slate-800 truncate" @click="switcherOpen = !switcherOpen">
@@ -104,7 +100,7 @@
           </div>
         </div>
 
-        <!-- 页签：当前文件夹（点开侧滑菜单）| 未读邮件 | 管理 -->
+        <!-- 页签：当前文件夹（点开侧滑菜单）| 未读邮件 -->
         <div class="flex items-center h-11 border-b border-slate-100 shrink-0 text-[14px] text-slate-600">
           <button class="flex-1 flex items-center justify-center gap-1.5 h-full" :class="{ 'text-blue-600 font-medium': mail.view.kind === 'folder' }" @click="openDrawer">
             <i :class="folderTabIcon"></i>{{ folderTabLabel }}
@@ -113,10 +109,6 @@
           <div class="w-px h-4 bg-slate-200"></div>
           <button class="flex-1 flex items-center justify-center gap-1.5 h-full" :class="{ 'text-blue-600 font-medium': mail.view.kind === 'all-unread' }" @click="unreadTab">
             <i class="fa-regular fa-envelope"></i>未读邮件
-          </button>
-          <div class="w-px h-4 bg-slate-200"></div>
-          <button class="flex-1 flex items-center justify-center gap-1.5 h-full" @click="$emit('manage')">
-            <i class="fa-solid fa-list-ul"></i>管理
           </button>
         </div>
 
@@ -136,7 +128,7 @@
         <span class="font-bold text-slate-800 truncate">{{ mail.mobileAccount ? (mail.mobileAccount.displayName || mail.mobileAccount.email) : '全部邮箱' }}</span>
         <button class="text-slate-400 w-8 h-8" @click="mail.drawerOpen = false"><i class="fa-solid fa-xmark"></i></button>
       </div>
-      <div class="flex-1 overflow-y-auto pb-4">
+      <div class="flex-1 min-h-0 overflow-y-auto pb-4">
         <template v-if="mail.mobileAccount">
           <div
             v-for="f in mobileFolders" :key="f.id"
@@ -161,9 +153,6 @@
           </div>
         </template>
         <div class="border-t border-slate-100 mt-2 pt-2">
-          <div class="drawer-item" @click="mail.drawerOpen = false; $emit('manage')">
-            <i class="fa-solid fa-gear w-5 text-center"></i><span class="flex-1">管理</span>
-          </div>
           <div v-if="mail.mobileAccount" class="drawer-item" @click="refreshCurrent">
             <i class="fa-solid fa-arrow-rotate-left w-5 text-center"></i><span class="flex-1">刷新该邮箱</span>
           </div>
@@ -177,16 +166,14 @@
 import { ref, computed } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useMailStore, AGGREGATES, folderIcon } from '../stores/mail'
-import { useThemeStore } from '../stores/theme'
 import { initialOf, domainColor, domainShort } from '../utils'
 import type { Folder } from '../types'
 import MessageList from './MessageList.vue'
 import ReadingPane from './ReadingPane.vue'
 
-defineEmits(['compose', 'manage', 'add-account', 'settings', 'logout', 'reply', 'forward'])
+defineEmits(['compose', 'logout', 'reply', 'forward'])
 const auth = useAuthStore()
 const mail = useMailStore()
-const theme = useThemeStore()
 
 const homeQ = ref<string>('')
 const switcherOpen = ref<boolean>(false)
@@ -223,10 +210,6 @@ const folderTabIcon = computed(() => {
 
 function aggColor(kind: string): string {
   return { 'all-inbox': '#f59e0b', 'all-unread': '#3b82f6', 'all-drafts': '#64748b', 'all-sent': '#22c55e', 'all-trash': '#ef4444' }[kind] || '#3b82f6'
-}
-
-function onPalette(e: MouseEvent): void {
-  theme.togglePanel(e.currentTarget as HTMLElement | null)
 }
 
 function searchFromHome(): void {

@@ -6,6 +6,11 @@
 html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
 body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
 
+/* 根容器用动态视口高度：手机浏览器地址栏/工具栏会让 100vh 比可视区高，
+   底部被顶到屏幕外、怎么拖都到不了底；100dvh 跟随可视高度，旧浏览器回落 100vh。 */
+.app-viewport { height: 100vh; height: 100dvh; }
+.app-min-viewport { min-height: 100vh; min-height: 100dvh; }
+
 /* ---------- 主题配色（6 色，与旧版 css/style.css 一致） ---------- */
 body[data-theme="blue"] {
     --c-50: #eff6ff; --c-100: #dbeafe; --c-200: #bfdbfe; --c-300: #93c5fd; --c-400: #60a5fa;
@@ -134,3 +139,14 @@ body[data-theme] .to-blue-600 { --tw-gradient-to: var(--c-600) !important; }
 .qq-row { display: flex; gap: 12px; padding: 10px 16px; border-bottom: 1px solid #f1f5f9; cursor: pointer; background: #fff; }
 .qq-row:active { background: var(--c-50); }
 .qq-row.active { background: #fde8e8; }
+
+/* ---------- 滚动容器根因防护（2026-11-18，防复发） ----------
+   根因：flex 布局里，子项默认 min-height:auto（横向为 min-width:auto），
+   不会缩到内容尺寸以下。滚动容器（overflow-y-auto）若缺 min-h-0，
+   会撑满内容而不滚动——表现为列表/弹窗/抽屉无法滚动、无滚动条。
+   本规则对所有滚动容器强制 min-height:0 / min-width:0：
+   - 对非 flex 元素，min-height:0 等同默认行为，无副作用；
+   - 对 flex/grid 子项，允许其缩到父容器约束的高度，恢复滚动。
+   以后新增任何滚动容器都会自动受保护，无需再逐个加 min-h-0。 */
+.overflow-y-auto, .overflow-auto { min-height: 0; }
+.overflow-x-auto, .overflow-auto { min-width: 0; }

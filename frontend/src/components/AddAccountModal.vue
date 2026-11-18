@@ -5,7 +5,7 @@
         <span class="font-bold text-slate-700">{{ editing ? '邮箱设置' : '添加邮箱' }}</span>
         <button class="text-slate-400 hover:text-slate-600" aria-label="关闭" @click="close"><i class="fa-solid fa-xmark"></i></button>
       </div>
-      <div class="p-5 space-y-3 overflow-y-auto text-sm">
+      <div class="flex-1 min-h-0 p-5 space-y-3 overflow-y-auto text-sm">
         <p class="text-xs text-slate-400">创建时后端会实测 IMAP + SMTP 连通。</p>
         <div>
           <label class="block text-xs text-slate-500 mb-1">邮件帐号</label>

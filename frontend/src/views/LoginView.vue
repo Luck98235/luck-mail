@@ -1,5 +1,5 @@
 <template>
-  <div class="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+  <div class="app-min-viewport bg-slate-50 flex items-center justify-center px-4">
     <div class="w-full max-w-sm bg-white rounded-2xl shadow-lg border border-slate-100 px-8 py-10">
       <!-- Logo -->
       <div class="flex flex-col items-center mb-8">
@@ -14,7 +14,7 @@
         <div>
           <label class="block text-xs text-slate-500 mb-1.5">用户名</label>
           <input
-            v-model="username" type="text" autocomplete="username" placeholder="用户名（不要带邮箱后缀）"
+            v-model="username" type="text" autocomplete="username"
             class="w-full border border-slate-200 rounded-lg px-3 py-2.5 text-sm outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400"
           >
         </div>
@@ -58,8 +58,6 @@
           {{ busy ? '请稍候…' : (isSetup ? '创建账号并登录' : '登录') }}
         </button>
       </form>
-
-      <p class="text-center text-[11px] text-slate-300 mt-6">单用户使用 · 忘记密码请在邮箱管理界面修改</p>
     </div>
   </div>
 </template>

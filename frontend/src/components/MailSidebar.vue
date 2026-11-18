@@ -16,7 +16,7 @@
       </button>
     </div>
 
-    <div class="flex-1 overflow-y-auto px-2 pb-4 space-y-4">
+    <div class="flex-1 min-h-0 overflow-y-auto px-2 pb-4 space-y-4">
       <!-- 聚合分类 -->
       <div class="space-y-0.5 text-sm">
         <div v-for="agg in AGGREGATES" :key="agg.kind">
@@ -74,17 +74,35 @@
         </div>
       </div>
     </div>
+    <!-- 底部：设置 / 配色 / 退出 -->
+    <div class="border-t border-blue-100/60 px-3 py-2 flex items-center justify-around text-blue-400">
+      <button class="w-9 h-9 rounded-full hover:bg-blue-100 hover:text-blue-600 transition-colors flex items-center justify-center" title="设置" @click="$emit('settings')">
+        <i class="fa-solid fa-gear text-base"></i>
+      </button>
+      <button class="w-9 h-9 rounded-full hover:bg-blue-100 hover:text-blue-600 transition-colors flex items-center justify-center" title="配色" @click.stop="onPalette">
+        <i class="fa-solid fa-palette text-base"></i>
+      </button>
+      <button class="w-9 h-9 rounded-full hover:bg-blue-100 hover:text-blue-600 transition-colors flex items-center justify-center" title="退出系统" @click="$emit('logout')">
+        <i class="fa-solid fa-power-off text-base"></i>
+      </button>
+    </div>
   </aside>
 </template>
 
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useMailStore, AGGREGATES, folderIcon } from '../stores/mail'
+import { useThemeStore } from '../stores/theme'
 import { domainColor, domainShort } from '../utils'
 import type { Account } from '../types'
 
-defineEmits(['compose', 'manage'])
+defineEmits(['compose', 'manage', 'settings', 'logout'])
 const mail = useMailStore()
+const theme = useThemeStore()
+
+function onPalette(e: MouseEvent): void {
+  theme.togglePanel(e.currentTarget as HTMLElement | null)
+}
 
 // 复制邮箱：点复制按钮把完整邮箱地址写进剪贴板，成功后该行图标变绿勾 1.5 秒。
 const copiedId = ref<number | null>(null)

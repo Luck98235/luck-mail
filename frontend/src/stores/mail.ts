@@ -191,9 +191,31 @@ export const useMailStore = defineStore('mail', () => {
   function unreadOfFolder(accountId: number, folderId: number): number { return unreadCounts.get(`folder:${accountId}:${folderId}`) || 0 }
 
   // 手机/平板 QQ 式三级视图：home（账号总览）/ account（邮箱内列表）/ read（阅读窗）
-  const mview = ref<'home' | 'account' | 'read'>('home')
-  const mobileAccountId = ref<number | null>(null)
+  // 刷新（如下拉刷新整页重载）时，mview 必须在首屏渲染前就恢复到保存值，
+  // 否则先以默认值 'home' 渲染、等 init() 的网络请求回来才切回列表/正文，
+  // 首页会闪一下。localStorage 是同步的，在这里直接读。
+  const MOBILE_STATE_KEY = 'luck-mail-mobile-state'
+  let savedMview: 'home' | 'account' | 'read' = 'home'
+  let savedMobileAccountId: number | null = null
+  if (window.innerWidth < 1024) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null') as { mview?: string; mobileAccountId?: number | null; selectedId?: number | string | null } | null
+      if (saved && (saved.mview === 'account' || saved.mview === 'read' || saved.mview === 'home')) savedMview = saved.mview
+      if (saved && typeof saved.mobileAccountId === 'number') savedMobileAccountId = saved.mobileAccountId
+      if (saved && saved.mview === 'read' && saved.selectedId != null) selectedId.value = saved.selectedId
+    } catch { /* 读不到就默认回首页 */ }
+  }
+  const mview = ref<'home' | 'account' | 'read'>(savedMview)
+  const mobileAccountId = ref<number | null>(savedMobileAccountId)
   const drawerOpen = ref<boolean>(false)
+  // 手机端刷新后回到哪一级也要记住（只记 view 不够：正在读信时刷新，
+  // 光恢复 view 会回到列表，而不是正在读的那封信；只在手机/平板上用）。
+  function saveMobileState(): void {
+    try {
+      localStorage.setItem(MOBILE_STATE_KEY, JSON.stringify({ mview: mview.value, mobileAccountId: mobileAccountId.value, selectedId: selectedId.value }))
+    } catch { /* 存不下就下次默认回列表 */ }
+  }
+  watch([mview, mobileAccountId, selectedId], saveMobileState)
 
   const totalUnread = computed<number>(() => unreadCounts.get('total') || 0)
   const totalPages = computed<number>(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
@@ -368,6 +390,23 @@ export const useMailStore = defineStore('mail', () => {
       return
     }
     await loadMessages()
+  }
+
+  // 恢复手机端在哪一级：正在读信时回到正在读的那封信（openMessage 会把 mview 切到 read），
+  // 正在看某邮箱列表时回到列表；只在手机/平板上跑，桌面端不用。
+  // 注意：saved 必须由调用方在 restoreView() 之前读好传进来——restoreView 里
+  // setAggregate/setFolderView 会把 mview 改成 'account' 并触发保存，若在这里
+  // 再读 localStorage，读到的已是被盖掉的“列表”，正在读信就回不去了。
+  async function restoreMobileState(saved: { mview?: string; mobileAccountId?: number | null; selectedId?: number | string | null } | null): Promise<void> {
+    if (window.innerWidth >= 1024) return
+    if (!saved) return
+    if (typeof saved.mobileAccountId === 'number') mobileAccountId.value = saved.mobileAccountId
+    if (saved.mview === 'read' && saved.selectedId != null) {
+      await openMessage(saved.selectedId)
+      return
+    }
+    if (saved.mview === 'account') { mview.value = 'account'; return }
+    if (saved.mview === 'home') { mview.value = 'home'; return }
   }
 
   function accountLabel(accountId: number | null): string {
@@ -706,8 +745,16 @@ export const useMailStore = defineStore('mail', () => {
     // 懒加载：初始化只加载一级账号名，不预加载任何账号的文件夹；
     // 文件夹在点邮箱行 / 折叠箭头时才按需加载。
     await Promise.all([loadAccounts(), loadSettings()])
+    // 手机端状态先读出来存着，再恢复导航——restoreView 会改 mview 并触发保存，
+    // 若恢复完再读 localStorage，正在读信的状态已被“列表”盖掉，回不到正文。
+    let savedMobile: { mview?: string; mobileAccountId?: number | null; selectedId?: number | string | null } | null = null
+    if (window.innerWidth < 1024) {
+      try { savedMobile = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null') } catch { savedMobile = null }
+    }
     // 恢复上次选中的导航（无记录/记录失效时默认所有收件箱）。
     await restoreView()
+    // 手机/平板再恢复在哪一级（列表/正在读的信），桌面端这步直接跳过。
+    await restoreMobileState(savedMobile)
     // 刷新回来后，若后端批量删除任务还在跑，继续显示“删除中…”并轮询到完成。
     void syncDeleteStatus()
     connectRealtime()

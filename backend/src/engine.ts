@@ -20,6 +20,12 @@ import { LARGE_PARSE_THRESHOLD, log } from './config.js';
 
 const RECONNECT_BASE_MS = 5000;
 const RECONNECT_MAX_MS = 5 * 60 * 1000;
+// Fallback INBOX re-sync interval. IMAP IDLE is the primary new-mail path,
+// but some servers (notably QQ Mail) do not reliably push `exists`
+// notifications — the connection stays up yet new mail never triggers a
+// sync, so it sits on the server until the next reconnect (hours/days).
+// A periodic INBOX sync bounds that delay to this interval.
+const PERIODIC_SYNC_MS = 5 * 60 * 1000;
 // Fetch only the first bytes of the TEXT part for the list snippet; the full
 // source is fetched (and parsed) only when a message is opened.
 const SNIPPET_BYTES = 4096;
@@ -30,6 +36,7 @@ interface AccountState {
   connected: boolean;
   backoffMs: number;
   timer: NodeJS.Timeout | null;
+  syncTimer: NodeJS.Timeout | null;
   queue: Promise<unknown>;
   idleInboxPath: string | null;
 }
@@ -81,6 +88,7 @@ export class SyncEngine {
       connected: false,
       backoffMs: RECONNECT_BASE_MS,
       timer: null,
+      syncTimer: null,
       queue: Promise.resolve(),
       idleInboxPath: null,
     };
@@ -93,6 +101,7 @@ export class SyncEngine {
     if (!state) return;
     this.states.delete(accountId);
     if (state.timer) clearTimeout(state.timer);
+    if (state.syncTimer) clearInterval(state.syncTimer);
     const client = state.client;
     state.client = null;
     state.connected = false;
@@ -125,6 +134,7 @@ export class SyncEngine {
       client.on('expunge', () => this._onExists(accountId));
       client.on('close', () => {
         state.connected = false;
+        this._stopPeriodicSync(accountId);
         if (this.states.get(accountId) === state) {
           this.setAccountStatus(accountId, 'offline');
           this._scheduleReconnect(accountId);
@@ -145,9 +155,14 @@ export class SyncEngine {
       });
       await this._runOp(accountId, async (c) => { await this._openInbox(c, accountId); });
       // From here imapflow auto-IDLEs on INBOX (disableAutoIdle:false).
+      // Plus a periodic INBOX re-sync as a fallback for servers whose
+      // IDLE never fires (notably QQ Mail): without it, new mail can sit
+      // on the server unsynced until the next reconnect.
+      this._startPeriodicSync(accountId);
       getDb().prepare("UPDATE accounts SET last_sync_at=datetime('now') WHERE id=?").run(accountId);
     } catch (e) {
       state.connected = false;
+      this._stopPeriodicSync(accountId);
       const msg = String((e as Error)?.message || e);
       logError(`imap connect failed account ${accountId}:`, msg);
       this.setAccountStatus(accountId, 'error', msg.slice(0, 500));
@@ -168,6 +183,25 @@ export class SyncEngine {
       state.timer = null;
       void this._connectLoop(accountId);
     }, delay);
+  }
+
+  private _startPeriodicSync(accountId: number): void {
+    const state = this.states.get(accountId);
+    if (!state || state.syncTimer) return;
+    state.syncTimer = setInterval(() => {
+      // Same incremental INBOX sync as the IDLE `exists` path; _onExists
+      // no-ops safely when the connection is down (its _runOp rejects and
+      // the error is logged), so a stale timer cannot corrupt anything.
+      this._onExists(accountId);
+    }, PERIODIC_SYNC_MS);
+  }
+
+  private _stopPeriodicSync(accountId: number): void {
+    const state = this.states.get(accountId);
+    if (state?.syncTimer) {
+      clearInterval(state.syncTimer);
+      state.syncTimer = null;
+    }
   }
 
   private _onExists(accountId: number): void {

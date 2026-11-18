@@ -1,9 +1,8 @@
 <template>
-  <div class="h-screen flex flex-col bg-white text-slate-800 text-sm overflow-hidden">
+  <div class="app-viewport flex flex-col bg-white text-slate-800 text-sm overflow-hidden">
     <!-- 桌面端 >1024px：完整 4 栏（与旧版一致） -->
     <div id="desktop-layout" class="hidden lg:flex flex-1 min-h-0">
-      <SysNav @settings="settingsOpen = true" @logout="logout" />
-      <MailSidebar @compose="openCompose()" @manage="manageOpen = true" />
+      <MailSidebar @compose="openCompose()" @manage="manageOpen = true" @settings="settingsOpen = true" @logout="logout" />
       <MessageList variant="desktop" />
       <ReadingPane @reply="reply" @forward="forward" />
     </div>
@@ -12,9 +11,6 @@
     <div class="lg:hidden flex-1 min-h-0">
       <MobileShell
         @compose="openCompose()"
-        @manage="manageOpen = true"
-        @add-account="addOpen = true"
-        @settings="settingsOpen = true"
         @logout="logout"
         @reply="reply"
         @forward="forward"
@@ -41,7 +37,6 @@ import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useMailStore } from '../stores/mail'
-import SysNav from '../components/SysNav.vue'
 import MailSidebar from '../components/MailSidebar.vue'
 import MessageList from '../components/MessageList.vue'
 import ReadingPane from '../components/ReadingPane.vue'

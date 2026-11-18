@@ -330,14 +330,33 @@ export function messageRoutes(ctx: Ctx): express.Router {
     });
   }
 
-  async function translateOne(text: string): Promise<string> {
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|zh-CN`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
-    if (!resp.ok) throw new Error(`翻译服务返回 ${resp.status}`);
-    const data = await resp.json() as { responseData?: { translatedText?: string } };
-    const t = data?.responseData?.translatedText;
-    if (typeof t !== 'string' || !t.trim()) throw new Error('翻译服务无返回');
+  // ---- 正文翻译：只用 DeepL ----
+  // 用户 2026-11-17 决定：换成 DeepL，用外贸站的 DeepL 免费密钥；DeepL 验证
+  // 通过后，百度和腾讯已彻底去掉（代码、密钥、SDK 均已删除，不再备用）。
+  // DeepL 密钥只放服务器 systemd 环境变量 DEEPL_API_KEY，不进仓库/聊天/记忆。
+  // DeepL 无百度式敏感词过滤，白宫类邮件也能翻；且实测从国内服务器可直连
+  // api-free.deepl.com。免费 Key（:fx 结尾）走 api-free，付费 Key 走 api。
+  // 外贸站密钥为 100 万字符免费额度，有效期至 2027-11-01；邮件翻译量小够用。
+  async function translateWithDeepL(text: string): Promise<string> {
+    const key = process.env.DEEPL_API_KEY;
+    if (!key) throw new Error('未配置 DeepL 密钥');
+    const host = key.endsWith(':fx') ? 'api-free.deepl.com' : 'api.deepl.com';
+    const body = new URLSearchParams({ text, source_lang: 'EN', target_lang: 'ZH' });
+    const resp = await fetch(`https://${host}/v2/translate`, {
+      method: 'POST',
+      headers: { Authorization: `DeepL-Auth-Key ${key}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok) throw new Error(`DeepL 返回 ${resp.status}`);
+    const data = await resp.json() as { message?: string; translations?: { text?: string }[] };
+    if ((data as { message?: string }).message) throw new Error(`DeepL 错误：${(data as { message?: string }).message}`);
+    const t = data?.translations?.[0]?.text;
+    if (typeof t !== 'string' || !t.trim()) throw new Error('DeepL 翻译无返回');
     return t;
+  }
+  async function translateOne(text: string): Promise<string> {
+    return translateWithDeepL(text);
   }
 
   r.post('/messages/:id/translate', async (req: Request, res: Response) => {
@@ -365,6 +384,7 @@ export function messageRoutes(ctx: Ctx): express.Router {
     try {
       const paras = splitForTranslate(text);
       const outParas: string[] = [];
+      // DeepL 不限流，无需段间延迟（1.1 秒延迟是为百度 QPS=1 加的，DeepL 为主后已去掉）。
       for (const chunks of paras) {
         const parts: string[] = [];
         for (const c of chunks) parts.push(await translateOne(c));

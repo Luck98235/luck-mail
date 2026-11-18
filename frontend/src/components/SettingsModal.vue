@@ -5,7 +5,7 @@
         <span class="font-bold text-slate-700">设置</span>
         <button class="text-slate-400 hover:text-slate-600" aria-label="关闭" @click="close"><i class="fa-solid fa-xmark"></i></button>
       </div>
-      <div class="p-5 space-y-6 overflow-y-auto text-sm">
+      <div class="flex-1 min-h-0 p-5 space-y-6 overflow-y-auto text-sm">
         <!-- 用户名 -->
         <section>
           <h3 class="font-medium text-slate-700 mb-2">用户名</h3>

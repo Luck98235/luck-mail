@@ -5,7 +5,7 @@
         <span class="font-bold text-slate-700">{{ isEdit ? '编辑草稿' : '写信' }}</span>
         <button class="text-slate-400 hover:text-slate-600" aria-label="关闭" @click="close"><i class="fa-solid fa-xmark"></i></button>
       </div>
-      <div class="p-5 space-y-3 overflow-y-auto">
+      <div class="flex-1 min-h-0 p-5 space-y-3 overflow-y-auto">
         <div class="flex items-center gap-2">
           <label class="w-12 text-xs text-slate-500 shrink-0">发件人</label>
           <select v-model="accountId" class="flex-1 border border-slate-200 rounded-md px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400 bg-white">
