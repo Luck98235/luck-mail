@@ -7,7 +7,7 @@
 
 ## 认证（单用户，Cookie 会话）
 
-- Cookie 名 `lm_session`，httpOnly，SameSite=Lax，Path=/。除下述三个接口与健康检查接口外，所有 `/api/*` 与 `/socket.io/` 都必须带有效会话，否则 401。
+- Cookie 名 `lm_session`，httpOnly，SameSite=Strict，Path=/。除下述三个接口与健康检查接口外，所有 `/api/*` 与 `/socket.io/` 都必须带有效会话，否则 401。
 - `GET /api/auth/status` → `{ok:true, setupRequired:boolean, loggedIn:boolean, username?:string}`
   - `setupRequired=true` 表示还没有任何用户（首次使用），前端显示“创建账号”页。
 - `POST /api/auth/setup` `{username, password, confirm}` → 201 `{ok:true}`。
@@ -62,7 +62,7 @@
 - `DELETE /api/messages/:id` → 200。彻底删除与否以后端实际文件夹为准：邮件在已删除文件夹里就是彻底删除（IMAP 标记删除 + expunge + 本地删除），在其他文件夹里就是移到已删除（IMAP MOVE 到 Trash + 本地更新）。客户端 `permanent` 参数已废弃，不再发送。
 - `POST /api/messages/batch-delete` → 200，`{ ids: number[], view?: { kind, accountId, folderId } }`，逐封走与单封删除同一语义（移到已删除；邮件已在已删除文件夹里时彻底删除），一次最多 200 封。无 `permanent` 参数——彻底与否以后端实际文件夹为准。`view` 为发起删除的视图，后端记进批量删除任务，刷新后 `delete-status` 靠它恢复“只在该视图显示删除中”。**永远异步返回** `{ ok, taskId, status: 'running' }`（无同步返回），前端轮询 `GET /api/messages/delete-status` 到 running===false，再以状态接口的 `deleted`（数字计数）一次结算 toast。
 - `GET /api/messages/delete-status?taskId=` → `{ ok, running, total, deleted, startedAt, view: { kind, accountId, folderId } | null, taskId?, failed?, finishedAt? }`。批量删除任务状态（单进程内存）：任务在跑时前端每 1.5 秒轮询，显示“删除中（剩余数）”；跑完停轮询并刷新列表。`deleted` 为数字计数（已删封数，不是数组）；`total` 为任务总封数；`failed` 为失败明细（有失败时才出现）；`finishedAt` 为任务完成时间（跑完后才有）。`taskId`（可选）：本会话发起的任务传自己的 taskId，避免两标签页同时批量删除时轮询到对方的任务；不传时后端返回最近一个任务（兼容）。`view` 为发起删除的视图，刷新后前端优先用它恢复 deleteView，localStorage 的 `luck-mail-delete-view` 为兜底；两者都没有时按全局 batchDeleting 显示。
-- `POST /api/messages/:id/translate` → 200，`{ ok, translated: string, alreadyChinese: boolean }`。正文翻译：英文 → 中文（后端调 DeepL，密钥放服务器 systemd 环境变量 `DEEPL_API_KEY`；免费 Key（`:fx` 结尾）走 `api-free.deepl.com`，付费 Key 走 `api.deepl.com`；未配密钥时报错）。正文取磁盘 `bodies/<id>.txt`（为空时先 fetchFullMessage 再读）；正文已基本是中文时直接返回 `alreadyChinese: true`，不调接口。后端先按段落、再按句子切成 ≤450 字节的小段逐段翻译再拼接。翻译失败返回 502。
+- `POST /api/messages/:id/translate` → 200，`{ ok, translated: string, alreadyChinese: boolean }`。正文翻译：英文 → 中文（后端调 DeepL，密钥放服务器 `/opt/luck-mail/.deepl-env`（0600），经 systemd `EnvironmentFile=` 加载，绝不写进单元文件；免费 Key（`:fx` 结尾）走 `api-free.deepl.com`，付费 Key 走 `api.deepl.com`；未配密钥时报错）。正文取磁盘 `bodies/<id>.txt`（为空时先 fetchFullMessage 再读）；正文已基本是中文时直接返回 `alreadyChinese: true`，不调接口。后端先按段落、再按句子切成 ≤450 字节的小段逐段翻译再拼接。翻译失败返回 502。
 - `POST /api/backup/download` → 200，下载 `luck-mail-backup-YYYYMMDD-HHmm.tar.gz`（`Content-Disposition: attachment`）。内容为 `.key` + `data/`（含 luck-mail.db 一致性快照 + bodies/ + attachments/），与迁移指南的恢复布局一致（解压到 /opt/luck-mail 即可恢复）。须登录。**只接受 POST**（GET 会被拒绝：防跨站顶层导航 CSRF 触发下载）。
 - `POST /api/messages/send`（multipart/form-data）字段：`accountId`, `to`（逗号分隔）, `cc?`, `bcc?`, `subject`, `text?`, `html?`, `idempotencyKey?`（发信幂等键，字符串，≤128 字符，不校验 UUID 格式；同一封邮件重试复用同一个 key），`draftId?`（发信成功后服务端自动删这条草稿；发信失败草稿保留），文件字段 `attachments`（可多个）。→ 201 `{ok:true, id, messageId, rejected?: string[], warning?: string}`（`rejected` 为被收件方服务器拒收的收件人；`warning` 表示已发出、但未存入已发送文件夹）。发信后把副本 APPEND 到该账号已发送并写库。
   - 也接受无附件的 JSON POST（`Content-Type: application/json`，`to/cc/bcc` 可为数组，同样可带 `idempotencyKey` 与 `draftId`）。

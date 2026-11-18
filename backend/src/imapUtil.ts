@@ -11,9 +11,11 @@ import type { AccountRow } from './db.js';
 // imapflow does this automatically: ImapFlow.startSession() sends ID before
 // login AND re-sends it after login when the server advertises the ID
 // capability (see imapflow/lib/imap-flow.js ~1516-1526), using the
-// `clientInfo` option, with keys AND values sent as quoted strings
-// (imapflow/lib/commands/id.js). We pass explicit luck-mail clientInfo so
-// the wire form is ("name" "luck-mail" "version" "0.1.0" ...).
+// `clientInfo` option. imapflow 的 ID 编译器按值拼：纯 atom 字符的值发
+// atom、不带引号，只有含 `:` `/` 等特殊字符的值才发带引号字符串
+// （imapflow/lib/commands/id.js）——键与值并非一律加引号，行为本身
+// 没问题（24 个 163 账号线上正常同步即是活证据）。We pass explicit
+// luck-mail clientInfo so the wire form is ("name" "luck-mail" "version" "0.1.0" ...).
 // ---------------------------------------------------------------------------
 export const CLIENT_INFO = {
   name: 'luck-mail',
@@ -181,6 +183,17 @@ export function isAuthError(e: unknown): boolean {
   if (err?.authenticationFailed || err?.code === 'EAUTH') return true;
   const text = `${err?.message || ''} ${err?.responseText || ''} ${err?.response || ''}`;
   return /Invalid login|AUTHENTICATIONFAILED|Login error/i.test(text);
+}
+
+// Audit #8 LOW-1（友好性）：识别服务器的限流/拒绝信号（不是认证失败）。
+// 命中时调用方把退避下限提到 5 分钟、且不走重连循环只等轮询——
+// 否则按通用错误 5 秒就重试，会延长服务器限流。网易 451（登录失败
+// 过多临时禁登）、421 HL:ICC（并发连接过大临时禁连）都在这里。
+export function isThrottleError(e: unknown): boolean {
+  const err = e as { message?: string; responseText?: string; code?: string; response?: string };
+  const text = `${err?.message || ''} ${err?.responseText || ''} ${err?.response || ''}`;
+  if (/\b(421|451)\b/.test(text)) return true;
+  return /too many connections|too frequent|temporarily blocked|temporarily banned|rate limit|throttl|login too frequent|too many login/i.test(text);
 }
 
 export function readableImapError(e: unknown): string {

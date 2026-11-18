@@ -255,12 +255,28 @@ try {
   r = await api('GET', `/api/messages/${m1}/attachments/${Number(attLarge.lastInsertRowid)}`);
   check('uncached attachment without IMAP part -> 404 JSON (no crash)', r.status === 404 && r.json?.ok === false);
 
+  // Audit #8 LOW-7：标已读 IMAP 不通时本地兜底——假账号连不上 163，
+  // 仍返回 200 且本地 is_read 置 1，不再 502。
+  r = await api('POST', `/api/messages/${m2}/read`, { read: true });
+  const m2Read = db.prepare('SELECT is_read FROM messages WHERE id=?').get(m2).is_read;
+  check('audit8 LOW-7: mark-read falls back to local update when IMAP is unreachable (200 + is_read=1)',
+    r.status === 200 && m2Read === 1, `status=${r.status} is_read=${m2Read}`);
+
   // ---------- 7. account test endpoint (fake creds, clear step error) ----------
   console.log('== account test endpoint ==');
   r = await api('POST', `/api/accounts/${accountId}/test`);
   check('test endpoint: imapOk=false + step error (not ok:true lie)',
     r.json?.imapOk === false && typeof r.json?.error === 'string' && r.json.error.includes('IMAP') && r.json.error.includes('认证被拒'),
     JSON.stringify(r.json)?.slice(0, 200));
+  // Audit #8 LOW-6（友好性）：同一账号 10 秒内重复测试直接返回上次结果。
+  {
+    const t0 = Date.now();
+    r = await api('POST', `/api/accounts/${accountId}/test`);
+    const dt = Date.now() - t0;
+    check('audit8 LOW-6: repeat account test within 10s returns cached result (no new login)',
+      r.json?.cached === true && r.json?.imapOk === false && dt < 5000,
+      `cached=${r.json?.cached} dt=${dt}ms`);
+  }
 
   // ---------- 8. DOMPurify + streaming parse ----------
   console.log('== DOMPurify & streaming parse ==');
@@ -549,6 +565,13 @@ try {
   check('B16: to+cc+bcc over 50 recipients -> 400 with clear message',
     r.status === 400 && typeof r.json?.error === 'string' && r.json.error.includes('50'),
     `status=${r.status} error=${r.json?.error}`);
+  // Audit #8 LOW-3：主题/正文全空 -> 400，不走到 SMTP。
+  r = await api('POST', '/api/messages/send', {
+    accountId: idemAccountId, to: 'x@163.com',
+  });
+  check('audit8 LOW-3: send with empty subject/text/html -> 400 (no SMTP attempt)',
+    r.status === 400 && typeof r.json?.error === 'string',
+    `status=${r.status} error=${r.json?.error}`);
 
   // B13: 批量删除立即返回 taskId，后台跑完后 delete-status 可查（任务隔离）。
   {
@@ -595,12 +618,12 @@ try {
     const { openDb } = await import('../dist/db.js');
     const { SyncEngine } = await import('../dist/engine.js');
     const vdb = openDb();
-    const mkEnv = (uid, mid, subject = 'F1 test') => ({
+    const mkEnv = (uid, mid, subject = 'F1 test', from = 'a@163.com') => ({
       uid,
       envelope: {
         messageId: mid, subject,
         date: new Date('2026-11-18T10:00:00Z'),
-        from: [{ address: 'a@163.com', name: 'A' }], to: [],
+        from: [{ address: from, name: 'A' }], to: [],
       },
       flags: ['\\Seen'],
       bodyStructure: null,
@@ -832,7 +855,7 @@ try {
         mailbox: { path: '已发送' },
         mailboxOpen: async (p) => { fakeClient.mailbox = { path: p }; return { uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: 2 }; },
         search: async () => [100, 101],
-        fetch: async function* () { yield mkEnv(100, MID); yield mkEnv(101, MID); },
+        fetch: async function* () { yield mkEnv(100, MID, 'sweep test', 'sweep@163.com'); yield mkEnv(101, MID, 'sweep test', 'sweep@163.com'); },
         messageMove: async (uid, target) => { calls.move.push([uid, target]); return { uidMap: new Map([[100, 200]]) }; },
         messageFlagsAdd: async (uid) => { calls.flagsAdd.push(uid); },
         messageDelete: async (uid) => { calls.deleted.push(uid); },
@@ -845,6 +868,48 @@ try {
         ok === true
         && calls.move.length === 1 && calls.move[0][0] === '100' && calls.move[0][1] === '已删除'
         && calls.deleted.length === 1 && calls.deleted[0] === '101' && !calls.deleted.includes('100')
+        && rowAfter.folder_id === trashId && rowAfter.uid === 200,
+        `move=${JSON.stringify(calls.move)} deleted=${JSON.stringify(calls.deleted)} row=${JSON.stringify(rowAfter)}`);
+      engine.states.delete(accountId);
+    }
+    // Audit #8 LOW-8：同 Message-ID 但主题/发件人不同的信不是副本，清扫时不动它。
+    {
+      const MID8 = '<sweep-verify-8@x>';
+      const a = vdb.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run('sweep8@163.com', 'S8', encryptSecret('FAKE', key),
+        'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+      const accountId = Number(a.lastInsertRowid);
+      const sentF = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已发送', '已发送', 'sent')").run(accountId);
+      const sentId = Number(sentF.lastInsertRowid);
+      const trashF = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已删除', '已删除', 'trash')").run(accountId);
+      const trashId = Number(trashF.lastInsertRowid);
+      const msgInfo = vdb.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+        from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
+        VALUES (?,?,?,?,?,?,?, ?,datetime('now'),'',1,0,100,'[\"\\\\Seen\"]')`).run(
+        accountId, sentId, 100, MID8, 'real subject', 'real@163.com', 'R8', '[]');
+      const msgId = Number(msgInfo.lastInsertRowid);
+      const calls = { move: [], deleted: [] };
+      const fakeClient = {
+        usable: true,
+        mailbox: { path: '已发送' },
+        mailboxOpen: async (p) => { fakeClient.mailbox = { path: p }; return { uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: 2 }; },
+        search: async () => [100, 101],
+        fetch: async function* () {
+          yield mkEnv(100, MID8, 'real subject', 'real@163.com');
+          yield mkEnv(101, MID8, 'DIFFERENT subject', 'other@163.com');
+        },
+        messageMove: async (uid, target) => { calls.move.push([uid, target]); return { uidMap: new Map([[100, 200]]) }; },
+        messageFlagsAdd: async (uid) => { /* not used here */ },
+        messageDelete: async (uid) => { calls.deleted.push(uid); },
+      };
+      const engine = new SyncEngine(key);
+      engine.states.set(accountId, { client: fakeClient, queue: Promise.resolve(), opFailures: 0 });
+      const ok = await engine.deleteMessage(accountId, msgId);
+      const rowAfter = vdb.prepare('SELECT folder_id, uid FROM messages WHERE id=?').get(msgId);
+      check('audit8 LOW-8: sweep skips same-Message-ID mail with different subject/from (not a copy)',
+        ok === true && calls.move.length === 1 && calls.deleted.length === 0
         && rowAfter.folder_id === trashId && rowAfter.uid === 200,
         `move=${JSON.stringify(calls.move)} deleted=${JSON.stringify(calls.deleted)} row=${JSON.stringify(rowAfter)}`);
       engine.states.delete(accountId);
@@ -995,6 +1060,55 @@ try {
     }
   }
 
+  // Audit #8 HIGH-1 / MED-1 / LOW-1（友好性）：认证失败停连 + 网易只靠轮询重试 + 限流识别。
+  {
+    const { SyncEngine } = await import('../dist/engine.js');
+    const { isThrottleError } = await import('../dist/imapUtil.js');
+    check('audit8 LOW-1: isThrottleError matches 421/451/too-many-connections, not auth errors',
+      isThrottleError(new Error('451 too much fail authentication'))
+      && isThrottleError(new Error('421 HL:ICC too many connections'))
+      && isThrottleError(new Error('Too many connections from your IP'))
+      && !isThrottleError(new Error('Invalid login'))
+      && !isThrottleError(new Error('connection timed out')));
+    const h1 = vdb.prepare(
+      `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+        smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+    ).run('h1@163.com', 'H1', encryptSecret('FAKE', key),
+      'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+    const h1Id = Number(h1.lastInsertRowid);
+    vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, 'INBOX', '收件箱', 'inbox')").run(h1Id);
+    // HIGH-1(b)：authFailed 时 _pollAllFolders 直接返回，不调 withClient（不登录）。
+    const engineH1 = new SyncEngine(key);
+    let withClientCalls = 0;
+    engineH1.withClient = async (...args) => { withClientCalls++; throw new Error('must not be called'); };
+    engineH1.states.set(h1Id, { authFailed: true, pollOnly: true, connecting: false, queue: Promise.resolve() });
+    await engineH1._pollAllFolders(h1Id);
+    check('audit8 HIGH-1: _pollAllFolders returns early when authFailed (no IMAP login attempt)',
+      withClientCalls === 0, `withClientCalls=${withClientCalls}`);
+    // HIGH-1(c)：authFailed 时 _withSharedClient 直接抛认证失败，不建连。
+    const engineH1c = new SyncEngine(key);
+    engineH1c.states.set(h1Id, { authFailed: true, pollOnly: true, connecting: false, queue: Promise.resolve(), client: null, sharedClient: null });
+    let threwAuth = false;
+    try { await engineH1c.withClient(h1Id, async () => 'should-not-run'); } catch (e) { threwAuth = /认证失败/.test(String(e?.message || e)); }
+    check('audit8 HIGH-1: _withSharedClient throws auth error without connecting when authFailed',
+      threwAuth === true);
+    // MED-1：网易轮询账号不走重连循环——_scheduleReconnect 不设 timer。
+    const engineM1 = new SyncEngine(key);
+    const stM1 = { authFailed: false, pollOnly: true, timer: null, backoffMs: 5000 };
+    engineM1.states.set(h1Id, stM1);
+    engineM1._scheduleReconnect(h1Id);
+    check('audit8 MED-1: _scheduleReconnect does nothing for pollOnly accounts (poll timer is the only retry)',
+      stM1.timer === null || stM1.timer === undefined);
+    // 对照：非轮询账号仍会设重连 timer。
+    const engineM1b = new SyncEngine(key);
+    const stM1b = { authFailed: false, pollOnly: false, timer: null, backoffMs: 5000 };
+    engineM1b.states.set(h1Id, stM1b);
+    engineM1b._scheduleReconnect(h1Id);
+    const scheduled = stM1b.timer !== null && stM1b.timer !== undefined;
+    if (stM1b.timer) clearTimeout(stM1b.timer);
+    check('audit8 MED-1 control: _scheduleReconnect still schedules for non-poll accounts', scheduled);
+  }
+
   // 9: 同步删除对账时正文孤儿文件一并删。
   {
     const { SyncEngine } = await import('../dist/engine.js');
@@ -1052,6 +1166,32 @@ try {
     }
     check('L4: UNIQUE(account_id, folder_id, message_id) index exists and rejects duplicates',
       hasIdx && dupThrew, `index=${hasIdx} threw=${dupThrew}`);
+  }
+  // Audit #8 MED-1 / LOW-2 / LOW-6（数据库）：新索引存在 + 三处热查询走 SEARCH。
+  {
+    const { openDb } = await import('../dist/db.js');
+    const vdb2 = openDb();
+    const idxList = (table) => vdb2.prepare(`PRAGMA index_list(${table})`).all().map((x) => x.name);
+    const msgIdx = idxList('messages');
+    const attIdx = idxList('attachments');
+    const tombIdx = idxList('deleted_messages');
+    const delKeyIdx = idxList('delete_idempotency');
+    check('audit8 MED-1: idx_messages_folder_uid_read exists',
+      msgIdx.includes('idx_messages_folder_uid_read'), msgIdx.join(','));
+    check('audit8 LOW-2: idx_attachments_message_id exists',
+      attIdx.includes('idx_attachments_message_id'), attIdx.join(','));
+    check('audit8 LOW-6: prune indexes exist (deleted_messages.deleted_at, delete_idempotency.created_at)',
+      tombIdx.includes('idx_deleted_messages_deleted_at') && delKeyIdx.includes('idx_delete_idempotency_created_at'),
+      `tomb=${tombIdx.join(',')} delkey=${delKeyIdx.join(',')}`);
+    const plan = (sql) => vdb2.prepare(`EXPLAIN QUERY PLAN ${sql}`).all().map((r) => r.detail).join(' | ');
+    const p1 = plan('SELECT id, uid FROM messages WHERE folder_id=1');
+    const p2 = plan('SELECT id, uid, is_read FROM messages WHERE folder_id=1');
+    const p3 = plan("SELECT COUNT(*) total, COALESCE(SUM(CASE WHEN is_read=0 THEN 1 ELSE 0 END),0) unread FROM messages WHERE folder_id=1");
+    check('audit8 MED-1: UID diff / flags / counts use SEARCH on idx_messages_folder_uid_read (no SCAN)',
+      p1.includes('SEARCH messages USING COVERING INDEX idx_messages_folder_uid_read')
+      && p2.includes('SEARCH messages USING COVERING INDEX idx_messages_folder_uid_read')
+      && p3.includes('SEARCH messages USING COVERING INDEX idx_messages_folder_uid_read'),
+      `p1=${p1} p2=${p2} p3=${p3}`);
   }
   r = await api('GET', '/api/messages?' + new URLSearchParams({ q: '""' }));
   check('D4: search with only quotes does not 500', r.status === 200 && Array.isArray(r.json?.messages), `status=${r.status}`);

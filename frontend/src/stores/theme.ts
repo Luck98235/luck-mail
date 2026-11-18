@@ -29,7 +29,7 @@ export const useThemeStore = defineStore('theme', () => {
     apply(saved || document.body.getAttribute('data-theme') || 'blue')
   }
 
-  // ---- 配色面板（单例，由 MailView 渲染；各处调色板按钮调 openPanel） ----
+  // ---- 配色面板（单例，由 MailView 渲染；各处调色板按钮调 togglePanel（内部再调 openPanel）） ----
   const panelOpen = ref<boolean>(false)
   const panelPos = ref<{ left: number; top: number }>({ left: 0, top: 0 })
 

@@ -15,21 +15,15 @@
 // 写一次，重认领沿用旧行的值，永不重新生成。
 import crypto from 'node:crypto';
 import { getDb } from './db.js';
+// Audit #8 LOW-7（死代码）：parseSqliteUtc 原来这里与 auth.ts 各有一份；
+// 现在共用 auth.ts 的 parseSqliteUtcMs（正则守卫 + 解析不出返回 null），
+// 这里只留引用。
+import { parseSqliteUtcMs } from './auth.js';
 
 // F6: “发送进行中”占位的最长存活时间——进程在发信中途崩溃/重启后，
 // 占位行永远卡在“进行中”，同一 key 重试永远 409。超过此时长视为
 // 过期，认领时删掉重建（已完成的记录永不过期，是去重依据）。
 export const IDEMPOTENCY_PLACEHOLDER_TTL_MS = 10 * 60 * 1000;
-
-// SQLite datetime('now') 存的是 UTC 'YYYY-MM-DD HH:MM:SS'；按 UTC 解析。
-// 解析不出时返回 null（调用方按“未过期”处理，不删无法定年的占位）。
-function parseSqliteUtc(s: string | null | undefined): number | null {
-  if (!s) return null;
-  let iso = String(s).trim();
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(iso)) iso = `${iso.replace(' ', 'T')}Z`;
-  const t = Date.parse(iso);
-  return Number.isFinite(t) ? t : null;
-}
 
 export interface IdempotencyRow {
   account_id: number;
@@ -78,7 +72,7 @@ export function claimSendKey(accountId: number, key: string, plannedMessageId?: 
     // 限定 message_id IS NULL 删除，避免删掉并发下刚完成的记录。
     // Audit #5b：重认领沿用旧行的 planned_message_id（没有时用本次
     // 传入的），不重新生成——否则崩溃后重试以新 ID 再发一封。
-    const createdMs = parseSqliteUtc(row.created_at);
+    const createdMs = parseSqliteUtcMs(row.created_at);
     if (createdMs != null && Date.now() - createdMs > IDEMPOTENCY_PLACEHOLDER_TTL_MS) {
       const keptPlanned = row.planned_message_id || planned;
       db.prepare(

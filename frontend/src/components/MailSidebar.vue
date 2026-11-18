@@ -50,6 +50,11 @@
               <span class="w-4 h-4 rounded-full text-white flex items-center justify-center text-[8px] font-bold shrink-0" :style="{ background: domainColor(a.email) }">{{ domainShort(a.email) }}</span>
               <span class="truncate" :title="a.email" :class="{ 'opacity-50': a.enabled === false }">{{ a.displayName || a.email }}</span>
               <span class="ml-auto flex items-center gap-1 shrink-0">
+                <!-- 认证失败标记：红色是既定的危险色，不随主题变；独立的可点击元素，
+                     点它打开该账号的设置（@click.stop，别触发账号行本身的展开/切视图）。 -->
+                <button v-if="a.status === 'error'" class="text-red-500 font-bold text-[11px] shrink-0 px-1 rounded hover:bg-red-50" :title="a.error || '连接异常，点击打开邮箱设置'" @click.stop="onAuthBadge(a.id)">
+                  <i class="fa-solid fa-triangle-exclamation mr-0.5"></i>{{ accountErrorLabel(a.status, a.error) }}
+                </button>
                 <span v-if="a.status === 'syncing'" class="text-blue-400 text-[10px]"><i class="fa-solid fa-circle-notch fa-spin"></i></span>
                 <span v-else-if="mail.unreadOfAccount(a.id) > 0" class="text-red-500 font-bold text-xs">({{ mail.unreadOfAccount(a.id) }})</span>
                 <button class="w-5 h-5 flex items-center justify-center rounded text-slate-400 hover:text-blue-500 hover:bg-blue-100 opacity-0 group-hover:opacity-100 transition-opacity" :title="copiedId === a.id ? '已复制' : '复制邮箱'" @click.stop="copyEmail(a)">
@@ -93,7 +98,7 @@
 import { ref } from 'vue'
 import { useMailStore, AGGREGATES, folderIcon } from '../stores/mail'
 import { useThemeStore } from '../stores/theme'
-import { domainColor, domainShort, copyText } from '../utils'
+import { domainColor, domainShort, copyText, accountErrorLabel } from '../utils'
 import type { Account } from '../types'
 
 defineEmits(['compose', 'manage', 'settings', 'logout'])
@@ -147,6 +152,12 @@ async function retryFolders(id: number): Promise<void> {
 }
 function onFoldersHintClick(id: number): void {
   if (foldersFailed.value.has(id)) void retryFolders(id)
+}
+
+// 认证失败标记：点它打开该账号的设置（桌面端；移动端不渲染本组件，
+// MobileShell 那边点标记只提示去电脑端处理，见 requestAccountSettings）。
+function onAuthBadge(id: number): void {
+  mail.requestAccountSettings(id)
 }
 
 function isAggregateActive(kind: string): boolean {

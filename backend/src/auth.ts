@@ -109,8 +109,21 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
 // new Date('YYYY-MM-DD HH:MM:SS') 会按本地时区解析（服务器在 CST 时
 // 会早 8 小时），锁会提前失效。凡是拿 SQLite 时间串跟现在比，都走
 // 这里按 UTC 解析；会话过期比较已在 SQL 里用 datetime()，不受影响。
+// Audit #8 LOW-7（死代码）：原来 auth.ts 与 idempotency.ts 各有一份
+// parseSqliteUtc，行为一致却各管各的；现在只留这一份共享实现——
+// 毫秒版带正则守卫、解析不出返回 null；Date 版包一层，非法输入仍得
+// Invalid Date（与旧行为一致）。
+export function parseSqliteUtcMs(s: string | null | undefined): number | null {
+  if (!s) return null;
+  let iso = String(s).trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(iso)) iso = `${iso.replace(' ', 'T')}Z`;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? t : null;
+}
+
 export function parseSqliteUtc(s: string): Date {
-  return new Date(s.replace(' ', 'T') + 'Z');
+  const ms = parseSqliteUtcMs(s);
+  return new Date(ms ?? NaN);
 }
 
 // Failed-login bookkeeping on the user row (5 fails -> lock 15 min).

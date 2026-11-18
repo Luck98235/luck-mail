@@ -110,6 +110,6 @@ export type RealtimeEvent =
   | { type: 'new-mail'; accountId: number; folderId: number; message: MessageEnvelope }
   | { type: 'mail-updated'; messageId: number | string; accountId?: number; folderId?: number; changes: { isRead?: boolean; folderId?: number } }
   | { type: 'mail-deleted'; messageId: number | string }
-  | { type: 'sync'; accountId: number; folderId?: number; state: 'started' | 'done' | 'error'; error?: string }
+  | { type: 'sync'; accountId: number; folderId?: number; state: 'started' | 'done' | 'error'; error?: string; authFailed?: boolean }
   | { type: 'account'; action: 'added' | 'removed' | 'updated'; account: Account }
   | { type: 'ping' }

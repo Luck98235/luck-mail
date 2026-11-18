@@ -66,6 +66,10 @@
         >
           <span class="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-bold shrink-0" :style="{ background: domainColor(a.email) }">{{ domainShort(a.email) }}</span>
           <span class="flex-1 text-[15px] text-slate-800 truncate">{{ a.displayName || a.email }}</span>
+          <!-- 认证失败标记：只显示红色标记与错误文案；点标记不打开管理（手机/平板不显示
+               邮箱管理，见 requestAccountSettings），只提示去电脑端处理；@click.stop
+               别触发整行的进入账号。 -->
+          <span v-if="a.status === 'error'" class="text-xs text-red-500 font-medium shrink-0" :title="a.error || '连接异常'" @click.stop="mail.requestAccountSettings(a.id)">{{ accountErrorLabel(a.status, a.error) }}</span>
           <span v-if="mail.unreadOfAccount(a.id) > 0" class="text-sm text-slate-400">{{ mail.unreadOfAccount(a.id) }}</span>
           <i class="fa-solid fa-chevron-right text-xs text-slate-300"></i>
         </button>
@@ -168,7 +172,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useMailStore, AGGREGATES, folderIcon } from '../stores/mail'
-import { initialOf, domainColor, domainShort } from '../utils'
+import { initialOf, domainColor, domainShort, accountErrorLabel } from '../utils'
 import { attachSwipeBack } from '../utils/swipeBack'
 import type { Folder } from '../types'
 import MessageList from './MessageList.vue'

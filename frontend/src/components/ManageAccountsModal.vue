@@ -95,8 +95,13 @@ import { useMailStore } from '../stores/mail'
 import AddAccountModal from './AddAccountModal.vue'
 import type { Account } from '../types'
 
-const props = defineProps({ open: { type: Boolean, default: false } })
-const emit = defineEmits(['close'])
+const props = defineProps({
+  open: { type: Boolean, default: false },
+  // 从侧栏认证失败标记点进来时，直接打开该账号的设置（复用每行“邮箱设置”入口）；
+  // 打开后由 watch 消费一次并 emit('edit-consumed')，下次正常打开不再直达。
+  editAccountId: { type: Number, default: null }
+})
+const emit = defineEmits(['close', 'edit-consumed'])
 const mail = useMailStore()
 
 type ManageRow = Account & { _deleted: boolean }
@@ -118,6 +123,13 @@ watch(() => props.open, (v) => {
   error.value = ''
   // 暂存副本：确定才写回，取消直接丢弃
   rows.value = mail.accounts.map((a) => ({ ...a, displayName: a.displayName || '', _deleted: false }))
+  // 直达指定账号的设置（侧栏认证失败标记点进来）：复用 editRow，与手动点
+  // 该行“邮箱设置”完全同一入口；找不到该行时只打开管理列表。
+  if (props.editAccountId != null) {
+    const row = rows.value.find((r) => r.id === props.editAccountId)
+    if (row) editRow(row)
+    emit('edit-consumed')
+  }
 })
 
 function move(i: number, dir: number): void {

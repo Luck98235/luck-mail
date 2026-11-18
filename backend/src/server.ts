@@ -1,6 +1,7 @@
 import express from 'express';
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import cookieParser from 'cookie-parser';
 import { Server as SocketIOServer } from 'socket.io';
@@ -23,6 +24,17 @@ const masterKey = initStorage();
 openDb();
 // 启动时一次性清理：已过期会话 + 180 天以上的删除墓碑（S2/D5/L6）。
 pruneExpiredRows();
+// Audit #8 LOW-5：清掉上次运行崩溃时残留的 multer 上传临时文件
+// （luck-mail-upload-*，发信附件落盘在 os.tmpdir()）；正常发信的
+// finally 里已删，这里只处理崩溃残留。busboy 流式计数（发信中途超
+// 50MB 立即中断）不在本次范围。
+try {
+  for (const f of fs.readdirSync(os.tmpdir())) {
+    if (f.startsWith('luck-mail-upload-')) {
+      try { fs.rmSync(path.join(os.tmpdir(), f), { force: true }); } catch { /* ignore */ }
+    }
+  }
+} catch { /* ignore */ }
 const engine = new SyncEngine(masterKey);
 const ctx: Ctx = { engine, masterKey };
 

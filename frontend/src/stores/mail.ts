@@ -108,7 +108,7 @@ export const useMailStore = defineStore('mail', () => {
   // 重试后会变成永久删除。key 生成规则与发信的 idempotencyKey 一致
   //（crypto.randomUUID，有回落）。单删按邮件 id 存一份，删成后清掉，
   // 删失败（行还在）时留着，下次再点同一封复用；批量删按待删 id 集合存
-  // 一份，任务跑完后清掉（轮询查不到任务状态时不清，留给重试复用）。
+  // 一份，任务跑完清掉；轮询连续失败 ≥3 次停表时也清掉，见 syncDeleteStatus，审计 #7）。
   function newDeleteKey(): string {
     try {
       if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
@@ -224,6 +224,20 @@ export const useMailStore = defineStore('mail', () => {
   const drafts = ref<Draft[]>([])
   const composeDraft = ref<Draft | null>(null) // 点草稿时，交给写信弹窗回填
   const toast = ref<string>('')
+  // toast 点击动作：带动作的 toast 点了执行它（认证失败 toast 点开账号设置）；
+  // 普通 toast 没有动作，点它什么也不做。超时/新 toast/手动关闭时一并清掉，
+  // 别让旧动作挂在新 toast 上。
+  const toastAction = ref<(() => void) | null>(null)
+  // 认证失败提醒：每个账号每个会话只弹一次；账号恢复 online 时从集合里清除，
+  // 恢复后若再失败可再提醒一次。退出/会话重置时也清空（见 resetSessionState）。
+  const authFailedToasted = new Set<number>()
+  // 打开指定账号的设置：桌面端由 MailView 监听后打开邮箱管理并直达该账号的
+  // 设置；手机/平板不显示邮箱管理（用户 2026-11-17 立规），只提示去电脑端处理。
+  const accountSettingsRequest = ref<number | null>(null)
+  function requestAccountSettings(accountId: number): void {
+    if (window.innerWidth < 1024) { showToast('请在电脑端打开邮箱设置处理'); return }
+    accountSettingsRequest.value = accountId
+  }
   // 页内确认框：替代浏览器原生 window.confirm（太难看），由 ConfirmModal 渲染。
   // requestConfirm 返回 Promise，点确定 resolve(true)、点取消 resolve(false)。
   const confirmRequest = ref<{ message: string; danger: boolean; resolve: (ok: boolean) => void } | null>(null)
@@ -315,8 +329,21 @@ export const useMailStore = defineStore('mail', () => {
   let toastTimer: ReturnType<typeof setTimeout> | null = null
   function showToast(msg: string, ms = 2500): void {
     toast.value = msg
+    toastAction.value = null
     if (toastTimer) clearTimeout(toastTimer)
-    toastTimer = setTimeout(() => { toast.value = '' }, ms)
+    toastTimer = setTimeout(() => { toast.value = ''; toastAction.value = null }, ms)
+  }
+  // 带点击动作的 toast（认证失败提醒用）：点 toast 执行 onClick，6 秒后自动消失。
+  function showToastAction(msg: string, onClick: () => void, ms = 6000): void {
+    toast.value = msg
+    toastAction.value = onClick
+    if (toastTimer) clearTimeout(toastTimer)
+    toastTimer = setTimeout(() => { toast.value = ''; toastAction.value = null }, ms)
+  }
+  function dismissToast(): void {
+    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null }
+    toast.value = ''
+    toastAction.value = null
   }
   // 发信成功后 4 秒内抑制“邮件列表加载失败”这类加载失败 toast（F2）：
   // 发信后切视图会触发 loadMessages，若它恰好失败，失败 toast 会盖掉
@@ -1072,7 +1099,7 @@ export const useMailStore = defineStore('mail', () => {
   // 删信时未读总数即时减少；导航树红色角标绑定 unreadCounts，即时亮起，
   // 不轮询、不整页刷新、不重新拉全量。
   // 同步完成后的重载防抖：多个账号挨个 done 时合并成一次 loadAccounts + loadMessages，
-  // 否则 28 个邮箱的 done 事件会把列表反复冲刷 28 次（M3）。
+  // 否则全部邮箱的 done 事件会把列表反复冲刷（M3）。
   let syncReloadTimer: ReturnType<typeof setTimeout> | null = null
   function scheduleSyncReload(): void {
     if (syncReloadTimer) clearTimeout(syncReloadTimer)
@@ -1145,7 +1172,7 @@ export const useMailStore = defineStore('mail', () => {
       } else if (!inView && (view.value.kind === 'all-sent' || view.value.kind === 'all-trash') && !folderType) {
         // 当前在已发送/已删除视图、且该账号文件夹未加载过，无法判断新邮件
         // 是否属于当前视图：防抖重载一次兜底（1.5 秒合并，不会刷屏）。
-        // 注：后端目前只对收件箱发 new-mail（engine.ts:786），此分支现为
+        // 注：后端目前只对收件箱发 new-mail（_upsertEnvelope 里的 inbox 守卫），此分支现为
         // 防御性兜底；若后端以后对已发送/已删除也发事件，这里直接生效。
         scheduleSyncReload()
       }
@@ -1220,7 +1247,19 @@ export const useMailStore = defineStore('mail', () => {
     } else if (msg.type === 'sync') {
       const acct = accounts.value.find((a) => a.id === msg.accountId)
       if (acct) acct.status = msg.state === 'started' ? 'syncing' : (msg.state === 'error' ? 'error' : 'online')
-      if (msg.state === 'done') scheduleSyncReload()
+      if (msg.state === 'done') {
+        scheduleSyncReload()
+        // 账号恢复 online：允许之后再失败时重新提醒一次。
+        authFailedToasted.delete(msg.accountId)
+      } else if (msg.state === 'error') {
+        // 认证失败才弹提醒（后端可能多带 authFailed 字段，旧后端只有 error 文本，
+        // 两者都认）；非认证失败的同步错误不弹，每个账号每个会话只弹一次。
+        const isAuthFailed = msg.authFailed === true || (msg.error || '').startsWith('认证失败')
+        if (isAuthFailed && acct && !authFailedToasted.has(msg.accountId)) {
+          authFailedToasted.add(msg.accountId)
+          showToastAction(`${acct.email} 认证失败，请检查密码/授权码`, () => requestAccountSettings(msg.accountId))
+        }
+      }
     } else if (msg.type === 'account') {
       void loadAccounts()
     }
@@ -1262,6 +1301,8 @@ export const useMailStore = defineStore('mail', () => {
     mailList.value = []
     total.value = 0
     checkedIds.value = new Set()
+    // 退出/会话重置：认证失败提醒记录也清掉，新会话里可重新提醒一次。
+    authFailedToasted.clear()
   }
 
   async function init(): Promise<void> {
@@ -1297,10 +1338,10 @@ export const useMailStore = defineStore('mail', () => {
     activeAccountId, activeFolder,
     searchQuery, selectedId, selectedMessage, checkedIds, checkedCount, isAllChecked, isSomeChecked, batchDeleting, deleteRemaining, isDeletingHere,
     readingLoading, refreshingAll,
-    settings, drafts, composeDraft, toast, confirmRequest, requestConfirm, resolveConfirm, suppressLoadFailToast, unreadCounts, unreadOfAccount, unreadOfFolder, topInsertCount,
+    settings, drafts, composeDraft, toast, toastAction, accountSettingsRequest, confirmRequest, requestConfirm, resolveConfirm, suppressLoadFailToast, unreadCounts, unreadOfAccount, unreadOfFolder, topInsertCount,
     mview, mobileAccountId, drawerOpen,
     totalUnread, mobileAccount, isTrashView,
-    showToast, loadAccounts, loadFolders, inboxFolderId,
+    showToast, showToastAction, dismissToast, requestAccountSettings, loadAccounts, loadFolders, inboxFolderId,
     setAggregate, setFolderView, setAccountUnread, selectAccount, toggleAccountExpand,
     loadMessages, goToPage, nextPage, prevPage, setSearch, openMessage, setRead, deleteMessage, moveToSpam,
     toggleCheck, toggleCheckAll, clearChecked, deleteChecked,

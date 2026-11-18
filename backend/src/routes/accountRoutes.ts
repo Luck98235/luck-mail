@@ -21,6 +21,12 @@ export interface Ctx {
   masterKey: Buffer;
 }
 
+// Audit #8 LOW-6（友好性）：账号测试接口节流——每点一次就是一次 IMAP
+// 登录 + 一次 SMTP 验证；同一账号 10 秒内重复测试直接返回上次结果。
+// 只记内存（单进程），账号删除时清掉对应项。
+const testResultCache = new Map<number, { at: number; result: { imapOk: boolean; smtpOk: boolean; error: string | null } }>();
+const TEST_CACHE_MS = 10 * 1000;
+
 // 导出与导入模板共用的 8 列：序号 / 邮箱名 / 授权码 / 接收服务器（IMAP）/
 // IMAP 端口 / 发送服务器（SMTP）/ SMTP 端口 / 备注。
 const ACCOUNT_EXCEL_COLUMNS = [
@@ -34,9 +40,11 @@ const ACCOUNT_EXCEL_COLUMNS = [
   { header: '备注', key: 'displayName', width: 20 },
 ];
 
-function publicAccount(row: AccountRow): Record<string, unknown> {
-  const db = getDb();
-  const unread = (db.prepare(
+function publicAccount(row: AccountRow, unreadCount?: number): Record<string, unknown> {
+  // Audit #8 LOW-4（数据库）：原来每账号一次 SUM 查未读数（N+1）；
+  // 列表接口改为一次 GROUP BY 查全部（见 GET /accounts），这里只在
+  // 未传 unreadCount 的单账号调用时才逐行查（导入/新增/更新后回显）。
+  const unread = unreadCount ?? (getDb().prepare(
     'SELECT COALESCE(SUM(unread_count),0) c FROM folders WHERE account_id=?',
   ).get(row.id) as { c: number }).c;
   return {
@@ -108,7 +116,12 @@ export function accountRoutes(ctx: Ctx): express.Router {
   r.get('/accounts', (_req: Request, res: Response) => {
     const db = getDb();
     const rows = db.prepare('SELECT * FROM accounts ORDER BY sort_order, id').all() as AccountRow[];
-    res.json({ ok: true, accounts: rows.map(publicAccount) });
+    // Audit #8 LOW-4：一次 GROUP BY 查出全部账号的未读数，不再每账号一查。
+    const unreadByAccount = new Map<number, number>(
+      (db.prepare('SELECT account_id, COALESCE(SUM(unread_count),0) c FROM folders GROUP BY account_id').all() as { account_id: number; c: number }[])
+        .map((x) => [x.account_id, x.c]),
+    );
+    res.json({ ok: true, accounts: rows.map((row) => publicAccount(row, unreadByAccount.get(row.id) ?? 0)) });
   });
 
   // 取单个邮箱的当前密码（明文）：仅供“邮箱设置”弹窗打开时回填密码框，
@@ -229,6 +242,12 @@ export function accountRoutes(ctx: Ctx): express.Router {
     const skipped: string[] = [];
     const failed: { row: number; email: string; reason: string }[] = [];
     const seenInFile = new Set<string>();
+    // Audit #8 LOW-5（数据库）：导入前一次查出全部已有邮箱进 Set，
+    // 不再每行一次 SELECT 判重。
+    const existingEmails = new Set(
+      (db.prepare('SELECT email FROM accounts').all() as { email: string }[])
+        .map((x) => x.email.toLowerCase()),
+    );
     // 列顺序与导入模板一致：0 序号（忽略），1 邮箱名，2 授权码，3 IMAP 服务器，
     // 4 IMAP 端口，5 SMTP 服务器，6 SMTP 端口，7 备注。第 1 行是表头。
     rows.forEach((cols, idx) => {
@@ -246,7 +265,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
         failed.push({ row: rnum, email, reason: '邮箱地址格式不正确' });
         return;
       }
-      if (seenInFile.has(email) || db.prepare('SELECT id FROM accounts WHERE email=?').get(email)) {
+      if (seenInFile.has(email) || existingEmails.has(email)) {
         skipped.push(email);
         return;
       }
@@ -393,6 +412,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
     if (!row) return res.status(404).json({ ok: false, error: '账号不存在' });
     engine.stopAccount(id, true);
     dropTransporter(id);
+    testResultCache.delete(id);
     // Remove cached attachment files + body files for this account's messages.
     const msgIds = db.prepare('SELECT id FROM messages WHERE account_id=?').all(id) as { id: number }[];
     for (const m of msgIds) {
@@ -411,8 +431,19 @@ export function accountRoutes(ctx: Ctx): express.Router {
     const id = Number(req.params.id);
     const row = db.prepare('SELECT * FROM accounts WHERE id=?').get(id) as AccountRow | undefined;
     if (!row) return res.status(404).json({ ok: false, error: '账号不存在' });
+    // Audit #8 LOW-6：10 秒内重复测试直接返回上次结果（cached: true），
+    // 不再每次新建连接登录一次。返回形状与原来一致（无错误时不带 error 字段）。
+    const cached = testResultCache.get(id);
+    if (cached && Date.now() - cached.at < TEST_CACHE_MS) {
+      return res.json({
+        ok: true, imapOk: cached.result.imapOk, smtpOk: cached.result.smtpOk,
+        ...(cached.result.error ? { error: cached.result.error } : {}), cached: true,
+      });
+    }
     const password = decryptSecret(row.password_enc, masterKey);
     const test = await testConnectivity(accountToImap(row), password);
+    const result = { imapOk: test.imapOk, smtpOk: test.smtpOk, error: test.error };
+    testResultCache.set(id, { at: Date.now(), result });
     return res.json({ ok: true, imapOk: test.imapOk, smtpOk: test.smtpOk, ...(test.error ? { error: test.error } : {}) });
   });
 

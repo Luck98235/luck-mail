@@ -62,8 +62,9 @@ export function miscRoutes(): express.Router {
   // 包内结构与迁移说明一致（.key + data/），解压到新服务器的 /opt/luck-mail 即可恢复。
   // 数据库用 better-sqlite3 在线备份做一致性快照（含 WAL 已提交数据），不直接拷正在用的库文件；
   // 正文与附件缓存是静态文件，直接拷。路由在 /api 下，已有 requireAuth（仅登录用户可下）。
-  // S1: 只接受 POST——GET 可被跨站顶层导航触发（SameSite=Lax 不挡顶层
-  // 导航 GET），登录状态下点一条恶意链接就会把含主密钥的备份种进下载目录。
+  // S1: 只接受 POST——Cookie 已是 SameSite=Strict（顶层导航 GET 也不带
+  // Cookie），POST-only 是第二层纵深防御：即使将来 Cookie 策略放宽，
+  // 跨站顶层导航也触发不了这条含主密钥的备份下载。
   r.post('/backup/download', async (_req: Request, res: Response) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'luck-mail-backup-'));
     try {

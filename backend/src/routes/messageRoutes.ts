@@ -297,8 +297,13 @@ export function messageRoutes(ctx: Ctx): express.Router {
     try {
       await engine.setRead(row.account_id, id, read);
     } catch (e) {
-      res.status(502).json({ ok: false, error: `IMAP 标记失败：${String((e as Error)?.message || e).slice(0, 300)}` });
-      return;
+      // Audit #8 LOW-7：IMAP 暂时不通时先本地更新、待同步回补（与打开
+      // 邮件的路径一致），不再一直 502——用户点“标为已读/未读”在断网
+      // 时也能生效，下次同步时服务器 flags 会再对账。
+      log('mark-read failed, falling back to local-only', id, (e as Error)?.message || e);
+      db.prepare('UPDATE messages SET is_read=?, updated_at=datetime(\'now\') WHERE id=?').run(read ? 1 : 0, id);
+      if (row.folder_id) refreshFolderCounts(row.folder_id);
+      emit('mail-updated', { messageId: id, accountId: row.account_id, folderId: row.folder_id, changes: { isRead: read } });
     }
     res.json({ ok: true });
   });
@@ -548,7 +553,8 @@ export function messageRoutes(ctx: Ctx): express.Router {
   // ---- 正文翻译：只用 DeepL ----
   // 用户 2026-11-17 决定：换成 DeepL，用外贸站的 DeepL 免费密钥；DeepL 验证
   // 通过后，百度和腾讯已彻底去掉（代码、密钥、SDK 均已删除，不再备用）。
-  // DeepL 密钥只放服务器 systemd 环境变量 DEEPL_API_KEY，不进仓库/聊天/记忆。
+  // DeepL 密钥只放服务器 /opt/luck-mail/.deepl-env（0600），经 systemd
+  // EnvironmentFile= 加载；绝不写进单元文件、不进仓库/聊天/记忆。
   // DeepL 无百度式敏感词过滤，白宫类邮件也能翻；且实测从国内服务器可直连
   // api-free.deepl.com。免费 Key（:fx 结尾）走 api-free，付费 Key 走 api。
   // 外贸站密钥为 100 万字符免费额度，有效期至 2027-11-01；邮件翻译量小够用。
@@ -697,6 +703,15 @@ export function messageRoutes(ctx: Ctx): express.Router {
         res.status(400).json({ ok: false, error: '收件人合计超过 50 人上限，请分批发送' });
         return;
       }
+      // Audit #8 LOW-3：主题/正文不能全空——前端要求主题，但后端不拦
+      // 等于信任客户端；subject、text、html 至少一项非空。
+      const subjectRaw = typeof b.subject === 'string' ? b.subject.trim() : '';
+      const textRaw = typeof b.text === 'string' ? b.text.trim() : '';
+      const htmlRaw = typeof b.html === 'string' ? b.html.trim() : '';
+      if (!subjectRaw && !textRaw && !htmlRaw) {
+        res.status(400).json({ ok: false, error: '主题、正文不能全为空' });
+        return;
+      }
       // B14: 附件总大小上限 50MB（单文件 25MB 由本文件 :32 的 multer limits 限）。
       const totalBytes = files.reduce((s, f) => s + (f.size || 0), 0);
       if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
@@ -815,7 +830,9 @@ export function messageRoutes(ctx: Ctx): express.Router {
         // “收件人/内容问题”，用户会去改收件人，实际是密码/授权码错了。
         const error = isAuthError(e)
           ? 'SMTP 认证失败，请检查发件账号的密码/授权码'
-          : isPermanentSmtpError(e)
+          : code === 451
+            ? '对方服务器暂时拒收（灰名单），请 5 分钟后再发'
+            : isPermanentSmtpError(e)
             ? `发信失败：对方服务器拒绝了这封邮件（${code}），请检查收件人地址或内容后重试`
             : `发信失败：${detail}`;
         res.status(502).json({ ok: false, error });
@@ -834,11 +851,13 @@ export function messageRoutes(ctx: Ctx): express.Router {
         smtpSucceeded = true;
         sentMessageId = sent.messageId;
       } catch (e) {
-        // B15: 4xx（灰名单/限流/对方繁忙）最多重试 1 次（约 5 秒后）；
-        // 重试仍失败按 4xx 文案返回。5xx 与其他错误直接失败。
-        if (isTransientSmtpError(e)) {
+        // B15: 4xx（对方繁忙等）5 秒后最多重试 1 次。451 灰名单例外：
+        // 灰名单希望几分钟后重试，请求内等 5 分钟会先触发前端 30 秒超时——
+        // 用户看到失败、信却可能稍后发出；所以 451 不重试、直接失败，
+        // 让用户 5 分钟后手动重发（见 failSend 的 451 文案，幂等键防重发）。
+        if (isTransientSmtpError(e) && smtpResponseCode(e) !== 451) {
           log('send smtp 4xx, retry once after 5s', accountId, smtpResponseCode(e));
-          await new Promise((r) => setTimeout(r, 5000));
+          await new Promise((r) => setTimeout(r, 5 * 1000));
           try {
             sent = await sendMail(account, password, mailInput, prebuilt);
             smtpSucceeded = true;

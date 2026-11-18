@@ -166,7 +166,8 @@ export const api = {
   // 这里只负责透传。
   deleteMessage: (id: number | string, idempotencyKey?: string) =>
     request<{ ok: boolean; duplicate?: boolean }>(`/api/messages/${id}`, { method: 'DELETE', body: idempotencyKey ? { idempotencyKey } : undefined }),
-  // 批量删除：后端永远异步返回 { ok, taskId, status:'running' }，
+  // 批量删除：首次提交异步返回 { ok, taskId, status:'running' }；同一 key 重复提交
+  // 返回第一次任务的已有状态（running/finished/unknown，见 messageRoutes 幂等注释），
   // 进度走 getDeleteStatus；请求体不带 permanent（彻底与否以后端实际
   // 文件夹为准，后端忽略该字段）。同步返回分支仅作防御兼容。
   // 删信幂等键（审计 #6）：与单删同一字段、同一语义——同一 key 重复提交时

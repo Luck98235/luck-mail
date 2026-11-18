@@ -113,7 +113,7 @@ export function closeDb(): void {
 // datetime() 包一层：新格式直接比对；旧版 ISO 格式（T/Z）的遗留会话行
 // 也能正确过期。墓碑只清 180 天前的——须长于服务器端保留期，
 // 避免刚删的信在同步里复活。
-export function pruneExpiredRows(): { sessions: number; tombstones: number; deleteKeys: number } {
+export function pruneExpiredRows(): { sessions: number; tombstones: number; deleteKeys: number; sentKeys: number } {
   const db = getDb();
   const s = db.prepare(
     "DELETE FROM sessions WHERE datetime(expires_at) <= datetime('now')",
@@ -126,10 +126,16 @@ export function pruneExpiredRows(): { sessions: number; tombstones: number; dele
   const d = db.prepare(
     "DELETE FROM delete_idempotency WHERE created_at <= datetime('now', '-7 days')",
   ).run();
-  if (s.changes || t.changes || d.changes) {
-    log(`pruned ${s.changes} expired session(s), ${t.changes} tombstone(s) older than 180 days, ${d.changes} delete key(s) older than 7 days`);
+  // Audit #8 LOW-4（邮件逻辑）：发信幂等键原来只增不减——已完成
+  // （message_id 非空）的记录 180 天后清掉，保留去重窗口即可；
+  // 进行中的占位行（message_id 为空）不受影响。
+  const si = db.prepare(
+    "DELETE FROM sent_idempotency WHERE message_id IS NOT NULL AND created_at <= datetime('now', '-180 days')",
+  ).run();
+  if (s.changes || t.changes || d.changes || si.changes) {
+    log(`pruned ${s.changes} expired session(s), ${t.changes} tombstone(s) older than 180 days, ${d.changes} delete key(s) older than 7 days, ${si.changes} completed send key(s) older than 180 days`);
   }
-  return { sessions: s.changes, tombstones: t.changes, deleteKeys: d.changes };
+  return { sessions: s.changes, tombstones: t.changes, deleteKeys: d.changes, sentKeys: si.changes };
 }
 
 function initSchema(db: Db): void {
@@ -338,6 +344,30 @@ function initSchema(db: Db): void {
     log('WARNING: could not create messages Message-ID unique index:', (e as Error)?.message || e);
   }
 
+  // ---- Audit #8 MED-1（数据库）：messages 缺 folder_id 索引——每次同步
+  // 每个文件夹的 UID 差集 / flags 全取 / 计数刷新都是全表扫（EXPLAIN 全是
+  // SCAN）。复合覆盖索引一次解决三处查询（10,235 封实测一轮同步 346ms → 13ms）。
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_messages_folder_uid_read ' +
+    'ON messages(folder_id, uid, is_read)',
+  );
+  // ---- Audit #8 LOW-2（数据库）：attachments 缺 message_id 索引——打开
+  // 每封信都查、删信时 FK 级联删附件同样全表扫。
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_attachments_message_id ' +
+    'ON attachments(message_id)',
+  );
+  // ---- Audit #8 LOW-6（数据库）：prune 的 DELETE 全表扫——墓碑与删信
+  // 幂等键的过期清理按时间列删，给两列加索引。
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_deleted_messages_deleted_at ' +
+    'ON deleted_messages(deleted_at)',
+  );
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_delete_idempotency_created_at ' +
+    'ON delete_idempotency(created_at)',
+  );
+
   // ---- FTS5 (standalone table, maintained by the app, NOT triggers) ----
   // The searchable text lives here (subject / from / plain-text body);
   // the full bodies live on disk. An old content-table FTS (content=
@@ -446,8 +476,10 @@ export function searchMessageIds(q: string): number[] | null {
   const matchTerms = longTerms.map((t) => t.replace(/"/g, '')).filter((t) => t.length > 0);
   if (matchTerms.length) {
     const match = matchTerms.map((t) => `"${t}"`).join(' ');
+    // Audit #8 LOW-1（数据库）：MATCH 原来返回全部命中行、无 LIMIT——
+    // 常见词一次返回上万行再在 JS 里交集；加 LIMIT 2000 封顶。
     const rows = db.prepare(
-      'SELECT rowid AS id, bm25(messages_fts) AS rank FROM messages_fts WHERE messages_fts MATCH ? ORDER BY rank'
+      'SELECT rowid AS id, bm25(messages_fts) AS rank FROM messages_fts WHERE messages_fts MATCH ? ORDER BY rank LIMIT 2000'
     ).all(match) as { id: number; rank: number }[];
     ftsIds = new Set(rows.map((r) => r.id));
     for (const r of rows) ftsRank.set(r.id, r.rank);
@@ -464,7 +496,10 @@ export function searchMessageIds(q: string): number[] | null {
       params.push(esc, esc, esc);
     }
     const rows = db.prepare(
-      `SELECT rowid AS id FROM messages_fts WHERE ${likeClauses.join(' AND ')}`
+      // Audit #8 MED-2（数据库）：短词 LIKE 在 FTS 表上全表扫（含全部正文），
+      // 搜索范围不变（body_text 继续搜），只加 LIMIT 2000 封顶——
+      // 单次短词搜索的扫描量有界，正常搜索（命中 <2000）不受影响。
+      `SELECT rowid AS id FROM messages_fts WHERE ${likeClauses.join(' AND ')} LIMIT 2000`
     ).all(...params) as { id: number }[];
     likeIds = new Set(rows.map((r) => r.id));
   }

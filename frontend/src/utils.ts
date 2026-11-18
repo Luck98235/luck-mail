@@ -72,6 +72,12 @@ export async function copyText(text: string): Promise<boolean> {
   }
 }
 
+// 账号连接异常的展示文案：认证失败与一般连接异常区分开，别把普通断线也说成密码错了。
+export function accountErrorLabel(status: string | undefined, error: string | undefined): string {
+  if (status !== 'error') return ''
+  return (error || '').startsWith('认证失败') ? '认证失败' : '连接异常'
+}
+
 // 下载 Blob：建临时 <a> 触发下载，点完立即回收对象 URL。
 export function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob)

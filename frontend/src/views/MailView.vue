@@ -19,13 +19,13 @@
 
     <!-- 弹窗 -->
     <ComposeModal :open="composeOpen" :initial="composeInitial" @close="composeOpen = false" @sent="composeOpen = false" />
-    <ManageAccountsModal :open="manageOpen" @close="manageOpen = false" />
+    <ManageAccountsModal :open="manageOpen" :edit-account-id="manageEditId ?? undefined" @close="manageOpen = false" @edit-consumed="manageEditId = null" />
     <SettingsModal :open="settingsOpen" @close="settingsOpen = false" />
     <ConfirmModal />
     <ThemePanel />
 
-    <!-- Toast -->
-    <div v-if="mail.toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[70] bg-slate-800 text-white text-xs px-4 py-2 rounded-full shadow-lg">
+    <!-- Toast：带动作的 toast（认证失败提醒）可点，点它打开该账号的设置；普通 toast 不可点 -->
+    <div v-if="mail.toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[70] bg-slate-800 text-white text-xs px-4 py-2 rounded-full shadow-lg" :class="mail.toastAction ? 'cursor-pointer hover:bg-slate-700' : ''" :title="mail.toastAction ? '点击打开邮箱设置' : ''" @click="onToastClick">
       {{ mail.toast }}
     </div>
   </div>
@@ -55,10 +55,28 @@ const mail = useMailStore()
 const composeOpen = ref<boolean>(false)
 const composeInitial = ref<ComposeInitial>({})
 const manageOpen = ref<boolean>(false)
+const manageEditId = ref<number | null>(null) // 侧栏认证失败标记点进来时，直达该账号的设置
 const settingsOpen = ref<boolean>(false)
 
 onMounted(() => { void mail.init() })
 onUnmounted(() => { mail.disconnectRealtime(); mail.destroyMobileHistory() })
+
+// 打开指定账号的设置（侧栏认证失败标记 / 认证失败 toast 点进来）：
+// 先给直达 id 再打开邮箱管理，管理弹窗打开后自动进该账号的设置。
+watch(() => mail.accountSettingsRequest, (id) => {
+  if (id == null) return
+  manageEditId.value = id
+  manageOpen.value = true
+  mail.accountSettingsRequest = null
+})
+
+// 点 toast：有动作才执行（认证失败提醒 → 打开该账号的设置；移动端只提示去电脑端）。
+function onToastClick(): void {
+  const fn = mail.toastAction
+  if (!fn) return
+  mail.dismissToast()
+  fn()
+}
 
 // 点草稿：回填到写信弹窗
 watch(() => mail.composeDraft, (d) => {

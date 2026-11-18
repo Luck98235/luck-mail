@@ -69,7 +69,7 @@ export function createMockServer() {
     if (url.pathname === '/api/auth/login' && req.method === 'POST') {
       if (body?.password !== 'correct-password') return send(401, { ok: false, error: '用户名或密码错误' })
       loggedIn = true
-      return send(200, { ok: true, username: body?.username }, { 'Set-Cookie': 'lm_session=mock; Path=/; HttpOnly; SameSite=Lax' })
+      return send(200, { ok: true, username: body?.username }, { 'Set-Cookie': 'lm_session=mock; Path=/; HttpOnly; SameSite=Strict' })
     }
     if (url.pathname === '/api/auth/setup' && req.method === 'POST') return send(201, { ok: true })
     if (url.pathname === '/api/auth/logout' && req.method === 'POST') { loggedIn = false; return send(200, { ok: true }) }

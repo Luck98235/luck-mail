@@ -156,7 +156,9 @@ npm start            # node dist/server.js
 - **systemd**（示例）：工作目录放后端根目录，`ExecStart=/usr/bin/node
   /opt/luck-mail/backend/dist/server.js`，环境 `PORT=8080
   DATA_DIR=/opt/luck-mail/data PUBLIC_DIR=/opt/luck-mail/backend/public
-  KEY_FILE=/opt/luck-mail/.key COOKIE_SECURE=1 DEEPL_API_KEY=<DeepL 密钥>`，
+  KEY_FILE=/opt/luck-mail/.key COOKIE_SECURE=1`，另加
+  `EnvironmentFile=/opt/luck-mail/.deepl-env`（0600，内含 `DEEPL_API_KEY` 一行；
+  密钥绝不写进单元文件），
   `Restart=always`，`User=root`（与线上服务一致）；
   `DATA_DIR`（含 `.key`、SQLite、附件、正文）要持久化、定期备份，
   `.key` 丢了则所有已存邮箱密码无法解密（须重新添加邮箱）。

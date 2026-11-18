@@ -7,7 +7,7 @@ import {
 } from './db.js';
 import type { AccountRow, FolderRow, MessageRow, AttachmentRow } from './db.js';
 import { decryptSecret } from './cryptoUtil.js';
-import { makeImapClient, accountToImap, logError, isAuthError } from './imapUtil.js';
+import { makeImapClient, accountToImap, logError, isAuthError, isThrottleError } from './imapUtil.js';
 import {
   detectFolderType, displayNameOf, collectAttachmentParts, matchAttachmentParts,
   isNonSelectable, toIsoDate,
@@ -30,8 +30,9 @@ const RECONNECT_MAX_MS = 5 * 60 * 1000;
 const PERIODIC_SYNC_MS = 5 * 60 * 1000;
 // Full flag comparison (CONDSTORE fallback) runs at most this often per
 // folder — it is a whole-folder FETCH, so it must not run on every IDLE
-// event. Same cadence as the periodic fallback sync.
-const FLAG_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+// event. Audit #8 LOW-3：原来 5 分钟，与轮询间隔相同、等于每轮都跑；
+// 放宽到 15 分钟，已读状态同步仍及时，整文件夹 FETCH 次数降为 1/3。
+const FLAG_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 // Fetch only the first bytes of the TEXT part for the list snippet; the full
 // source is fetched (and parsed) only when a message is opened.
 const SNIPPET_BYTES = 4096;
@@ -79,6 +80,9 @@ interface AccountState {
   lastFolderListAt: number | null;
   // R1: 网易系账号不保持长连接 IDLE，改轮询（_pollAllFolders）。
   pollOnly: boolean;
+  // Audit #8 LOW-4：_connectLoop 进行中（首连/重连同步）时轮询跳过一轮，
+  // 否则建连与轮询并行、同一账号瞬时有 2 条 IMAP 连接。
+  connecting: boolean;
 }
 
 // Public envelope shape (contract): no body, no password, ever.
@@ -148,6 +152,7 @@ export class SyncEngine {
       sharedTimer: null,
       lastFolderListAt: null,
       pollOnly: isNetEaseHost(account.imap_host),
+      connecting: false,
     };
     this.states.set(accountId, state);
     void this._connectLoop(accountId);
@@ -190,6 +195,8 @@ export class SyncEngine {
   private async _connectLoop(accountId: number): Promise<void> {
     const state = this.states.get(accountId);
     if (!state) return; // stopped
+    // Audit #8 LOW-4：标记建连进行中，轮询定时器触发时跳过本轮。
+    state.connecting = true;
     try {
       // R1: 网易系账号先起轮询定时器——之后无论首连成功与否，轮询
       // 都是同步的驱动力（首连失败时轮询每 5 分钟再试，不用等重连退避）。
@@ -217,6 +224,7 @@ export class SyncEngine {
       // 退出，不能继续往下跑（否则两个连接同时 IDLE/同步同一个账号）。
       if (this.states.get(accountId) !== state) {
         await client.logout().catch(() => {});
+        state.connecting = false;
         return;
       }
       state.backoffMs = RECONNECT_BASE_MS;
@@ -253,6 +261,7 @@ export class SyncEngine {
         this._startPeriodicSync(accountId);
       }
       getDb().prepare("UPDATE accounts SET last_sync_at=datetime('now') WHERE id=?").run(accountId);
+      state.connecting = false;
     } catch (e) {
       if (!state.pollOnly) this._stopPeriodicSync(accountId);
       const msg = String((e as Error)?.message || e);
@@ -264,9 +273,17 @@ export class SyncEngine {
         const authMsg = '认证失败，请检查密码/授权码（邮箱设置里重新测试或保存后恢复）';
         logError(`imap auth failed account ${accountId}:`, msg);
         this.setAccountStatus(accountId, 'error', authMsg);
-        emit('sync', { accountId, state: 'error', error: authMsg });
+        emit('sync', { accountId, state: 'error', error: authMsg, authFailed: true });
         try { await state.client?.logout().catch(() => {}); } catch { /* ignore */ }
         state.client = null;
+        // Audit #8 HIGH-1(a)：认证失败也要停掉轮询定时器——网易账号的
+        // 轮询定时器在 _connectLoop 开头就起了，上面 `if (!state.pollOnly)`
+        // 那行只停非轮询账号，网易账号会每 5 分钟拿错凭证再登录一次，
+        // 直到服务器 451 临时禁登。注意不停在 :257 去条件：非认证失败
+        // 时轮询定时器本身就是网易账号的重试驱动，停了它、重连循环又被
+        // MED-1 守卫拦住，账号会 stranded 到手动刷新。
+        this._stopPeriodicSync(accountId);
+        state.connecting = false;
         return;
       }
       logError(`imap connect failed account ${accountId}:`, msg);
@@ -274,13 +291,23 @@ export class SyncEngine {
       emit('sync', { accountId, state: 'error', error: msg.slice(0, 500) });
       try { await state.client?.logout().catch(() => {}); } catch { /* ignore */ }
       state.client = null;
+      // Audit #8 LOW-1：服务器限流信号（421/451 等）时退避下限提到 5 分钟；
+      // 网易轮询账号不走 _scheduleReconnect（MED-1 守卫），只等轮询。
+      if (isThrottleError(e)) {
+        state.backoffMs = RECONNECT_MAX_MS;
+        log(`imap account ${accountId}: server throttling, backoff raised to 5m`);
+      }
       this._scheduleReconnect(accountId);
+      state.connecting = false;
     }
   }
 
   private _scheduleReconnect(accountId: number): void {
     const state = this.states.get(accountId);
-    if (!state || state.timer || state.authFailed) return;
+    // Audit #8 MED-1（友好性）：网易轮询账号不走重连循环——轮询定时器
+    // 本身就是重试驱动（每 5 分钟），再加一条退避重连就是双轨重试，
+    // 故障时登录次数翻倍，早期 5 秒退避还会延长服务器限流。
+    if (!state || state.timer || state.authFailed || state.pollOnly) return;
     // B3(b): 退避加抖动 ±25%，避免多账号同一时刻一起重连（惊群）。
     const delay = Math.round(state.backoffMs * (0.75 + Math.random() * 0.5));
     state.backoffMs = Math.min(state.backoffMs * 2, RECONNECT_MAX_MS);
@@ -321,9 +348,19 @@ export class SyncEngine {
   private async _pollAllFolders(accountId: number): Promise<void> {
     const state = this.states.get(accountId);
     if (!state) return;
+    // Audit #8 HIGH-1(b)：认证失败后轮询直接返回，不再建连登录——
+    // 否则网易账号每 5 分钟拿错凭证登录一次，触发服务器 451 临时禁登。
+    if (state.authFailed) return;
+    // Audit #8 LOW-4：_connectLoop 进行中（首连/重连同步）时跳过本轮
+    // 轮询——建连不在 state.queue 里，两路并行会让同一账号瞬时有 2 条连接。
+    if (state.connecting) return;
+    // Audit #8 LOW-2：复用 B23 的 1 小时 LIST 缓存——轮询原来每轮都
+    // 完整 LIST（全站约 324 次/小时），现在最多每小时一次；文件夹删除
+    // 的发现延迟到 1 小时，与手动刷新同款取舍。
+    const needList = !state.lastFolderListAt || Date.now() - state.lastFolderListAt > 60 * 60 * 1000;
     try {
       await this.withClient(accountId, async (c) => {
-        await this._syncFolders(c, accountId);
+        if (needList) await this._syncFolders(c, accountId);
         for (const f of this._dbFolders(accountId)) {
           try {
             await this._syncFolder(c, accountId, f);
@@ -421,6 +458,12 @@ export class SyncEngine {
     const state = this.states.get(accountId);
     if (!state) throw new Error('account not running');
     const run = state.queue.then(async () => {
+      // Audit #8 HIGH-1(c)：认证失败的账号不再建连——直接抛认证失败，
+      // 不拿错凭证去登录（_pollAllFolders 的守卫拦轮询，这里拦用户
+      // 主动操作：打开/删除/移动/发信时的按需连接）。
+      if (state.authFailed) {
+        throw new Error('认证失败，请检查密码/授权码（邮箱设置里重新测试或保存后恢复）');
+      }
       // The live connection may have come back while we were queued.
       if (state.client?.usable) return fn(state.client);
       if (state.sharedTimer) {
@@ -528,7 +571,7 @@ export class SyncEngine {
       return;
     }
     // 全部账号完成后只发一次聚合 sync done：以前每个账号各发一次 done，
-    // 前端收到一次就 loadMessages 一次，28 个账号就是 28 次重载。
+    // 前端收到一次就 loadMessages 一次，全部账号各发一次就是多次重载。
     // 单个账号的失败仍写进 accounts.status，聚合 done 触发的 loadAccounts
     // 会把它显示出来。
     // B3(c): 限并发——每批 5 个账号，Promise.allSettled 分批跑，不再 27 个
@@ -661,9 +704,15 @@ export class SyncEngine {
       // R3: 全量重取后去重记录失效（行已重建），清空。
       this.skippedDupeUids.delete(folder.id);
       if (readUids.size) {
-        const placeholders = [...readUids].map(() => '?').join(',');
-        db.prepare(`UPDATE messages SET is_read=1 WHERE folder_id=? AND uid IN (${placeholders})`)
-          .run(folder.id, ...[...readUids]);
+        // Audit #8 LOW-6：占位符数 = 已读 UID 数，大文件夹下超 SQLite
+        // 变量上限（32766）会抛错且无兜底；按 500 一批更新。
+        const uids = [...readUids];
+        for (let i = 0; i < uids.length; i += 500) {
+          const batch = uids.slice(i, i + 500);
+          const placeholders = batch.map(() => '?').join(',');
+          db.prepare(`UPDATE messages SET is_read=1 WHERE folder_id=? AND uid IN (${placeholders})`)
+            .run(folder.id, ...batch);
+        }
       }
       db.prepare(`INSERT INTO sync_state (folder_id, uidvalidity, uidnext, modseq, last_sync_at)
                   VALUES (?,?,?,?,datetime('now'))
@@ -694,13 +743,19 @@ export class SyncEngine {
         let minNewUid = newUids[0];
         for (const u of newUids) if (u < minNewUid) minNewUid = u;
         const fresh = await this._fetchEnvelopes(client, `${minNewUid}:*`, {}, { uid: true });
-        for (const m of fresh) {
-          try {
-            this._upsertEnvelope(accountId, folder, m, true);
-          } catch (e) {
-            logError(`upsert envelope failed account ${accountId} folder ${folder.path} uid ${m.uid}:`, (e as Error)?.message || e);
+        // Audit #8 LOW-3（数据库）：增量同步的逐封 upsert 包进一个事务——
+        // 原来每封约 5 条语句各走一次 autocommit 提交，1000 封新邮件
+        // 突发就是约 5000 次独立事务。
+        const txNew = db.transaction(() => {
+          for (const m of fresh) {
+            try {
+              this._upsertEnvelope(accountId, folder, m, true);
+            } catch (e) {
+              logError(`upsert envelope failed account ${accountId} folder ${folder.path} uid ${m.uid}:`, (e as Error)?.message || e);
+            }
           }
-        }
+        });
+        txNew();
       }
       // Flag changes since last MODSEQ (CONDSTORE).
       if (highestModseq && stored.modseq && highestModseq > stored.modseq) {
@@ -713,8 +768,8 @@ export class SyncEngine {
           }
         }
       } else if (!highestModseq) {
-        // 163/QQ 不支持 CONDSTORE（mailbox.highestModseq 恒为 null，生产库
-        // 174 个文件夹的 modseq 全是 NULL）：MODSEQ 路径永远走不到，别处
+        // 163/QQ 不支持 CONDSTORE（mailbox.highestModseq 恒为 null，全部
+        // 文件夹的 modseq 全是 NULL）：MODSEQ 路径永远走不到，别处
         // 客户端改的已读状态同步不回来。降级为定期全量比对 flags。
         // B6(b): 不再只做收件箱——全部文件夹都跑（每文件夹 5 分钟节流，
         // 见 _syncFlagsFull），否则非收件箱的已读状态永远同步不回来。
@@ -722,10 +777,18 @@ export class SyncEngine {
       }
       // Deletions: compare server UID set with local UIDs.
       if (serverUids.size || mailbox.exists === 0) {
-        for (const row of localRows) {
-          if (!serverUids.has(row.uid)) {
-            removeMessageFts(row.id);
-            db.prepare('DELETE FROM messages WHERE id=?').run(row.id);
+        // Audit #8 LOW-3（数据库）：删除对账的 DB 写包进一个事务；
+        // 正文文件删除与 mail-deleted 事件留在事务外（文件删了回滚不回来）。
+        const toDelete = localRows.filter((row) => !serverUids.has(row.uid));
+        if (toDelete.length) {
+          const txDel = db.transaction(() => {
+            for (const row of toDelete) {
+              removeMessageFts(row.id);
+              db.prepare('DELETE FROM messages WHERE id=?').run(row.id);
+            }
+          });
+          txDel();
+          for (const row of toDelete) {
             // R2: 对账删行时同样删正文文件（与 deleteMessage 同款）。
             removeBodyFiles(row.id);
             emit('mail-deleted', { messageId: row.id });
@@ -786,7 +849,7 @@ export class SyncEngine {
   // 取该 UID 前后各 100 个 UID 的窗口（自动保存的副本与原件 UID 相邻）。
   private async _findUidsByMessageId(
     client: ImapFlow, folderPath: string, messageId: string,
-    opts: { centerUid?: number; window?: number } = {},
+    opts: { centerUid?: number; window?: number; verify?: { subject: string; from: string } } = {},
   ): Promise<number[]> {
     await client.mailboxOpen(folderPath, { readOnly: true });
     const window = opts.window ?? 100;
@@ -814,7 +877,18 @@ export class SyncEngine {
     const hits: number[] = [];
     // range 是 UID，必须第 3 参数传 {uid:true}，否则当序号取。
     for await (const msg of client.fetch(`${min}:${max}`, { envelope: true, uid: true }, { uid: true })) {
-      if (msg.envelope?.messageId === messageId && typeof msg.uid === 'number') hits.push(Number(msg.uid));
+      if (msg.envelope?.messageId === messageId && typeof msg.uid === 'number') {
+        // Audit #8 LOW-8：副本清扫时核对 subject/from——个别错配
+        // Message-ID 的群发/转发邮件不能被当成同一封删掉。
+        if (opts.verify) {
+          const env = msg.envelope;
+          const subj = (env.subject || '').trim();
+          const fromAddr = (env.from?.[0]?.address || '').toLowerCase();
+          if (subj !== opts.verify.subject.trim()
+            || fromAddr !== opts.verify.from.toLowerCase()) continue;
+        }
+        hits.push(Number(msg.uid));
+      }
     }
     return hits.sort((a, b) => a - b);
   }
@@ -835,12 +909,12 @@ export class SyncEngine {
   // 墓碑又挡着它不再显示、界面里永远删不掉。只删 keepUid 之外的命中；
   // keepUid 为 null 时全部命中都删（彻底删除时清扫已发送文件夹用）。
   // 失败只记日志、不让本次删除失败（主删除已成功）。
-  private async _deleteOtherCopiesInFolder(accountId: number, folder: FolderRow, messageId: string, keepUid: number | null): Promise<void> {
+  private async _deleteOtherCopiesInFolder(accountId: number, folder: FolderRow, messageId: string, keepUid: number | null, verify?: { subject: string; from: string }): Promise<void> {
     try {
       const others = await this.withClient(accountId, async (client) => {
         return this._findUidsByMessageId(
           client, folder.path, messageId,
-          keepUid != null ? { centerUid: keepUid } : {},
+          keepUid != null ? { centerUid: keepUid, verify } : { verify },
         );
       });
       const targets = keepUid != null ? others.filter((u) => u !== keepUid) : others;
@@ -1030,7 +1104,13 @@ export class SyncEngine {
     const db = getDb();
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow | undefined;
     if (!row) throw new Error('邮件不存在');
-    if (row.body_path) return row;
+    if (row.body_path) {
+      // Audit #8 LOW-2：崩溃窗口——body_path 已入库、文件未落盘时，
+      // 直接返回会让正文永久为空（early return 挡住重取）；两个正文
+      // 文件都存在才返回，缺失则往下走重取（事务会重写 body_path）。
+      if (fs.existsSync(bodyHtmlPath(row.id)) && fs.existsSync(bodyTextPath(row.id))) return row;
+      log(`body files missing for message ${messageId}, re-fetching`);
+    }
     const folder = db.prepare('SELECT * FROM folders WHERE id=?').get(row.folder_id) as FolderRow | undefined;
     if (!folder) throw new Error('文件夹不存在');
     // Streaming download (contract: 纯流式处理 — never buffer the whole
@@ -1138,8 +1218,18 @@ export class SyncEngine {
     // row untouched — writing the old UID would point at the wrong message
     // in the target folder (later deletes/reads would silently hit nothing
     // or the wrong mail, and the server copy would never sync back).
+    // Audit #8 LOW-1：无 Message-ID 的信还有一层兜底——移动前后目标文件
+    // 夹 EXISTS +1 时，取目标文件夹的最大 UID（刚移入的信一定是最新那封）。
     const newUid = await this.withClient(accountId, async (client) => {
       await client.mailboxOpen(source.path);
+      let targetExistsBefore: number | null = null;
+      if (!row.message_id) {
+        try {
+          const mb = await client.mailboxOpen(target.path, { readOnly: true });
+          targetExistsBefore = typeof mb?.exists === 'number' ? mb.exists : null;
+          await client.mailboxOpen(source.path);
+        } catch { targetExistsBefore = null; }
+      }
       // 必须传 {uid:true}：row.uid 是 UID，默认当序号就是空操作，信就移不过去。
       const result = await client.messageMove(String(row.uid), target.path, { uid: true });
       try {
@@ -1147,7 +1237,21 @@ export class SyncEngine {
         const mapped = map?.get(row.uid);
         if (typeof mapped === 'number' && Number.isFinite(mapped)) return mapped;
       } catch { /* fall through to Message-ID lookup */ }
-      if (!row.message_id) return null;
+      if (!row.message_id) {
+        if (targetExistsBefore == null) return null;
+        try {
+          const mb = await client.mailboxOpen(target.path, { readOnly: true });
+          if (typeof mb?.exists === 'number' && mb.exists === targetExistsBefore + 1) {
+            const uids = await client.search({ all: true }, { uid: true });
+            if (Array.isArray(uids) && uids.length) {
+              let max = -1;
+              for (const u of uids) { const n = Number(u); if (n > max) max = n; }
+              if (max > 0) return max;
+            }
+          }
+        } catch { /* fall through to null */ }
+        return null;
+      }
       return this._findUidByMessageId(client, target.path, row.message_id);
     });
     if (newUid == null) {
@@ -1181,7 +1285,8 @@ export class SyncEngine {
       // 服务器副本一并删掉（163/QQ 自动保存的那份），否则原件移走后
       // 另一份还留在已发送、墓碑又挡着它不再显示、界面里永远删不掉。
       if (folder.type === 'sent' && row.message_id) {
-        await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid);
+        await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid,
+          { subject: row.subject || '', from: row.from_addr || '' });
       }
       return true;
     }
@@ -1194,13 +1299,15 @@ export class SyncEngine {
     // F1 附带：彻底删除时同样清掉同文件夹内同一 Message-ID 的其他
     // 服务器副本（两份副本先后被移进已删除的情形）。
     if (row.message_id) {
-      await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid);
+      await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid,
+        { subject: row.subject || '', from: row.from_addr || '' });
       // L3: 彻底删除时也清扫同账号已发送文件夹里的同 Message-ID 副本
       // （第一次清扫失败、或副本在已发送里时，墓碑会挡着它永不显示、
       // 界面里永远删不掉，只占服务器空间）。
       const sentFolder = db.prepare("SELECT * FROM folders WHERE account_id=? AND type='sent' LIMIT 1").get(accountId) as FolderRow | undefined;
       if (sentFolder && sentFolder.id !== folder.id) {
-        await this._deleteOtherCopiesInFolder(accountId, sentFolder, row.message_id, null);
+        await this._deleteOtherCopiesInFolder(accountId, sentFolder, row.message_id, null,
+          { subject: row.subject || '', from: row.from_addr || '' });
       }
     }
     const folderId = row.folder_id;
