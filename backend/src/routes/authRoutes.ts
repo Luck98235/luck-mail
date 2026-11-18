@@ -38,7 +38,7 @@ export function authRoutes(): express.Router {
     if (count > 0) return res.status(409).json({ ok: false, error: '已创建过账号' });
     const remaining = ipLockRemaining(req, 'setup');
     if (remaining > 0) {
-      return res.status(429).json({ ok: false, error: '尝试次数过多，请稍后再试', retryAfter: remaining });
+      return res.status(429).json({ ok: false, error: '账号已锁定，请稍后再试', retryAfter: remaining });
     }
     const { username, password, confirm } = (req.body || {}) as Record<string, unknown>;
     const fail = (msg: string, code = 400): Response => {

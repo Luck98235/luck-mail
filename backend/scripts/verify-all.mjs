@@ -72,7 +72,7 @@ async function api(method, p, body, extraHeaders = {}) {
   return { status: res.status, json, text, headers: res.headers };
 }
 
-async function waitReady(server, tries = 40) {
+async function waitReady(server, tries = 60) {
   for (let i = 0; i < tries; i++) {
     try {
       const r = await fetch(BASE + '/api/auth/status');
@@ -84,19 +84,41 @@ async function waitReady(server, tries = 40) {
 }
 
 console.log(`verify tmp dir: ${TMP}`);
-const server = spawn('node', ['dist/server.js'], {
-  cwd: BACKEND,
-  env: { ...process.env, PORT: String(PORT), DATA_DIR, PUBLIC_DIR },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
+// Audit #7 LOW-1：启动失败一次后重试——冷启动抖动/端口竞态可能导致首跑
+// 误报 "server did not start"（waitReady 窗口）；spawn 加 error 处理并
+// 记录退出码/信号，失败时保留 serverLog 供诊断。
+let server = null;
 let serverLog = '';
-server.stdout.on('data', (d) => { serverLog += d.toString(); });
-server.stderr.on('data', (d) => { serverLog += d.toString(); });
+let serverExit = null;
+function startServer() {
+  const srv = spawn('node', ['dist/server.js'], {
+    cwd: BACKEND,
+    env: { ...process.env, PORT: String(PORT), DATA_DIR, PUBLIC_DIR },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  srv.stdout.on('data', (d) => { serverLog += d.toString(); });
+  srv.stderr.on('data', (d) => { serverLog += d.toString(); });
+  srv.on('error', (err) => { serverLog += `[spawn error] ${err.message}\n`; });
+  srv.on('exit', (code, signal) => { serverExit = { code, signal }; });
+  return srv;
+}
+server = startServer();
 let db = null;
 
 try {
-  if (!(await waitReady(server))) {
+  let started = await waitReady(server);
+  if (!started) {
+    console.log('server did not start on first try, retrying once...');
     console.log(serverLog);
+    if (serverExit) console.log(`first server exited: code=${serverExit.code} signal=${serverExit.signal}`);
+    try { server.kill('SIGKILL'); } catch { /* ignore */ }
+    serverExit = null;
+    server = startServer();
+    started = await waitReady(server);
+  }
+  if (!started) {
+    console.log(serverLog);
+    if (serverExit) console.log(`server exited: code=${serverExit.code} signal=${serverExit.signal}`);
     throw new Error('server did not start');
   }
   console.log('== server up ==');
@@ -1269,6 +1291,48 @@ try {
   check('L1: same key for a different message -> 409', r.status === 409, `status=${r.status}`);
   r = await api('DELETE', '/api/messages/424242?idempotencyKey=' + 'x'.repeat(129));
   check('L1: over-long idempotencyKey -> 400', r.status === 400, `status=${r.status}`);
+  // Audit #7 MED-1：并发同 key 单删——先占位后删除。两路并发 DELETE 带
+  // 同一 key 时，只有一路真正执行删除（这里因种子账号无 trash 文件夹
+  // 而 502），另一路必须返回 duplicate:true、不执行第二次删除；
+  // 未修之前两路都会走到 IMAP 删除（都 502、无 duplicate）。
+  const mConc = mkMsg(3, '并发删信测试', 'conc@163.com', '并发同 key 单删');
+  {
+    const [c1, c2] = await Promise.all([
+      api('DELETE', `/api/messages/${mConc}?idempotencyKey=del-conc-1`),
+      api('DELETE', `/api/messages/${mConc}?idempotencyKey=del-conc-1`),
+    ]);
+    const dups = [c1, c2].filter((x) => x.json?.duplicate === true).length;
+    const fails = [c1, c2].filter((x) => x.status === 502).length;
+    check('MED-1: concurrent same-key single deletes -> exactly one duplicate:true, one 502',
+      dups === 1 && fails === 1, `c1=${c1.status}/${JSON.stringify(c1.json)} c2=${c2.status}/${JSON.stringify(c2.json)}`);
+    const claimRows = vdb.prepare("SELECT COUNT(*) c FROM delete_idempotency WHERE idempotency_key='del-conc-1'").get().c;
+    check('MED-1: claim row recorded exactly once', claimRows === 1, `rows=${claimRows}`);
+  }
+  // 批量删并发同 key：同一 taskId、其一 duplicate:true。
+  {
+    const [b1, b2] = await Promise.all([
+      api('POST', '/api/messages/batch-delete', { ids: [m1], idempotencyKey: 'del-conc-batch-1' }),
+      api('POST', '/api/messages/batch-delete', { ids: [m1], idempotencyKey: 'del-conc-batch-1' }),
+    ]);
+    check('MED-1: concurrent same-key batch deletes -> same taskId, one duplicate:true',
+      b1.json?.taskId && b1.json.taskId === b2.json?.taskId
+      && [b1, b2].filter((x) => x.json?.duplicate === true).length === 1,
+      `b1=${JSON.stringify(b1.json)} b2=${JSON.stringify(b2.json)}`);
+    for (let i = 0; i < 40; i++) {
+      const s = await api('GET', `/api/messages/delete-status?taskId=${encodeURIComponent(b1.json.taskId)}`);
+      if (s.json && s.json.running === false) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+  // Audit #7 LOW-1：key 命中但任务已不在内存（重启/剪枝）时，批量删重试
+  // 应返回 status:'unknown'，而不是谎报 'finished'。
+  vdb.prepare("INSERT OR IGNORE INTO delete_idempotency (idempotency_key, task_id) VALUES (?,?)")
+    .run('del-unknown-1', '00000000-0000-0000-0000-000000000000');
+  r = await api('POST', '/api/messages/batch-delete', { ids: [m1], idempotencyKey: 'del-unknown-1' });
+  check("LOW-1: batch-delete retry with key whose task is gone -> status 'unknown' (not 'finished')",
+    r.status === 200 && r.json?.taskId === '00000000-0000-0000-0000-000000000000'
+    && r.json?.status === 'unknown' && r.json?.duplicate === true,
+    `status=${r.status} body=${JSON.stringify(r.json)}`);
 
   // ---------- 18. audit #5b fixes ----------
   console.log('== audit #5b fixes ==');

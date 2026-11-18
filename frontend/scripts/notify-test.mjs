@@ -1,5 +1,6 @@
 // 通知模块测试：用全局 stub 的 Notification 覆盖合并窗口逻辑，node 直接跑。
 //   node scripts/notify-test.mjs
+import { readFileSync } from 'node:fs'
 import { MailNotifier, isNotifySupported, getNotifyPermission, requestNotifyPermission, NOTIFY_MERGE_MS } from '../src/utils/notify.ts'
 
 const results = []
@@ -171,6 +172,16 @@ async function main() {
       threw = e
     }
     check('Notification 未定义时入队/到点不抛错', threw === null, threw ? String(threw) : '')
+  }
+
+  // 10. 跨标签页同步：store 监听 storage 事件，luck-mail-notify 变化时同步 notifyEnabled
+  // （静态源码断言，同 noautoopen-test 的做法；真跨标签行为由浏览器验证覆盖）
+  {
+    const storeSrc = readFileSync(new URL('../src/stores/mail.ts', import.meta.url), 'utf8')
+    const hasListener = /window\.addEventListener\('storage'/.test(storeSrc)
+      && /e\.key !== NOTIFY_KEY/.test(storeSrc)
+      && /notifyEnabled\.value = e\.newValue === '1'/.test(storeSrc)
+    check('跨标签页同步：mail.ts 监听 storage 事件同步 notifyEnabled', hasListener)
   }
 
   const failed = results.filter((r) => !r.ok)

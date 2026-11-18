@@ -28,7 +28,7 @@ export const useAuthStore = defineStore('auth', () => {
     if (e instanceof ApiError) {
       if (e.status === 429) {
         const secs = (e.body as { retryAfter?: number } | null)?.retryAfter
-        return `尝试次数过多，已锁定${secs ? `，${Math.ceil(secs / 60)} 分钟后再试` : '，请稍后再试'}。`
+        return `账号已锁定${secs ? `，${Math.ceil(secs / 60)} 分钟后再试` : '，请稍后再试'}。`
       }
       return e.message || '操作失败，请重试。'
     }

@@ -43,7 +43,7 @@ Single Node process + SQLite. No PostgreSQL, Redis, S3 or Elasticsearch.
 | Storage | SQLite (WAL + FTS5 trigram); sanitized HTML bodies as files; attachments are metadata-only — content is streamed live from IMAP on download, never stored on disk |
 | Security | AES-256-GCM mailbox password encryption; DOMPurify + JSDOM sanitization; sandboxed iframe (srcdoc) for bodies |
 
-**How mail flows:** the frontend talks only to the Node backend over one WebSocket (Socket.io). For most providers imapflow keeps one IDLE connection per mailbox; on new mail the backend pushes JSON to Vue, which updates unread counts and the list. NetEase accounts (163/126/yeah/188) do not use IDLE at all — 163 silently drops IDLE after ~3 minutes, so those accounts poll all folders every ~4.5–5.5 minutes over a short-lived connection instead, and new mail there can take up to ~5 minutes to appear. Other providers keep IDLE, with a 5-minute periodic INBOX sync as the fallback when IDLE does not push (e.g. QQ). Deleting a message performs the IMAP operation on the server first (move to trash, or expunge for permanent delete), then updates the local database — client and server stay in sync.
+**How mail flows:** the frontend talks only to the Node backend over one WebSocket (Socket.io). For most providers imapflow keeps one IDLE connection per mailbox; on new mail the backend pushes JSON to Vue, which updates unread counts and the list. NetEase accounts (163/126/yeah/188) do not use IDLE at all — 163 silently drops IDLE after ~3 minutes, so those accounts poll all folders every ~4.5–5.5 minutes over a short-lived connection instead, and new mail there can take up to ~5 minutes to appear. Other providers keep IDLE, with a 5-minute periodic all-folder sync as the fallback when IDLE does not push (e.g. QQ). Deleting a message performs the IMAP operation on the server first (move to trash, or expunge for permanent delete), then updates the local database — client and server stay in sync.
 
 ## Known provider presets
 
@@ -142,13 +142,13 @@ LICENSE                  # AGPL-3.0
 - Service status: `systemctl status luck-mail`; logs: `journalctl -u luck-mail -f`.
 - Health check: `GET /api/health` → `{"ok":true,"db":"ok"}` when the server and database are up (no login required).
 - Cannot log in: check the 5-failure lockout (15 minutes) and that the username has no email suffix; the password is the login password, not a mailbox authorization code.
-- A mailbox shows offline/error: open **Manage mailboxes → Test** for that mailbox; IMAP/SMTP errors are shown there. QQ Mail does not push IDLE notifications, so new QQ mail can take up to 5 minutes to appear (periodic sync fallback). NetEase (163/126/yeah/188) accounts poll every ~5 minutes instead of IDLE, so new mail there can also take up to ~5 minutes.
+- A mailbox shows offline/error: open **Manage mailboxes → Test** for that mailbox; IMAP/SMTP errors are shown there. QQ Mail does not push IDLE notifications, so new QQ mail can take up to 5 minutes to appear (periodic all-folder sync fallback). NetEase (163/126/yeah/188) accounts poll every ~5 minutes instead of IDLE, so new mail there can also take up to ~5 minutes.
 - Sync seems stuck: use the refresh button (desktop header / mobile account overview); check `journalctl -u luck-mail` for sync errors.
 
 ## Known limitations
 
 - Scale: up to 50 mailboxes; single Node process + SQLite.
-- QQ Mail IMAP IDLE does not push new-mail notifications; a 5-minute periodic sync is the fallback, so new QQ mail can take up to 5 minutes to show.
+- QQ Mail IMAP IDLE does not push new-mail notifications; a 5-minute periodic all-folder sync is the fallback, so new QQ mail can take up to 5 minutes to show.
 - NetEase (163/126/yeah/188) accounts do not use IDLE at all — they poll all folders every ~5 minutes over short-lived connections, so new mail can take up to ~5 minutes to show.
 - After deleting mail, the list can take about 5–6 seconds to reflect the change (async batch delete).
 - TLS certificates must be renewed (Let's Encrypt, auto-renewal via cron — see [MIGRATION.md](MIGRATION.md)).

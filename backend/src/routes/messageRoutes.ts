@@ -357,6 +357,26 @@ export function messageRoutes(ctx: Ctx): express.Router {
     }
     // 是否永久删除由后端按邮件实际所在文件夹决定（只看 folder.type），
     // 不再信任客户端传的 permanent（搜索是全局的，视图判断会错删）。
+    // Audit #7 MED-1：先占位、后删除——查 prior 与执行删除之间夹着一次
+    // await（IMAP），两路并发带同一 key 时都会查不到、都执行删除，
+    // 第二路会把第一路刚移进已删除的信彻底删除。占位用 INSERT OR IGNORE
+    //（key 是 PRIMARY KEY，原子抢占）：抢不到的重读返回 duplicate/409，
+    // 不执行删除。占位即使删除失败也保留（删信记录保留 7 天才清）：
+    // 重试返回 duplicate:true，前端按成功对账、行还在列表里会回来，
+    // 用户用新 key 再删即可——比“重试变彻底删除”的不可逆误删安全。
+    if (delKey) {
+      const claim = db.prepare('INSERT OR IGNORE INTO delete_idempotency (idempotency_key, message_db_id) VALUES (?,?)')
+        .run(delKey, id);
+      if (claim.changes === 0) {
+        const prior2 = db.prepare('SELECT message_db_id FROM delete_idempotency WHERE idempotency_key=?').get(delKey) as { message_db_id: number | null } | undefined;
+        if (prior2?.message_db_id === id) {
+          res.json({ ok: true, duplicate: true });
+          return;
+        }
+        res.status(409).json({ ok: false, error: 'idempotencyKey 已用于另一封邮件' });
+        return;
+      }
+    }
     try {
       await engine.deleteMessage(row.account_id, id);
     } catch (e) {
@@ -365,10 +385,6 @@ export function messageRoutes(ctx: Ctx): express.Router {
       log('delete failed', `account=${row.account_id} message=${id}`, (e as Error)?.message || e);
       res.status(502).json({ ok: false, error: `IMAP 删除失败：${String((e as Error)?.message || e).slice(0, 300)}` });
       return;
-    }
-    if (delKey) {
-      db.prepare('INSERT OR IGNORE INTO delete_idempotency (idempotency_key, message_db_id) VALUES (?,?)')
-        .run(delKey, id);
     }
     res.json({ ok: true });
   });
@@ -399,14 +415,22 @@ export function messageRoutes(ctx: Ctx): express.Router {
     }
     if (batchKey) {
       const prior = getDb().prepare('SELECT task_id FROM delete_idempotency WHERE idempotency_key=?').get(batchKey) as { task_id: string | null } | undefined;
-      if (prior?.task_id) {
-        const priorTask = deleteTasks.get(prior.task_id);
-        res.json({
-          ok: true,
-          taskId: prior.task_id,
-          status: priorTask ? (priorTask.running ? 'running' : 'finished') : 'finished',
-          duplicate: true,
-        });
+      if (prior) {
+        if (prior.task_id) {
+          const priorTask = deleteTasks.get(prior.task_id);
+          res.json({
+            ok: true,
+            taskId: prior.task_id,
+            // Audit #7 LOW-1：任务已不在内存（重启/剪枝）时返回 'unknown'，
+            // 不要谎报 'finished'——前端轮询不到任务时会按失败对账重拉列表。
+            status: priorTask ? (priorTask.running ? 'running' : 'finished') : 'unknown',
+            duplicate: true,
+          });
+          return;
+        }
+        // 记录存在但无 task_id（该 key 曾被单删用过）：不复用，直接 409，
+        // 不让批量任务顶掉单删的幂等记录。
+        res.status(409).json({ ok: false, error: 'idempotencyKey 已用于其他删除' });
         return;
       }
     }
@@ -420,8 +444,32 @@ export function messageRoutes(ctx: Ctx): express.Router {
       }
       : null;
     pruneDeleteTasks();
+    // Audit #7 MED-1：先占位再建任务——与单删同理，INSERT OR IGNORE 原子
+    // 抢占；抢不到的重读返回已有 taskId，不另起任务、不重复删。
+    // （本处理器全程同步、单进程内本无交错点，占位是防御性收紧，
+    // 也防以后重构加 await 或多进程部署时复发。）
+    const taskId = crypto.randomUUID();
+    if (batchKey) {
+      const claim = getDb().prepare('INSERT OR IGNORE INTO delete_idempotency (idempotency_key, task_id) VALUES (?,?)')
+        .run(batchKey, taskId);
+      if (claim.changes === 0) {
+        const prior = getDb().prepare('SELECT task_id FROM delete_idempotency WHERE idempotency_key=?').get(batchKey) as { task_id: string | null } | undefined;
+        if (prior?.task_id) {
+          const priorTask = deleteTasks.get(prior.task_id);
+          res.json({
+            ok: true,
+            taskId: prior.task_id,
+            status: priorTask ? (priorTask.running ? 'running' : 'finished') : 'unknown',
+            duplicate: true,
+          });
+          return;
+        }
+        res.status(409).json({ ok: false, error: 'idempotencyKey 已用于其他删除' });
+        return;
+      }
+    }
     const task: DeleteTask = {
-      taskId: crypto.randomUUID(),
+      taskId,
       running: true,
       total: ids.length,
       deleted: 0,
@@ -431,10 +479,6 @@ export function messageRoutes(ctx: Ctx): express.Router {
       view,
     };
     deleteTasks.set(task.taskId, task);
-    if (batchKey) {
-      getDb().prepare('INSERT OR IGNORE INTO delete_idempotency (idempotency_key, task_id) VALUES (?,?)')
-        .run(batchKey, task.taskId);
-    }
     // 后台跑：逐封走 engine.deleteMessage；跑完 running=false。
     // 注意不在请求上下文里抛错——失败记进 task.failed，前端轮询可见。
     // L2: 循环本身抛错（非单封失败，如 getDb 异常）时也要把任务置完成，
@@ -745,7 +789,25 @@ export function messageRoutes(ctx: Ctx): express.Router {
         inReplyTo: b.inReplyTo as string | undefined,
         references: b.references as string | string[] | undefined,
       };
-      const failSend = (e: unknown): void => {
+      // Audit #7 LOW-2：释放占位前先按本次 planned Message-ID 查一次
+      // 已发送——SMTP 已接受、响应丢失时，查到了就按已发送完成认领
+      // （返回 duplicate，不让用户以为失败而重发）；查不到再释放，
+      // 真失败仍可快速重试。复用 findAlreadySent（本地+服务器两路）。
+      // 注意：只有对方自动保存已发送副本的服务商（163/QQ）才能查到；
+      // 不自动保存的服务商查不到，仍会释放后重发（残留窗口，见报告）。
+      const completeIfAlreadySent = async (): Promise<{ localId: number | null } | null> => {
+        if (!claimed || !effectiveMessageId) return null;
+        const already = await findAlreadySent(engine, accountId, effectiveMessageId);
+        if (!already) return null;
+        try { completeSendKey(accountId, idemKey, already.localId, effectiveMessageId); } catch { /* ignore */ }
+        return already;
+      };
+      const failSend = async (e: unknown): Promise<void> => {
+        const already = await completeIfAlreadySent();
+        if (already) {
+          res.status(200).json({ ok: true, id: already.localId, messageId: effectiveMessageId, duplicate: true });
+          return;
+        }
         if (claimed) releaseSendKey(accountId, idemKey);
         const code = smtpResponseCode(e);
         const detail = String((e as Error)?.message || e).slice(0, 400);
@@ -782,12 +844,19 @@ export function messageRoutes(ctx: Ctx): express.Router {
             smtpSucceeded = true;
             sentMessageId = sent.messageId;
           } catch (e2) {
+            // 与 failSend 同理：重试也可能在对方已接受后断连，先查已发送
+            // 再释放（见 completeIfAlreadySent）。
+            const already = await completeIfAlreadySent();
+            if (already) {
+              res.status(200).json({ ok: true, id: already.localId, messageId: effectiveMessageId, duplicate: true });
+              return;
+            }
             if (claimed) releaseSendKey(accountId, idemKey);
             res.status(502).json({ ok: false, error: `发信失败：对方服务器临时拒绝（${smtpResponseCode(e2) ?? '4xx'}），请稍后重试` });
             return;
           }
         } else {
-          failSend(e);
+          await failSend(e);
           return;
         }
       }

@@ -32,7 +32,8 @@
         <div class="relative">
           <i class="fa-solid fa-magnifying-glass absolute left-3.5 top-3 text-slate-400 text-sm"></i>
           <input
-            v-model="homeQ" type="search" placeholder="搜索" aria-label="搜索邮件"
+            v-model="homeQ" type="search" name="mail-search-home" autocomplete="off" placeholder="搜索" aria-label="搜索邮件"
+            :readonly="!homeSearchFocused" @focus="homeSearchFocused = true" @blur="homeSearchFocused = false"
             class="w-full bg-slate-100 border-0 rounded-full pl-10 pr-4 py-2.5 text-sm outline-none focus:ring-1 focus:ring-blue-400"
             @keyup.enter="searchFromHome"
           >
@@ -178,6 +179,7 @@ const auth = useAuthStore()
 const mail = useMailStore()
 
 const homeQ = ref<string>('')
+const homeSearchFocused = ref<boolean>(false) // 首页搜索框防自动填充：聚焦前只读（同列表搜索框）
 const switcherOpen = ref<boolean>(false)
 const shellRef = ref<HTMLElement | null>(null)
 

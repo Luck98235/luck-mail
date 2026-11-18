@@ -200,6 +200,9 @@ export const useMailStore = defineStore('mail', () => {
       if (deleteStatusFailures >= 3) {
         deleteStatusFailures = 0
         pendingBatchDelete = null
+        // 审计 #7 LOW-1 收尾：停表时也清掉本次批量删的幂等 key——否则同一批
+        // id 重试会复用旧 key、再次撞上 unknown 循环，要刷新页面才有新 key。
+        lastBatchDeleteKey = null
         stopDeletePolling()
         batchDeleting.value = false
         deleteRemaining.value = 0
@@ -1108,6 +1111,14 @@ export const useMailStore = defineStore('mail', () => {
   function setNotifyEnabled(on: boolean): void {
     notifyEnabled.value = on
     try { localStorage.setItem(NOTIFY_KEY, on ? '1' : '0') } catch { /* 存不下就只改内存态 */ }
+  }
+  // 跨标签页同步：另一标签页改了通知开关时，本页也跟上（storage 事件只在
+  // 其他标签页触发，不会自触发；store 全生命周期只建一次，监听器只挂一次）。
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('storage', (e: StorageEvent) => {
+      if (e.key !== NOTIFY_KEY) return
+      notifyEnabled.value = e.newValue === '1'
+    })
   }
   function handleRealtime(msg: RealtimeEvent): void {
     if (!msg || !msg.type) return
