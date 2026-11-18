@@ -17,10 +17,10 @@ backend/
     db.ts                 SQLite schema（WAL）、FTS5 trigram、body 文件读写
     cryptoUtil.ts         scrypt 密码哈希、AES-256-GCM 账号密码加密
     auth.ts               会话 Cookie（lm_session）、5 次锁定 15 分钟
-    presets.ts            服务商预设表（与 Presets.php 同表，另含 exmail）
+    presets.ts            服务商预设表（另含 exmail）
     sanitize.ts           DOMPurify（JSDOM）：去脚本/事件属性/1x1 追踪像素
-    mailUtil.ts           文件夹类型判定、BODYSTRUCTURE 附件 part、parseRawMessage（测试用）
-    mailStream.ts         流式解析：MailParser 流 + 附件流直接落盘
+    mailUtil.ts           文件夹类型判定、BODYSTRUCTURE 附件 part
+    mailStream.ts         流式解析：MailParser 流 + 附件元数据（不落盘）
     streamParse.ts        大正文路由：超阈值先落临时文件再扔 worker 解析
     parseWorker.ts        worker_threads 解析入口（只收文件路径，不收大 Buffer）
     imapUtil.ts           IMAP ID（RFC 2971）、连通测试、SMTP transporter 构造
@@ -31,12 +31,11 @@ backend/
       authRoutes.ts       status / setup / login / logout / change-password
       accountRoutes.ts    presets / accounts CRUD / test / refresh / folders
       messageRoutes.ts    列表 / 详情 / 标已读 / 移动 / 删除 / 发信 / 附件下载 / 搜索
-      miscRoutes.ts       status / settings（签名、默认账号）
-    mailcomposer.d.ts     nodemailer MailComposer 的松散类型声明
+      miscRoutes.ts       settings（签名、默认账号）
   scripts/
     verify-all.mjs        本地全量验证脚本（见下）
   public/                 Vite dist 产物放这里（集成时；本地没有时 serve 占位页）
-  data/                   默认 DATA_DIR（git 忽略）：luck-mail.db、.key、attachments/、bodies/
+  data/                   默认 DATA_DIR（git 忽略）：luck-mail.db、.key、bodies/（.key 在 data/ 里是 KEY_FILE 默认 ./data/.key 的前提；KEY_FILE 另指别处时 .key 不在 data/ 里）
   dist/                   tsc 编译产物（git 忽略），跑 node dist/server.js
 ```
 
@@ -44,7 +43,7 @@ backend/
 
 ```bash
 cd backend
-npm install
+npm ci
 npm run build        # tsc -> dist/
 npm start            # node dist/server.js
 ```
@@ -52,16 +51,16 @@ npm start            # node dist/server.js
 环境变量：`PORT`（默认 8080）、`DATA_DIR`（默认 `./data`）、`KEY_FILE`
 （默认 `./data/.key`）、`PUBLIC_DIR`（默认 `./public`）、
 `COOKIE_SECURE=1`（生产经 HTTPS 时开启 Secure Cookie）、
-`ATTACHMENT_CACHE_MAX_BYTES`（默认 10MB）、
-`MAIL_PARSE_WORKER_THRESHOLD_BYTES`（默认 5MB）。
+`MAIL_PARSE_WORKER_THRESHOLD_BYTES`（默认 5MB）、
+`DEEPL_API_KEY`（正文翻译用 DeepL 密钥；不配则翻译报错）。
 
 首次启动会自动建 `data/`、生成 32 字节主密钥 `.key`（权限 0600）、建库开 WAL。
 `PUBLIC_DIR` 里没有 `index.html` 时，`/` 返回占位页说明后端已跑起来，不报错退出。
 
-## 验证结果（本地，`npm run verify`，47 项全过）
+## 验证结果（本地，`npm run verify`，46 项全过）
 
 验证脚本 `scripts/verify-all.mjs`：在临时 `DATA_DIR` 上起编译后的服务器，
-全程只用假账号/假授权码，不碰真实邮箱。2026-11-17 晚运行结果 **47 passed，0 failed**。
+全程只用假账号/假授权码，不碰真实邮箱。2026-11-18 运行结果 **46 passed，0 failed**。
 
 - **启动/构建**：`tsc` 严格模式编译通过；`node dist/server.js` 正常监听。
 - **认证**：setup（短密码 400、重复 409）、login（错密 401、未知用户 5 次后 429 +
@@ -73,8 +72,8 @@ npm start            # node dist/server.js
 - **搜索**：两封中文邮件入库后，3 字以上词走 FTS5 trigram 命中；
   2 字词（`项目`）走 LIKE 兜底命中（trigram 本身查不到 <3 字的词，见下）。
 - **列表/详情**：`all-inbox` 列出 2 封；详情从磁盘读回正文；
-  附件元信息含 `size` 与 `large`（15MB 附件 `large:true`）。
-- **附件**：≤10MB 从磁盘流式返回 200；未缓存且无 IMAP part 的返回 404 JSON，不崩溃。
+  附件元信息含 `size` 与 `large`（`large` 恒为 false，历史字段）。
+- **附件**：下载时从 IMAP 实时流式返回 200；无 IMAP part 的返回 404 JSON，不崩溃。
 - **连通测试接口**：假账号 `imapOk:false` + 明确错误
   `IMAP 连接失败（imap.163.com:993）：用户名或密码/授权码不正确（认证被拒：LOGIN Login error or password error）`。
 - **DOMPurify**：手写 .eml（base64 正文、中文编码字主题、`<script>`、1x1 追踪像素）
@@ -84,7 +83,7 @@ npm start            # node dist/server.js
   12MB 附件只存元信息、磁盘零文件。
 - **Socket.io**：带有效 `lm_session` Cookie 的客户端连上并收到 `refresh-all`
   触发的 `sync {state:"done"}` 事件；无 Cookie 的连接被拒绝。
-- **状态/设置**：`/api/status` 正常；签名保存后读回一致；未知接口 404 JSON。
+- **状态/设置**：签名保存后读回一致；未知接口 404 JSON。
 
 ### 163 可达性实证（假账号，只证明“摸得到、认得出”）
 
@@ -103,29 +102,22 @@ npm start            # node dist/server.js
 
 - **纯流式（严禁读整封进内存）**：取全文走 `client.download(uid, '', {uid:true})`
   拿 `Readable` → `stream.pipeline` → mailparser `MailParser` 流式解析；
-  附件流在解析回调里直接 `pipe` 进磁盘文件。列表同步只拉信封
+  附件只存元信息（文件名、大小、part 编号），不落盘。列表同步只拉信封
   （envelope + flags + bodyStructure + size，外加 TEXT 前 4KB 做摘要）。
-  `simpleParser`（整封进内存）只留在 `mailUtil.parseRawMessage` 里供验证脚本用，
-  生产路径不用。
+  `simpleParser`（整封进内存）已删除，生产路径只用流式解析。
 - **Worker Threads**：正文大小（`download.meta.expectedSize`）超过 5MB 时，
   主线程把下载流 spool 到临时文件（流式、有界内存），只把文件路径发给
-  `worker_threads`，由 worker 流式读文件、解析、写附件、回传元数据+正文；
+  `worker_threads`，由 worker 流式读文件、解析、回传元数据+正文；
   临时文件随后删除。主线程全程只维护 IMAP 长连接与 API。
 - **WAL**：`openDb()` 里连接后第一件事就是 `PRAGMA journal_mode=WAL`
  （另加 `synchronous=NORMAL`、`busy_timeout=5000`）；验证脚本用第二个连接
   并发读写同一库文件通过（种子数据就是这么写进去的）。
 
-### 附件 10MB 规则
+### 附件（元数据-only，不落盘）
 
-- 阈值 `ATTACHMENT_CACHE_MAX_BYTES`，默认 10MB（`>10MB` 算大，`≤10MB` 缓存）。
-- 解析时逐附件数字节数：超 10MB 立即停写磁盘、删掉已写部分、记
-  `cached=0`、`large=true`、`path=null`，但继续数完整大小（元信息里的 `size`
-  是准确的解码后字节数）；其余部分直接丢弃、不落盘。
-- 取全文前先拿 `BODYSTRUCTURE`，把附件的 IMAP part 编号（`"2"`、`"1.2"`）
-  存进 `attachments.part`；下载大附件时 `GET /api/messages/:id/attachments/:attId`
-  用 `client.download(uid, part)` 实时从 IMAP 拉、直接 `pipeline` 到浏览器响应，
-  全程不落盘。已缓存的从 `DATA_DIR/attachments/<messageId>/` 流式返回。
-- 附件元信息统一带 `size`（字节）与 `large`（>10MB 为 true），前端据此标“较大”。
+- 附件**只存元信息**：文件名、大小（解码后准确字节数）、IMAP part 编号（取全文前先拿 `BODYSTRUCTURE`，把附件的 part 编号（`"2"`、`"1.2"`）存进 `attachments.part`）。不写磁盘、不缓存附件内容。
+- 下载时 `GET /api/messages/:id/attachments/:attId` 用 `client.download(uid, part)` 实时从 IMAP 拉、直接 `pipeline` 到浏览器响应，全程不落盘。
+- 附件元信息统一带 `size`（字节）与 `large`（恒为 false，历史字段，仅兼容）；前端不再据此标“较大”。
 
 ### 规模与技术栈
 
@@ -134,8 +126,7 @@ npm start            # node dist/server.js
   无离线降级轮询。
 - **TypeScript 严格类型**：已落地。`tsconfig.json` 开 `strict: true`，
   `npm run build`（`tsc`）零错误；类型覆盖全部模块与路由（含 imapflow /
-  better-sqlite3 / nodemailer / mailparser 的类型）；只有一处松散声明
-  （`mailcomposer.d.ts`，因 MailComposer 无官方类型）。
+  better-sqlite3 / nodemailer / mailparser 的类型，MailComposer 类型来自 @types/nodemailer）。
 - **DOMPurify 清洗已生效**：`src/sanitize.ts`，JSDOM + DOMPurify，
   禁 `style/form/input/iframe/object/embed` 等标签，去脚本、事件属性、
   `javascript:` 链接，另用 hook 删 1x1 追踪像素；验证脚本实测通过。
@@ -155,7 +146,7 @@ npm start            # node dist/server.js
 客户端授权码验证后才能算闭环（本机不向用户索要任何密码/授权码）：
 
 1. 加真实 163 邮箱：IMAP 登录 + 文件夹 LIST + 收件箱增量同步 + IDLE 新邮件推送。
-2. 打开一封真实邮件：全文拉取、DOMPurify 清洗、附件（≤10MB 落盘、>10MB 实时流）下载。
+2. 打开一封真实邮件：全文拉取、DOMPurify 清洗、附件（实时从 IMAP 流式）下载。
 3. 发一封真实邮件：Nodemailer 发送 + APPEND 副本到已发送 + 本地写库。
 4. 移动/删除/标已读等 IMAP 写操作回写服务器。
 5. 多账号（163 + QQ）同时在线、断线重连、Socket.io 实时角标。
@@ -164,8 +155,9 @@ npm start            # node dist/server.js
 
 - **systemd**（示例）：工作目录放后端根目录，`ExecStart=/usr/bin/node
   /opt/luck-mail/backend/dist/server.js`，环境 `PORT=8080
-  DATA_DIR=/opt/luck-mail/data PUBLIC_DIR=/opt/luck-mail/frontend
-  COOKIE_SECURE=1`，`Restart=always`，`User=` 用非 root 专用用户；
+  DATA_DIR=/opt/luck-mail/data PUBLIC_DIR=/opt/luck-mail/backend/public
+  KEY_FILE=/opt/luck-mail/.key COOKIE_SECURE=1 DEEPL_API_KEY=<DeepL 密钥>`，
+  `Restart=always`，`User=root`（与线上服务一致）；
   `DATA_DIR`（含 `.key`、SQLite、附件、正文）要持久化、定期备份，
   `.key` 丢了则所有已存邮箱密码无法解密（须重新添加邮箱）。
   先 `npm ci --omit=dev && npm run build`，再起服务；升级时先停服务、备份

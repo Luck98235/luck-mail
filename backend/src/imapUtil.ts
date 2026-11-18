@@ -60,11 +60,16 @@ export function makeImapClient(
     // client leaves the default (auto-IDLE on) enabled.
     disableAutoIdle: extra.disableAutoIdle ?? true,
     tls: { rejectUnauthorized: true },
+    // B10: 显式 IMAP 超时——不靠 imapflow 默认值（无响应时连接不能无限挂住，
+    // 否则 _runOp 一直等、IDLE 也永远不触发重连）。
+    socketTimeout: 120000,
+    connectionTimeout: 30000,
+    greetingTimeout: 30000,
   });
 }
 
 // Test IMAP login only (connect + ID + login, then logout). Throws on failure.
-export async function testImap(
+async function testImap(
   account: ImapAccount,
   password: string,
   logger?: unknown,
@@ -86,6 +91,13 @@ export function makeSmtpTransporter(account: ImapAccount, password: string): Tra
     port: Number(account.smtpPort) || (secure ? 465 : 587),
     secure,
     auth: { user: account.email, pass: password },
+    // B5: 连接池——每次发信不再新建连接+重新登录。单账号同时只发一封
+    // （maxConnections: 1），一个连接最多发 100 封后轮换，对服务器友好、
+    // 也不怕并发登录被限。nodemailer 6.10.1 支持 pool 选项；close() 仍
+    // 可正常关闭池（dropTransporter 已验证）。
+    pool: true,
+    maxConnections: 1,
+    maxMessages: 100,
     // Fail fast instead of hanging on a slow/unreachable server (nodemailer
     // defaults are minutes-long; the add-account form must answer quickly).
     connectionTimeout: 15000,
@@ -95,8 +107,31 @@ export function makeSmtpTransporter(account: ImapAccount, password: string): Tra
   });
 }
 
+// ---- B15: SMTP 4xx/5xx 分类（发信失败时按响应码决定重试/直接失败）----
+// nodemailer 的 SMTP 错误带 responseCode（如 421/450/550）；没有时从
+// response/message 文本里抓第一个三位数响应码；都没有返回 null。
+export function smtpResponseCode(e: unknown): number | null {
+  const err = e as { responseCode?: unknown; response?: unknown; message?: unknown };
+  if (typeof err?.responseCode === 'number') return err.responseCode;
+  const text = String(err?.response || err?.message || '');
+  const m = text.match(/(\d{3})\b/);
+  return m ? Number(m[1]) : null;
+}
+
+// 4xx = 临时拒绝（灰名单/限流/对方繁忙）：值得重试 1 次。
+export function isTransientSmtpError(e: unknown): boolean {
+  const c = smtpResponseCode(e);
+  return c !== null && c >= 400 && c < 500;
+}
+
+// 5xx = 永久拒绝（收件人不存在/内容被拒/认证错）：重试也没用，直接失败。
+export function isPermanentSmtpError(e: unknown): boolean {
+  const c = smtpResponseCode(e);
+  return c !== null && c >= 500 && c < 600;
+}
+
 // Test SMTP connectivity: TCP+TLS handshake + AUTH (verify). Throws on failure.
-export async function testSmtp(account: ImapAccount, password: string): Promise<{ ok: boolean }> {
+async function testSmtp(account: ImapAccount, password: string): Promise<{ ok: boolean }> {
   const transporter = makeSmtpTransporter(account, password);
   try {
     await transporter.verify();
@@ -137,15 +172,22 @@ export async function testConnectivity(
   return result;
 }
 
+// B2: 判断一次 IMAP/SMTP 错误是不是认证失败（密码/授权码错）。
+// imapflow 把真实结论放在 `authenticationFailed` + `responseText` 里
+// （.message 只是通用的 "Command failed"）；nodemailer 用 code EAUTH /
+// "Invalid login: 550 ..."。
+export function isAuthError(e: unknown): boolean {
+  const err = e as { message?: string; authenticationFailed?: boolean; responseText?: string; code?: string; response?: string };
+  if (err?.authenticationFailed || err?.code === 'EAUTH') return true;
+  const text = `${err?.message || ''} ${err?.responseText || ''} ${err?.response || ''}`;
+  return /Invalid login|AUTHENTICATIONFAILED|Login error/i.test(text);
+}
+
 export function readableImapError(e: unknown): string {
   const err = e as { message?: string; authenticationFailed?: boolean; responseText?: string; code?: string; response?: string };
   const msg = String(err?.message || e || '未知错误');
-  // imapflow puts the real verdict in `authenticationFailed` + `responseText`
-  // (its .message is just the generic "Command failed"); nodemailer uses
-  // code EAUTH / "Invalid login: 550 ...".
   const serverText = err?.responseText || err?.response || '';
-  if (err?.authenticationFailed || err?.code === 'EAUTH'
-    || /Invalid login|AUTHENTICATIONFAILED|Login error/i.test(msg + ' ' + serverText)) {
+  if (isAuthError(e)) {
     return `用户名或密码/授权码不正确（认证被拒${serverText ? '：' + serverText.slice(0, 120) : ''}）`;
   }
   if (/Timed out|timeout/i.test(msg)) return '连接超时（服务器无响应）';

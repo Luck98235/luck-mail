@@ -25,7 +25,7 @@ Moving to a new server? See [MIGRATION.md](MIGRATION.md).
 3. **Manage mailboxes** — a popup table: serial number, mailbox, alias (edit inline), sort order (drag to reorder), actions (**test connectivity**, settings, temporarily disable, delete). The **Test** button checks IMAP + SMTP without opening settings. Bottom bar: **+ Add mailbox** and **Export all mailboxes** (downloads a real `.xlsx` with serial, email, authorization code, IMAP/SMTP server + port, alias), count, **OK / Cancel**.
 4. **Unified inbox** — aggregate views: All Inboxes, All Unread, All Drafts, All Sent, All Trash. Click a mailbox to expand its folders and switch to its inbox. Unread counts are live.
 5. **Message list** — sender avatar, sender + time, bold subject, one-line gray snippet, red unread dot before the sender name, pink selected row. Checkboxes on hover (always visible on mobile). **Batch select + batch delete** (up to 200 at a time; trash view = permanent delete, elsewhere = move to trash). While deleting, the button counts down the remaining messages ("Deleting (15)…"), the indicator belongs only to the view where the delete started, and the list stays scrollable (viewing/selecting is locked until it finishes). **Pagination** — 50 per page, with prev/next. Your current view (aggregate or a single mailbox/folder) is restored after a refresh.
-6. **Reading pane** — sanitized HTML rendered in a sandboxed iframe. Hover the sender to copy their email address. A **Translate** button under the sender date translates English bodies to Chinese (free MyMemory service, no key); click again to return to the original. No reply-all / print / more-menu clutter.
+6. **Reading pane** — sanitized HTML rendered in a sandboxed iframe. Hover the sender to copy their email address. A **Translate** button under the sender date translates English bodies to Chinese (DeepL; key in the server env `DEEPL_API_KEY`, free keys ending `:fx` use `api-free.deepl.com`); click again to return to the original. No reply-all / print / more-menu clutter.
 7. **Compose** — subject required, attachments supported; an empty subject is auto-filled with the first attachment's filename. The sender dropdown shows serial numbers (【01】, 【02】…). Attachments are metadata-only when sent; the body lives on the mail server's Sent folder, and downloading a sent attachment streams it live from IMAP.
 8. **Themes** — six color themes (blue default, green, black-white, purple, orange, cyan) via the palette button; saved in localStorage; scrollbars follow the theme.
 9. **Search** — full-text search over subjects, senders and bodies (SQLite FTS5 trigram).
@@ -66,14 +66,6 @@ Note: ProtonMail has no direct IMAP (requires the local Proton Bridge), so no pr
 
 ## Quick start
 
-### Docker
-
-```bash
-docker compose up -d --build
-```
-
-Open http://localhost:8080. Create your login account on first use (only once — registration closes after that), then add your first mailbox.
-
 ### Manual (Node)
 
 ```bash
@@ -94,8 +86,10 @@ Environment variables:
 | `PORT` | 8080 | HTTP port |
 | `DATA_DIR` | `./data` | SQLite database, bodies, attachments |
 | `PUBLIC_DIR` | `backend/public` | Built frontend files |
-| `KEY_FILE` | `./.key` | AES-256-GCM key for mailbox passwords (0600). **If lost, stored mailbox passwords cannot be decrypted — mailboxes must be re-added.** |
+| `KEY_FILE` | `./data/.key` | AES-256-GCM key for mailbox passwords (0600). **If lost, stored mailbox passwords cannot be decrypted — mailboxes must be re-added.** |
 | `COOKIE_SECURE` | 0 | Set to `1` behind HTTPS |
+| `MAIL_PARSE_WORKER_THRESHOLD_BYTES` | `5242880` (5MB) | Bodies larger than this are parsed in a worker thread instead of the main thread |
+| `DEEPL_API_KEY` | — | DeepL API key for body translation (free keys end `:fx` and use `api-free.deepl.com`). Without it, the Translate button returns an error |
 
 Data lives in `DATA_DIR` (`luck-mail.db` + `bodies/` + `attachments/`). **Back up this directory before upgrading.**
 
@@ -121,11 +115,6 @@ frontend/                # Vue 3 + Vite + TypeScript + Pinia
     api.ts               # REST client
     realtime.ts          # Socket.io client
 API_CONTRACT.md          # backend/frontend API contract
-Dockerfile
-docker-compose.yml
-entrypoint.sh
-patches/imap-id-command.patch   # reference: the 163 IMAP ID fix (historical, SnappyMail era)
-research/                # third-party reference excerpts (Frickmail, SnappyMail), not built — see research/README.md
 LICENSE                  # AGPL-3.0
 ```
 

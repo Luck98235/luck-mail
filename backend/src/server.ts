@@ -58,7 +58,7 @@ if (fs.existsSync(indexHtml)) {
 <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:10vh auto;padding:0 20px;color:#1e293b}h1{color:#2563eb}.ok{color:#16a34a}</style></head>
 <body><h1>luck-mail 后端已启动</h1><p class="ok">● API 与 Socket.io 正常运行</p>
 <p>前端（Vite dist）尚未放入 <code>${PUBLIC_DIR}</code>，放进去后这里会自动改为前端页面。</p>
-<p>接口：<code>GET /api/auth/status</code> · <code>GET /api/status</code>（需登录）· Socket.io <code>/socket.io/</code></p></body></html>`);
+<p>接口：<code>GET /api/auth/status</code> · Socket.io <code>/socket.io/</code></p></body></html>`);
   });
 }
 
@@ -70,6 +70,20 @@ app.use('/api', (_req, res) => res.status(404).json({ ok: false, error: '接口�
 app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   log('[error]', req.method, req.path, err?.message || err);
   if (res.headersSent) return;
+  // MulterError（附件上传超限）：返回 413 + 明确文案，不要笼统 500。
+  if ((err as { name?: string }).name === 'MulterError') {
+    const code = (err as { code?: string }).code;
+    if (code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({ ok: false, error: '单个附件超过 25MB 上限' });
+      return;
+    }
+    if (code === 'LIMIT_FILE_COUNT') {
+      res.status(413).json({ ok: false, error: '附件数量超过 10 个上限' });
+      return;
+    }
+    res.status(413).json({ ok: false, error: '附件上传失败' });
+    return;
+  }
   res.status(500).json({ ok: false, error: '服务器内部错误' });
 });
 

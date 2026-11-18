@@ -18,10 +18,10 @@
           <i class="fa-solid fa-share"></i>
         </button>
         <div class="w-px h-4 bg-blue-100 mx-1"></div>
-        <button :disabled="!mail.selectedMessage" class="hover:text-red-500 hover:bg-red-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" :title="mail.isTrashView ? '彻底删除' : '删除'" @click="act('delete')">
+        <button :disabled="!mail.selectedMessage || mail.isDeletingHere" class="hover:text-red-500 hover:bg-red-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" :title="mail.isTrashView ? '彻底删除' : '删除'" @click="act('delete')">
           <i class="fa-regular fa-trash-can"></i>
         </button>
-        <button :disabled="!mail.selectedMessage" class="hover:text-amber-500 hover:bg-amber-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" title="标记为垃圾邮件" @click="act('spam')">
+        <button :disabled="!mail.selectedMessage || mail.isDeletingHere" class="hover:text-amber-500 hover:bg-amber-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" title="标记为垃圾邮件" @click="act('spam')">
           <i class="fa-solid fa-ban"></i>
         </button>
         <button :disabled="!mail.selectedMessage" class="hover:text-blue-500 hover:bg-blue-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" :title="mail.selectedMessage?.isRead ? '标为未读' : '标为已读'" @click="act('toggle-read')">
@@ -67,10 +67,11 @@
           <a
             v-for="att in mail.selectedMessage.attachments" :key="att.id"
             :href="`/api/messages/${mail.selectedMessage.id}/attachments/${att.id}`"
+            :download="att.filename" target="_blank" rel="noopener noreferrer"
             title="点击下载：从邮箱服务器实时取，不经过本项目服务器缓存"
             class="inline-flex items-center gap-1.5 text-xs border rounded-md px-2.5 py-1.5 bg-blue-50 text-blue-600 border-blue-100 hover:bg-blue-100"
           >
-            <i class="fa-solid fa-paperclip"></i>{{ att.filename }}（{{ formatSize(att.size) }}）
+            <i class="fa-solid fa-paperclip"></i>{{ att.filename }}<span v-if="att.size != null">（{{ formatSize(att.size) }}）</span>
           </a>
         </div>
         <!-- 正文用沙盒 iframe（srcdoc）渲染：洗净后的 HTML 不直接插进主应用，
@@ -95,7 +96,8 @@ import { ref, computed, watch, nextTick, onUnmounted } from 'vue'
 import { useMailStore } from '../stores/mail'
 import { useThemeStore } from '../stores/theme'
 import { api } from '../api'
-import { fmtFullTime, initialOf, formatSize } from '../utils'
+import { attachSwipeBack } from '../utils/swipeBack'
+import { fmtFullTime, initialOf, formatSize, copyText } from '../utils'
 import type { MessageDetail } from '../types'
 
 defineProps<{ showBack?: boolean }>()
@@ -122,6 +124,8 @@ async function toggleTranslate(): Promise<void> {
   translating.value = true
   try {
     const r = await api.translateMessage(m.id)
+    // 竞态：等接口回来时用户可能已切到别的邮件，若不是同一封就丢弃这次译文
+    if (mail.selectedMessage?.id !== m.id) return
     if (r.alreadyChinese) { mail.showToast('正文已经是中文，无需翻译'); return }
     translatedText.value = r.translated
     showingTranslation.value = true
@@ -138,20 +142,8 @@ let senderCopyTimer: ReturnType<typeof setTimeout> | null = null
 async function copySender(): Promise<void> {
   const m = mail.selectedMessage
   if (!m?.from) return
-  const text = m.from
-  try {
-    await navigator.clipboard.writeText(text)
-  } catch {
-    // 剪贴板 API 不可用时回落到临时 textarea + execCommand
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    try { document.execCommand('copy') } catch { /* 忽略 */ }
-    ta.remove()
-  }
+  const ok = await copyText(m.from)
+  if (!ok) { mail.showToast('复制失败，请重试'); return }
   senderCopied.value = true
   if (senderCopyTimer) clearTimeout(senderCopyTimer)
   senderCopyTimer = setTimeout(() => { senderCopied.value = false }, 1500)
@@ -194,6 +186,7 @@ const srcdocHtml = computed<string>(() => {
 
 let bodyObserver: ResizeObserver | null = null
 let remeasureTimers: ReturnType<typeof setTimeout>[] = []
+let detachFrameSwipe: (() => void) | null = null
 
 // 正文 iframe 高度：多取几个量取最大，避免个别浏览器在手机上量不准导致底部被截。
 function measureDocHeight(doc: Document): number {
@@ -231,6 +224,15 @@ function setupFrame(): void {
   doc.querySelectorAll('img').forEach((img) => {
     if (!img.complete) img.addEventListener('load', resizeFrame, { once: true })
   })
+  // 手机/平板：邮件正文 iframe 里右滑返回上一屏（阅读 → 列表）。
+  // iframe 是独立文档，主应用的触摸监听收不到里面的手势，必须直接挂在 iframe 的 document 上。
+  // sandbox 有 allow-same-origin，父页面能访问 contentDocument；不改 sandbox、不往正文里注脚本。
+  // 只在手机/平板挂（桌面端 ReadingPane 也用同一组件，但桌面没有 mview 导航）。
+  detachFrameSwipe?.()
+  detachFrameSwipe = null
+  if (window.innerWidth < 1024) {
+    detachFrameSwipe = attachSwipeBack(doc, () => mail.goMobileBack())
+  }
   // 延迟复量：字体、图片晚到会引起重排，load 时量的高度可能偏小。
   remeasureTimers.forEach((t) => clearTimeout(t))
   remeasureTimers = [300, 1200].map((ms) => setTimeout(resizeFrame, ms))
@@ -239,6 +241,8 @@ function setupFrame(): void {
 onUnmounted(() => {
   bodyObserver?.disconnect()
   remeasureTimers.forEach((t) => clearTimeout(t))
+  detachFrameSwipe?.()
+  detachFrameSwipe = null
 })
 
 watch(() => mail.selectedMessage?.id, () => {
@@ -249,10 +253,22 @@ watch(() => mail.selectedMessage?.id, () => {
   void nextTick(setupFrame)
 })
 
+// 单封删除先弹确认（批量删除已在 store 里走 requestConfirm；
+// 这里与 store 共用同一个 requestConfirm，走覆盖保护：上一个确认框
+// 没点就来了新的，旧的按“取消” resolve，不会卡住调用方）。
+async function confirmDelete(): Promise<boolean> {
+  const msg = mail.isTrashView
+    ? '确定彻底删除这封邮件吗？彻底删除后不可恢复。'
+    : '确定删除这封邮件吗？将移到已删除。'
+  return mail.requestConfirm(msg, true)
+}
+
 function act(kind: 'reply' | 'forward' | 'delete' | 'spam' | 'toggle-read'): void {
   const m = mail.selectedMessage
   if (!m) return
-  if (kind === 'delete') void mail.deleteMessage(m.id)
+  if (kind === 'delete') {
+    void confirmDelete().then((ok) => { if (ok) void mail.deleteMessage(m.id) })
+  }
   else if (kind === 'spam') void mail.moveToSpam(m.id)
   else if (kind === 'toggle-read') void mail.setRead(m.id, !m.isRead)
   else if (kind === 'reply') emit('reply', m)

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 
 export interface ThemeDef { key: string; name: string; color: string }
 
@@ -33,23 +33,22 @@ export const useThemeStore = defineStore('theme', () => {
   const panelOpen = ref<boolean>(false)
   const panelPos = ref<{ left: number; top: number }>({ left: 0, top: 0 })
 
-  function openPanel(anchor: HTMLElement | null): void {
+  async function openPanel(anchor: HTMLElement | null): Promise<void> {
     if (!anchor) return
-    // 先显示再量尺寸定位（与旧版 app.js 的 positionPanel 一致）
+    // 先显示，等 Vue 把面板挂进 DOM 后再量尺寸定位
     panelOpen.value = true
-    requestAnimationFrame(() => {
-      const panel = document.getElementById('theme-panel')
-      const pw = panel ? panel.offsetWidth : 208
-      const ph = panel ? panel.offsetHeight : 200
-      const r = anchor.getBoundingClientRect()
-      let left = r.right + 8
-      let top = r.bottom - ph
-      if (left + pw > window.innerWidth - 8) left = r.left - pw - 8
-      if (left < 8) left = Math.max(8, (window.innerWidth - pw) / 2)
-      if (top < 8) top = 8
-      if (top + ph > window.innerHeight - 8) top = Math.max(8, window.innerHeight - ph - 8)
-      panelPos.value = { left, top }
-    })
+    await nextTick()
+    const panel = document.getElementById('theme-panel')
+    const pw = panel ? panel.offsetWidth : 208
+    const ph = panel ? panel.offsetHeight : 200
+    const r = anchor.getBoundingClientRect()
+    let left = r.right + 8
+    let top = r.bottom - ph
+    if (left + pw > window.innerWidth - 8) left = r.left - pw - 8
+    if (left < 8) left = Math.max(8, (window.innerWidth - pw) / 2)
+    if (top < 8) top = 8
+    if (top + ph > window.innerHeight - 8) top = Math.max(8, window.innerHeight - ph - 8)
+    panelPos.value = { left, top }
   }
 
   function closePanel(): void { panelOpen.value = false }

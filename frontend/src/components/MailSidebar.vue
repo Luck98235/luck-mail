@@ -11,7 +11,7 @@
       <button id="btn-compose" class="flex-1 bg-blue-500 hover:bg-blue-600 text-white py-2 rounded-md flex items-center justify-center gap-2 shadow-sm transition-colors font-medium text-sm" @click="$emit('compose')">
         <i class="fa-solid fa-pen"></i> 写信
       </button>
-      <button id="btn-refresh-all" class="w-9 shrink-0 bg-white hover:bg-blue-50 text-blue-500 border border-blue-200 rounded-lg flex items-center justify-center shadow-sm transition-colors" title="全部刷新" @click="mail.refreshAll()">
+      <button id="btn-refresh-all" class="w-9 shrink-0 bg-white hover:bg-blue-50 text-blue-500 border border-blue-200 rounded-lg flex items-center justify-center shadow-sm transition-colors disabled:opacity-40" :disabled="mail.refreshingAll" title="全部刷新" @click="mail.refreshAll()">
         <i class="fa-solid fa-arrow-rotate-left" :class="{ 'fa-spin': mail.refreshingAll }"></i>
       </button>
     </div>
@@ -44,8 +44,8 @@
         <div class="space-y-0.5 text-sm" id="account-list">
           <div v-for="(a, idx) in mail.accounts" :key="a.id" class="acct-item" :class="{ expanded: mail.expanded.has(a.id) }">
             <!-- 点邮箱行：未展开时展开 + 切单邮箱收件箱，已展开时再点折叠；点 `>`：只展开/折叠 -->
-            <div class="acct-row group flex items-center gap-2 px-2 py-1.5 text-slate-700 hover:bg-blue-100/50 rounded cursor-pointer" @click="mail.selectAccount(a.id)">
-              <i class="fa-solid fa-chevron-right w-3 text-[10px] text-slate-400 cursor-pointer" title="展开/折叠文件夹" @click.stop="mail.toggleAccountExpand(a.id)"></i>
+            <div class="acct-row group flex items-center gap-2 px-2 py-1.5 text-slate-700 hover:bg-blue-100/50 rounded cursor-pointer" @click="onAccountRow(a.id)">
+              <i class="fa-solid fa-chevron-right w-3 text-[10px] text-slate-400 cursor-pointer" title="展开/折叠文件夹" @click.stop="onToggleExpand(a.id)"></i>
               <span class="w-5 shrink-0 text-right text-[11px] text-slate-400">{{ String(idx + 1).padStart(2, '0') }}</span>
               <span class="w-4 h-4 rounded-full text-white flex items-center justify-center text-[8px] font-bold shrink-0" :style="{ background: domainColor(a.email) }">{{ domainShort(a.email) }}</span>
               <span class="truncate" :title="a.email" :class="{ 'opacity-50': a.enabled === false }">{{ a.displayName || a.email }}</span>
@@ -68,7 +68,7 @@
                 <span class="truncate text-xs">{{ f.name }}</span>
                 <span v-if="mail.unreadOfFolder(a.id, f.id) > 0" class="text-red-500 font-bold text-[10px] ml-auto">({{ mail.unreadOfFolder(a.id, f.id) }})</span>
               </div>
-              <div v-if="mail.expanded.has(a.id) && !(mail.foldersByAccount[a.id] || []).length" class="px-2 py-1 text-[11px] text-slate-400">文件夹同步中…</div>
+              <div v-if="mail.expanded.has(a.id) && !(mail.foldersByAccount[a.id] || []).length" class="px-2 py-1 text-[11px]" :class="foldersFailed.has(a.id) ? 'text-red-400 cursor-pointer' : 'text-slate-400'" @click="onFoldersHintClick(a.id)">{{ foldersFailed.has(a.id) ? '文件夹加载失败，点这里重试' : (mail.foldersByAccount[a.id] ? '暂无文件夹' : '文件夹同步中…') }}</div>
             </div>
           </div>
         </div>
@@ -93,7 +93,7 @@
 import { ref } from 'vue'
 import { useMailStore, AGGREGATES, folderIcon } from '../stores/mail'
 import { useThemeStore } from '../stores/theme'
-import { domainColor, domainShort } from '../utils'
+import { domainColor, domainShort, copyText } from '../utils'
 import type { Account } from '../types'
 
 defineEmits(['compose', 'manage', 'settings', 'logout'])
@@ -109,23 +109,44 @@ const copiedId = ref<number | null>(null)
 let copiedTimer: ReturnType<typeof setTimeout> | null = null
 
 async function copyEmail(a: Account): Promise<void> {
-  const text = a.email
-  try {
-    await navigator.clipboard.writeText(text)
-  } catch {
-    // 剪贴板 API 不可用时回落到临时 textarea + execCommand
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    try { document.execCommand('copy') } catch { /* 忽略 */ }
-    document.body.removeChild(ta)
-  }
+  const ok = await copyText(a.email)
+  if (!ok) { mail.showToast('复制失败，请重试'); return }
   copiedId.value = a.id
   if (copiedTimer) clearTimeout(copiedTimer)
   copiedTimer = setTimeout(() => { copiedId.value = null }, 1500)
+}
+
+// 文件夹加载失败标记：store 的 loadFolders 失败时不写缓存（foldersByAccount[id]
+// 仍是 undefined），成功（即使零个文件夹）也会写进一个数组；展开后用这个区分
+// “加载失败”和“确实无文件夹”，别让失败也一直显示“同步中…”。
+const foldersFailed = ref<Set<number>>(new Set())
+function setFoldersFailed(id: number, failed: boolean): void {
+  const next = new Set(foldersFailed.value)
+  if (failed) next.add(id)
+  else next.delete(id)
+  foldersFailed.value = next
+}
+function checkFoldersAfterLoad(id: number): void {
+  setFoldersFailed(id, mail.foldersByAccount[id] === undefined)
+}
+async function onAccountRow(id: number): Promise<void> {
+  const wasExpanded = mail.expanded.has(id)
+  await mail.selectAccount(id)
+  if (!wasExpanded && mail.expanded.has(id)) checkFoldersAfterLoad(id)
+  else if (wasExpanded) setFoldersFailed(id, false)
+}
+async function onToggleExpand(id: number): Promise<void> {
+  const wasExpanded = mail.expanded.has(id)
+  await mail.toggleAccountExpand(id)
+  if (!wasExpanded && mail.expanded.has(id)) checkFoldersAfterLoad(id)
+  else if (wasExpanded) setFoldersFailed(id, false)
+}
+async function retryFolders(id: number): Promise<void> {
+  await mail.loadFolders(id, true)
+  checkFoldersAfterLoad(id)
+}
+function onFoldersHintClick(id: number): void {
+  if (foldersFailed.value.has(id)) void retryFolders(id)
 }
 
 function isAggregateActive(kind: string): boolean {

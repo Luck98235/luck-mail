@@ -4,7 +4,7 @@
              → account（邮箱内：顶部切换账号 + 收件箱/未读/管理页签 + 侧滑文件夹菜单 + 列表）
              → read（阅读窗）
        平板 768–1024px：左栏固定为账号总览，右栏为列表/阅读窗；手机 <768px：单栏逐级钻取。 -->
-  <div class="mobile-shell" :data-mview="mail.mview">
+  <div ref="shellRef" class="mobile-shell" :data-mview="mail.mview">
     <!-- ===== 账号总览 ===== -->
     <div class="m-home flex-col bg-white overflow-y-auto">
       <!-- 账号头 -->
@@ -19,7 +19,7 @@
           </div>
           <div class="text-[13px] text-slate-400 truncate mt-0.5">{{ defaultAccountEmail || '还没有邮箱账号' }}</div>
         </div>
-        <button class="w-9 h-9 rounded-full text-blue-500 hover:bg-blue-50 flex items-center justify-center shrink-0" title="刷新全部邮箱" @click="mail.refreshAll()">
+        <button class="w-9 h-9 rounded-full text-blue-500 hover:bg-blue-50 flex items-center justify-center shrink-0 disabled:opacity-40" :disabled="mail.refreshingAll" title="刷新全部邮箱" @click="mail.refreshAll()">
           <i class="fa-solid fa-arrow-rotate-left text-lg" :class="{ 'fa-spin': mail.refreshingAll }"></i>
         </button>
         <button class="w-9 h-9 rounded-full text-slate-400 hover:bg-slate-100 flex items-center justify-center shrink-0" title="退出登录" @click="$emit('logout')">
@@ -61,7 +61,7 @@
         <button
           v-for="a in mail.accounts" :key="a.id"
           class="w-full flex items-center gap-3.5 px-3 py-3 rounded-lg text-left hover:bg-blue-50/50"
-          @click="mail.enterMobileAccount(a.id)"
+          @click="enterAccount(a.id)"
         >
           <span class="w-9 h-9 rounded-full text-white flex items-center justify-center text-xs font-bold shrink-0" :style="{ background: domainColor(a.email) }">{{ domainShort(a.email) }}</span>
           <span class="flex-1 text-[15px] text-slate-800 truncate">{{ a.displayName || a.email }}</span>
@@ -78,7 +78,7 @@
       <div class="m-list flex-col">
         <!-- 顶部：返回 + 切换账号 + 写信 -->
         <div class="flex items-center gap-2 h-14 px-3 border-b border-slate-100 shrink-0 relative">
-          <button class="w-9 h-9 flex items-center justify-center text-slate-500 md:hidden" aria-label="返回账号总览" @click="mail.goMobileHome()">
+          <button class="w-9 h-9 flex items-center justify-center text-slate-500 md:hidden" aria-label="返回账号总览" @click="mail.goMobileBack()">
             <i class="fa-solid fa-chevron-left"></i>
           </button>
           <button class="flex-1 flex items-center justify-center gap-1.5 font-bold text-slate-800 truncate" @click="switcherOpen = !switcherOpen">
@@ -117,7 +117,7 @@
 
       <!-- 阅读窗 -->
       <div class="m-reading flex-col">
-        <ReadingPane show-back class="flex-1" @back="mail.mview = 'account'" @reply="(m) => $emit('reply', m)" @forward="(m) => $emit('forward', m)" />
+        <ReadingPane show-back class="flex-1" @back="mail.goMobileBack()" @reply="(m) => $emit('reply', m)" @forward="(m) => $emit('forward', m)" />
       </div>
     </div>
 
@@ -163,10 +163,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useMailStore, AGGREGATES, folderIcon } from '../stores/mail'
 import { initialOf, domainColor, domainShort } from '../utils'
+import { attachSwipeBack } from '../utils/swipeBack'
 import type { Folder } from '../types'
 import MessageList from './MessageList.vue'
 import ReadingPane from './ReadingPane.vue'
@@ -177,6 +178,15 @@ const mail = useMailStore()
 
 const homeQ = ref<string>('')
 const switcherOpen = ref<boolean>(false)
+const shellRef = ref<HTMLElement | null>(null)
+
+// 手机/平板右滑返回上一屏（2026-11-18）：挂在 MobileShell 根元素上，
+// 覆盖首页、列表、阅读窗顶栏等主文档区域；邮件正文在 iframe 里，另见 ReadingPane。
+let detachSwipe: (() => void) | null = null
+onMounted(() => {
+  if (shellRef.value) detachSwipe = attachSwipeBack(shellRef.value, () => mail.goMobileBack())
+})
+onUnmounted(() => { detachSwipe?.(); detachSwipe = null })
 
 const defaultAccountEmail = computed(() => {
   const d = mail.accounts.find((a) => a.id === mail.settings.defaultAccountId)
@@ -212,8 +222,13 @@ function aggColor(kind: string): string {
   return { 'all-inbox': '#f59e0b', 'all-unread': '#3b82f6', 'all-drafts': '#64748b', 'all-sent': '#22c55e', 'all-trash': '#ef4444' }[kind] || '#3b82f6'
 }
 
-function searchFromHome(): void {
+async function searchFromHome(): Promise<void> {
   if (!homeQ.value.trim()) return
+  // 首页搜 = 全局搜：先切到“所有收件箱”，否则搜的是上次停留的视图
+  //（可能只是某一个邮箱），用户在首页搜时期望的是全部邮箱。
+  // 必须 await：setAggregate 末尾会 loadMessages，不等它完成就 setSearch，
+  // 两次加载会竞态，后返回的那次会把搜索结果冲掉。
+  await mail.setAggregate('all-inbox')
   mail.setSearch(homeQ.value.trim())
   mail.mview = 'account'
 }
@@ -223,9 +238,24 @@ function pickAccount(id: number | null): void {
   if (id == null) {
     mail.setMobileAccount(null)
     void mail.setAggregate('all-inbox')
+  } else if (mail.expanded.has(id)) {
+    // 已展开：切到该邮箱收件箱，不折叠（与 enterAccount 同一路）
+    void enterAccount(id)
   } else {
     void mail.selectAccount(id)
   }
+}
+
+// 点“我的邮箱”里的邮箱：未展开时展开 + 切单邮箱收件箱（走 enterMobileAccount）；
+// 已展开时再点仍切到该邮箱的收件箱视图，不折叠（折叠只留给行首 >）。
+// 否则第二次点同一邮箱会直接折叠、视图不动，看起来像“没反应”。
+async function enterAccount(id: number): Promise<void> {
+  if (!mail.expanded.has(id)) { mail.enterMobileAccount(id); return }
+  await mail.loadFolders(id)
+  const fid = mail.inboxFolderId(id)
+  const inbox = (mail.foldersByAccount[id] || []).find((f) => f.id === fid) || null
+  if (!inbox) { mail.showToast('文件夹同步中，请稍后再试'); return }
+  await mail.setFolderView(id, inbox)
 }
 
 async function openDrawer(): Promise<void> {

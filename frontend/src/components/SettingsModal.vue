@@ -24,7 +24,7 @@
           <div class="space-y-2">
             <!-- 诱饵用户名框：浏览器打开设置时要找个地方填用户名，没有它就会把用户名填进外面的搜索框 -->
             <input type="text" name="username" autocomplete="username" :value="auth.username" tabindex="-1" aria-hidden="true" class="absolute opacity-0 pointer-events-none h-0 w-0">
-            <input v-model="current" :type="showCurrent ? 'text' : 'password'" name="current-password" autocomplete="current-password" placeholder="当前密码" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
+            <input v-model="current" type="password" name="current-password" autocomplete="current-password" placeholder="当前密码" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
             <input v-model="next" :type="showNext ? 'text' : 'password'" name="new-password" autocomplete="new-password" placeholder="新密码（至少 8 位）" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
             <input v-model="confirm" :type="showNext ? 'text' : 'password'" name="new-password-confirm" autocomplete="new-password" placeholder="确认新密码" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
             <div class="flex items-center justify-between">
@@ -72,10 +72,11 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { api, ApiError } from '../api'
+import { downloadBlob } from '../utils'
 import { useAuthStore } from '../stores/auth'
 import { useMailStore } from '../stores/mail'
 
-const props = defineProps({ open: { type: Boolean, default: false }, openPassword: { type: Boolean, default: false } })
+const props = defineProps({ open: { type: Boolean, default: false } })
 const emit = defineEmits(['close'])
 const auth = useAuthStore()
 const mail = useMailStore()
@@ -87,7 +88,6 @@ const nameOk = ref<boolean>(false)
 const current = ref<string>('')
 const next = ref<string>('')
 const confirm = ref<string>('')
-const showCurrent = ref<boolean>(false)
 const showNext = ref<boolean>(false)
 const pwBusy = ref<boolean>(false)
 const pwMsg = ref<string>('')
@@ -104,11 +104,16 @@ watch(() => props.open, (v) => {
   if (!v) return
   username.value = auth.username || ''
   nameMsg.value = ''
+  nameOk.value = false
   current.value = ''
   next.value = ''
   confirm.value = ''
+  showNext.value = false
   pwMsg.value = ''
+  pwOk.value = false
   error.value = ''
+  backupMsg.value = ''
+  backupOk.value = false
   defaultAccountId.value = mail.settings.defaultAccountId ?? null
   signature.value = mail.settings.signature || ''
 })
@@ -159,14 +164,7 @@ async function downloadBackup(): Promise<void> {
   backupBusy.value = true
   try {
     const { blob, filename } = await api.downloadBackup()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    setTimeout(() => URL.revokeObjectURL(url), 5000)
+    downloadBlob(blob, filename)
     backupOk.value = true
     backupMsg.value = `备份已开始下载（${filename}），请妥善保存。`
   } catch (e) {
@@ -180,6 +178,13 @@ async function save(): Promise<void> {
   error.value = ''
   busy.value = true
   try {
+    // 用户名改了但没点旁边的“保存”：确定时一并提交，避免悄悄丢掉
+    const name = username.value.trim()
+    if (name && name !== auth.username) {
+      if (name.includes('@')) { error.value = '用户名不要带邮箱后缀。'; return }
+      await changeUsername()
+      if (!nameOk.value) { error.value = nameMsg.value || '用户名保存失败。'; return }
+    }
     await api.updateSettings({ signature: signature.value, defaultAccountId: defaultAccountId.value })
     mail.settings = { signature: signature.value, defaultAccountId: defaultAccountId.value }
     mail.showToast('设置已保存')

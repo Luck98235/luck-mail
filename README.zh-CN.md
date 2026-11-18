@@ -24,7 +24,7 @@
 3. **邮箱管理** — 弹出框表格：序号、邮箱、备注名（框里直接改，就是别名）、排序（拖拽）、操作（**测试**、邮箱设置、临时停用、删除邮箱）。**测试**按钮不用进设置就能测 IMAP + SMTP 通不通。底部：**+ 添加邮箱**和**导出全部邮箱**（下载真 `.xlsx`，含序号、邮箱名、授权码、IMAP/SMTP 服务器 + 端口、备注）、数量显示、**确定 / 取消**。
 4. **统一收件箱** — 聚合视图：所有收件箱、所有未读、所有草稿、所有已发送、所有已删除。点邮箱展开文件夹并切到该邮箱收件箱。未读数实时更新。
 5. **邮件列表** — 发件人头像、发件人 + 时间、加粗主题、灰色单行摘要、发件人名前红点未读、选中行浅粉底。复选框悬停出现（手机端常显）。**批量勾选 + 批量删除**（一次最多 200 封；已删除里是彻底删除，其他地方是移入已删除）。删除时按钮倒数剩余数（“删除中（15）…”），提示只属于发起删除的那个视图，列表可滚动（查看/勾选锁定到删完）。**分页** — 每页 50 条，上一页 / 下一页。刷新后回到删除前所在的视图。
-6. **阅读窗** — 消毒后的 HTML 在沙盒 iframe 里渲染。发件人悬停出现复制按钮，点一下复制发件人邮箱。发件人日期下面有个**翻译**按钮，点一下英文翻中文，再点回原文（免费 MyMemory 接口，不用密钥）。没有回复全部 / 打印 / 三个点的杂项。
+6. **阅读窗** — 消毒后的 HTML 在沙盒 iframe 里渲染。发件人悬停出现复制按钮，点一下复制发件人邮箱。发件人日期下面有个**翻译**按钮，点一下英文翻中文，再点回原文（DeepL，密钥放服务器环境变量 `DEEPL_API_KEY`，免费 Key 以 `:fx` 结尾、走 `api-free.deepl.com`）。没有回复全部 / 打印 / 三个点的杂项。
 7. **写信** — 主题必填，支持附件；主题为空时自动用第一个附件的文件名填充。发件人下拉列表带序号（【01】、【02】…）。发信附件只记元信息，本体只存邮箱服务器的已发送文件夹，下载已发附件时从 IMAP 实时取。
 8. **配色** — 6 种配色（蓝默认、绿、黑白、紫、橙、青），点调色板切换，localStorage 记住选择，滚动条跟着变色。
 9. **搜索** — 全文搜索主题、发件人、正文（SQLite FTS5 trigram）。
@@ -65,14 +65,6 @@
 
 ## 快速开始
 
-### Docker
-
-```bash
-docker compose up -d --build
-```
-
-打开 [http://localhost:8080](http://localhost:8080)。首次使用先创建一个登录账号（只允许创建一次，之后注册入口关闭），然后添加第一个邮箱。
-
 ### 手动跑（Node）
 
 ```bash
@@ -93,8 +85,10 @@ PORT=8080 DATA_DIR=/path/to/data PUBLIC_DIR=backend/public KEY_FILE=/path/to/.ke
 | `PORT` | 8080 | HTTP 端口 |
 | `DATA_DIR` | `./data` | SQLite 数据库、正文、附件 |
 | `PUBLIC_DIR` | `backend/public` | 构建好的前端文件 |
-| `KEY_FILE` | `./.key` | AES-256-GCM 密钥（邮箱密码加密用，0600）。**丢了则已存邮箱密码无法解密，须重新添加邮箱。** |
+| `KEY_FILE` | `./data/.key` | AES-256-GCM 密钥（邮箱密码加密用，0600）。**丢了则已存邮箱密码无法解密，须重新添加邮箱。** |
 | `COOKIE_SECURE` | 0 | HTTPS 后面设为 `1` |
+| `MAIL_PARSE_WORKER_THRESHOLD_BYTES` | `5242880`（5MB） | 正文超过这个大小时扔到 worker 线程里解析，不占主线程 |
+| `DEEPL_API_KEY` | — | DeepL 翻译密钥（正文翻译用；免费 Key 以 `:fx` 结尾、走 `api-free.deepl.com`）。不配则翻译按钮报错 |
 
 数据在 `DATA_DIR` 里（`luck-mail.db` + `bodies/` + `attachments/`）。**升级前先备份这个目录。**
 
@@ -120,11 +114,6 @@ frontend/                # Vue 3 + Vite + TypeScript + Pinia
     api.ts               # REST 客户端
     realtime.ts          # Socket.io 客户端
 API_CONTRACT.md          # 前后端 API 合同
-Dockerfile
-docker-compose.yml
-entrypoint.sh
-patches/imap-id-command.patch   # 参考：163 IMAP ID 补丁（SnappyMail 时期的历史记录）
-research/                # 第三方参考代码（Frickmail、SnappyMail），不参与构建——见 research/README.md
 LICENSE                  # AGPL-3.0
 ```
 

@@ -29,6 +29,7 @@ export function createMockServer() {
   let loggedIn = false
   let connections = 0
   let ioRef = null
+  let deleteShouldFail = false // 冒烟测试开关：打开后 DELETE /api/messages/:id 一律 500（行仍在）
 
   const accountsState = [
     { id: 1, email: 'zm235@163.com', displayName: '', imapHost: 'imap.163.com', imapPort: 993, imapSecure: 'SSL', smtpHost: 'smtp.163.com', smtpPort: 465, smtpSecure: 'SSL', enabled: true, sortOrder: 0, status: 'online', unreadCount: 0, lastSyncAt: new Date().toISOString() },
@@ -116,11 +117,23 @@ export function createMockServer() {
       return send(200, { ok: true })
     }
     if (msgMatch && req.method === 'DELETE') {
+      // 冒烟测试的“删除返回错误”分支（F13）：行仍在、不发 Socket.io 事件，
+      // 由 smoke.mjs 用 setDeleteFail(true) 打开、用完再关。
+      if (deleteShouldFail) return send(500, { ok: false, error: '删除失败，请重试' })
       const idx = messages.findIndex((x) => x.id === Number(msgMatch[1]))
       if (idx >= 0) messages.splice(idx, 1)
       return send(200, { ok: true })
     }
-    if (url.pathname === '/api/messages/send' && req.method === 'POST') return send(201, { ok: true, id: 99, messageId: '<mock@local>' })
+    if (url.pathname === '/api/messages/send' && req.method === 'POST') {
+      // 发信成功后把已发送副本记进 mock 数据：前端切到所有已发送后能看到它，
+      // 再按 201 返回的 id 打开（F2 的 openMessage(sent.id) 走 GET /api/messages/100）。
+      // id 用 100，避免与 Socket.io 推送的新邮件（id 99）撞号。
+      const sent = { id: 100, accountId: 1, accountEmail: 'zm235@163.com', folderId: 13, folderPath: '已发送', uid: 103, subject: body?.subject || '（无主题）', from: 'zm235@163.com', fromName: '', to: Array.isArray(body?.to) ? body.to : [body?.to || 'a@example.com'], date: new Date().toISOString(), snippet: body?.text || '', isRead: true, hasAttachments: false, size: 90 }
+      const existing = messages.findIndex((x) => x.id === 100)
+      if (existing >= 0) messages[existing] = sent
+      else messages.push(sent)
+      return send(201, { ok: true, id: 100, messageId: '<mock@local>' })
+    }
 
     // ---- 静态文件（dist，SPA fallback） ----
     let file = path.join(DIST, url.pathname === '/' || url.pathname === '/login' ? 'index.html' : decodeURIComponent(url.pathname))
@@ -148,6 +161,7 @@ export function createMockServer() {
   return {
     log,
     messages,
+    setDeleteFail(v) { deleteShouldFail = !!v },
     get connections() { return connections },
     get loggedIn() { return loggedIn },
     emitNewMail(payload) { ioRef.emit('new-mail', payload) },

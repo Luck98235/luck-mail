@@ -5,7 +5,7 @@
       <div class="font-bold text-slate-700 text-base truncate">{{ mail.view.label }}</div>
       <div class="flex items-center gap-3 text-slate-400">
         <span v-if="mail.isDeletingHere" class="flex items-center gap-1 text-xs text-red-500 font-normal shrink-0"><i class="fa-solid fa-circle-notch fa-spin"></i>{{ mail.deleteRemaining > 0 ? `删除中（${mail.deleteRemaining}）` : '删除中…' }}</span>
-        <i class="fa-solid fa-rotate-right cursor-pointer hover:text-blue-500 transition-colors" title="刷新" @click="mail.refreshAll()"></i>
+        <i class="fa-solid fa-rotate-right cursor-pointer hover:text-blue-500 transition-colors" :class="{ 'opacity-40 pointer-events-none': mail.refreshingAll }" title="刷新" @click="mail.refreshAll()"></i>
       </div>
     </div>
 
@@ -35,6 +35,10 @@
         <button v-if="mail.checkedCount > 0" class="text-slate-500 hover:text-slate-700" @click="mail.clearChecked()">取消</button>
       </div>
     </div>
+
+    <!-- 加载指示：列表非空时也显示（审计 #4 主修加固）——切视图时旧列表已清，
+         空列表走下面的“加载中…”；搜索/翻页不适合清列表，靠这条细提示表明正在加载 -->
+    <div v-if="mail.loading && mail.mailList.length" class="px-3 py-1.5 text-center text-xs text-blue-500 bg-blue-50/60 border-b border-blue-100">加载中…</div>
 
     <!-- 邮件列表（虚拟滚动：只渲染可视窗口内的行；账号树不用虚拟滚动） -->
     <!-- 删除中：列表半透明示意、仍可滚动；查看（openMessage）与勾选（toggleCheck/toggleCheckAll）
@@ -122,6 +126,11 @@ const searchFocused = ref<boolean>(false)
 
 let timer: ReturnType<typeof setTimeout> | null = null
 watch(q, (v) => {
+  // 同步回写不触发搜索：桌面与移动两个 MessageList 实例同时挂载，
+  // 一个实例输入后 setSearch 改了 mail.searchQuery，另一实例的回写 watcher
+  // 把 q 设成同一值；若这里不跳过，防抖回调会再发一次搜索请求。
+  // 切视图时 store 会清 searchQuery，回写值与当前 q 一致时同样跳过，不重复加载。
+  if (v === mail.searchQuery) return
   if (timer) clearTimeout(timer)
   timer = setTimeout(() => mail.setSearch(v), 300) // 输入防抖 300ms，走 q（FTS5）
 })
@@ -176,11 +185,14 @@ onUnmounted(() => {
   if (ro) { ro.disconnect(); ro = null }
 })
 
-// 切视图时回到顶部
-watch(() => mail.view, () => {
+// 切视图 / 翻页 / 搜索后回到顶部（列表内容换了，停在半截会看错页）
+function scrollToTop(): void {
   if (scrollEl.value) scrollEl.value.scrollTop = 0
   scrollTop.value = 0
-})
+}
+watch(() => mail.view, scrollToTop)
+watch(() => mail.page, scrollToTop)
+watch(() => mail.searchQuery, scrollToTop)
 
 // 列表数据变化后重测可视高度（手机端切进未读视图时数据刚回来、布局刚展开，
 // 靠这次重测量到真实高度；nextTick 等 DOM 落定后再量）。

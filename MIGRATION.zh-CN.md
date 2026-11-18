@@ -59,7 +59,7 @@ sudo tar -czf luck-mail-backup-$(date +%Y%m%d).tar.gz -C /opt/luck-mail .key dat
 scp luck-mail-backup-*.tar.gz root@<新服务器>:/tmp/
 ```
 
-整个数据目录很小（2026-11-17 时 27 个邮箱、374 封邮件，一共 5.5MB），
+整个数据目录很小（截至 2026-11-17 的参考值：27 个邮箱、374 封邮件，一共 5.5MB），
 每天备一份也不贵。备份要放在**服务器之外**的地方。
 
 ## 迁移步骤（在新服务器上）
@@ -112,6 +112,7 @@ Environment=DATA_DIR=/opt/luck-mail/data
 Environment=PUBLIC_DIR=/opt/luck-mail/backend/public
 Environment=KEY_FILE=/opt/luck-mail/.key
 Environment=COOKIE_SECURE=1
+Environment=DEEPL_API_KEY=<DeepL 密钥>
 Restart=always
 RestartSec=5
 

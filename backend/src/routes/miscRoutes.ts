@@ -7,33 +7,16 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getDb } from '../db.js';
 import { ATTACHMENTS_DIR, BODIES_DIR, KEY_FILE } from '../config.js';
-import type { AccountRow } from '../db.js';
 
 const execFileAsync = promisify(execFile);
 
 export function miscRoutes(): express.Router {
   const r = express.Router();
 
-  r.get('/status', (_req: Request, res: Response) => {
-    const db = getDb();
-    const rows = db.prepare('SELECT * FROM accounts ORDER BY sort_order, id').all() as AccountRow[];
-    res.json({
-      ok: true,
-      accounts: rows.map((row) => ({
-        id: row.id,
-        email: row.email,
-        status: row.status || 'offline',
-        lastSyncAt: row.last_sync_at || null,
-        ...(row.error ? { error: row.error } : {}),
-      })),
-      serverTime: new Date().toISOString(),
-    });
-  });
+  const get = (k: string): string | null =>
+    (getDb().prepare('SELECT value FROM settings WHERE key=?').get(k) as { value: string } | undefined)?.value ?? null;
 
   r.get('/settings', (_req: Request, res: Response) => {
-    const db = getDb();
-    const get = (k: string): string | null =>
-      (db.prepare('SELECT value FROM settings WHERE key=?').get(k) as { value: string } | undefined)?.value ?? null;
     const defaultAccountId = get('defaultAccountId');
     res.json({
       ok: true,
@@ -58,8 +41,6 @@ export function miscRoutes(): express.Router {
       const v = b.defaultAccountId === null || b.defaultAccountId === '' ? '' : String(Number(b.defaultAccountId));
       put('defaultAccountId', v);
     }
-    const get = (k: string): string | null =>
-      (db.prepare('SELECT value FROM settings WHERE key=?').get(k) as { value: string } | undefined)?.value ?? null;
     const defaultAccountId = get('defaultAccountId');
     res.json({
       ok: true,

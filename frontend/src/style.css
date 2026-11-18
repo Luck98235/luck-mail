@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /* Luck-Mail — Vue 版样式：Tailwind 本地构建 + 主题变量（由 body[data-theme] 驱动） */
-/* 桌面 >1024px：完整 4 栏（与旧版一致）。手机/平板：QQ 邮箱 APP 式布局（见下方 .mobile-shell）。 */
+/* 桌面 >1024px：完整 3 栏（左栏/列表/阅读窗）。手机/平板：QQ 邮箱 APP 式布局（见下方 .mobile-shell）。 */
 
 html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
 body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
@@ -51,9 +51,17 @@ body { scrollbar-color: var(--c-300) transparent; scrollbar-width: thin; }
 /* 把 Tailwind 蓝色类映射到主题变量（与旧版一致，!important 盖过 Tailwind） */
 body[data-theme] .bg-blue-50 { background-color: var(--c-50) !important; }
 body[data-theme] .bg-blue-100 { background-color: var(--c-100) !important; }
-body[data-theme] .bg-blue-200 { background-color: var(--c-200) !important; }
 body[data-theme] .bg-blue-500 { background-color: var(--c-500) !important; }
 body[data-theme] .bg-blue-600 { background-color: var(--c-600) !important; }
+body[data-theme] .bg-blue-800 { background-color: var(--c-700) !important; }
+body[data-theme] .bg-blue-900 { background-color: var(--c-900) !important; }
+body[data-theme] .bg-green-500 { background-color: var(--c-500) !important; }
+body[data-theme] .hover\:bg-green-600:hover { background-color: var(--c-600) !important; }
+body[data-theme] .hover\:bg-blue-800:hover { background-color: var(--c-700) !important; }
+body[data-theme] .hover\:bg-blue-900:hover { background-color: var(--c-900) !important; }
+/* 选中行浅粉底跟随主题（桌面行 bg-[#fde8e8] 与 QQ 行 .active 共用） */
+body[data-theme] .bg-\[\#fde8e8\] { background-color: var(--c-100) !important; }
+body[data-theme] .qq-row.active { background: var(--c-100) !important; }
 body[data-theme] .bg-blue-50\/50 { background-color: var(--c-50-50) !important; }
 body[data-theme] .bg-blue-100\/50 { background-color: var(--c-100-50) !important; }
 body[data-theme] .hover\:bg-blue-50:hover { background-color: var(--c-50) !important; }
@@ -65,13 +73,11 @@ body[data-theme] .text-blue-400 { color: var(--c-400) !important; }
 body[data-theme] .text-blue-500 { color: var(--c-500) !important; }
 body[data-theme] .text-blue-600 { color: var(--c-600) !important; }
 body[data-theme] .text-blue-700 { color: var(--c-700) !important; }
-body[data-theme] .text-blue-900 { color: var(--c-900) !important; }
 body[data-theme] .hover\:text-blue-500:hover { color: var(--c-500) !important; }
 body[data-theme] .hover\:text-blue-600:hover { color: var(--c-600) !important; }
 body[data-theme] .border-blue-50 { border-color: var(--c-50) !important; }
 body[data-theme] .border-blue-100 { border-color: var(--c-100) !important; }
 body[data-theme] .border-blue-200 { border-color: var(--c-200) !important; }
-body[data-theme] .border-blue-300 { border-color: var(--c-300) !important; }
 body[data-theme] .border-blue-400 { border-color: var(--c-400) !important; }
 body[data-theme] .border-blue-100\/50 { border-color: var(--c-100-50) !important; }
 body[data-theme] .focus\:border-blue-400:focus { border-color: var(--c-400) !important; }
@@ -92,7 +98,8 @@ body[data-theme] .to-blue-600 { --tw-gradient-to: var(--c-600) !important; }
 
 /* ---------- 桌面端邮箱文件夹展开 / 折叠（与旧版一致） ---------- */
 #account-list .acct-folders { max-height: 0; overflow: hidden; transition: max-height .25s ease; }
-#account-list .acct-item.expanded .acct-folders { max-height: 240px; }
+/* 展开态放宽到 400px（约 14 个文件夹）并允许纵向滚动：文件夹多于约 8 个时不再被截断 */
+#account-list .acct-item.expanded .acct-folders { max-height: 400px; overflow-y: auto; }
 #account-list .acct-row .fa-chevron-right { transition: transform .2s ease; }
 #account-list .acct-item.expanded .acct-row .fa-chevron-right { transform: rotate(90deg); }
 

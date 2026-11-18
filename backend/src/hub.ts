@@ -13,7 +13,3 @@ export function emit(event: string, payload: Record<string, unknown>): void {
   if (!io) return;
   io.emit(event, payload || {});
 }
-
-export function clientCount(): number {
-  return io ? io.engine.clientsCount : 0;
-}

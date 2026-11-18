@@ -1,6 +1,6 @@
 <template>
   <div class="app-viewport flex flex-col bg-white text-slate-800 text-sm overflow-hidden">
-    <!-- 桌面端 >1024px：完整 4 栏（与旧版一致） -->
+    <!-- 桌面端 >1024px：完整 3 栏 -->
     <div id="desktop-layout" class="hidden lg:flex flex-1 min-h-0">
       <MailSidebar @compose="openCompose()" @manage="manageOpen = true" @settings="settingsOpen = true" @logout="logout" />
       <MessageList variant="desktop" />
@@ -20,7 +20,6 @@
     <!-- 弹窗 -->
     <ComposeModal :open="composeOpen" :initial="composeInitial" @close="composeOpen = false" @sent="composeOpen = false" />
     <ManageAccountsModal :open="manageOpen" @close="manageOpen = false" />
-    <AddAccountModal :open="addOpen" @close="addOpen = false" @back="addOpen = false; manageOpen = true" @saved="addOpen = false" />
     <SettingsModal :open="settingsOpen" @close="settingsOpen = false" />
     <ConfirmModal />
     <ThemePanel />
@@ -44,7 +43,6 @@ import MobileShell from '../components/MobileShell.vue'
 import ComposeModal from '../components/ComposeModal.vue'
 import type { ComposeInitial } from '../components/ComposeModal.vue'
 import ManageAccountsModal from '../components/ManageAccountsModal.vue'
-import AddAccountModal from '../components/AddAccountModal.vue'
 import SettingsModal from '../components/SettingsModal.vue'
 import ConfirmModal from '../components/ConfirmModal.vue'
 import ThemePanel from '../components/ThemePanel.vue'
@@ -57,11 +55,10 @@ const mail = useMailStore()
 const composeOpen = ref<boolean>(false)
 const composeInitial = ref<ComposeInitial>({})
 const manageOpen = ref<boolean>(false)
-const addOpen = ref<boolean>(false)
 const settingsOpen = ref<boolean>(false)
 
 onMounted(() => { void mail.init() })
-onUnmounted(() => { mail.disconnectRealtime() })
+onUnmounted(() => { mail.disconnectRealtime(); mail.destroyMobileHistory() })
 
 // 点本地草稿：回填到写信弹窗
 watch(() => mail.composeDraft, (d) => {
@@ -100,6 +97,7 @@ function forward(m: MessageDetail): void {
 
 async function logout(): Promise<void> {
   mail.disconnectRealtime()
+  mail.resetSessionState()
   await auth.logout()
   router.replace('/login')
 }

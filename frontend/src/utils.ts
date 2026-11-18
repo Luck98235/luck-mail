@@ -51,3 +51,35 @@ export function formatSize(n: number | null | undefined): string {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
   return (n / 1024 / 1024).toFixed(1) + ' MB'
 }
+
+// 复制文本到剪贴板：优先 Clipboard API，不可用时回落到临时 textarea + execCommand。
+// 返回是否复制成功（失败时调用方 toast 提示，不要静默当作成功）。
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    let ok = false
+    try { ok = document.execCommand('copy') } catch { ok = false }
+    document.body.removeChild(ta)
+    return ok
+  }
+}
+
+// 下载 Blob：建临时 <a> 触发下载，点完立即回收对象 URL。
+export function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}

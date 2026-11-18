@@ -26,12 +26,6 @@ export const SESSION_COOKIE = 'lm_session';
 export const MAX_FAILED_ATTEMPTS = 5;
 export const LOCKOUT_MS = 15 * 60 * 1000;
 
-// Attachments larger than this are NOT cached on disk: only metadata is
-// stored, and downloads stream live from IMAP (contract: 10 MB rule).
-export const ATTACHMENT_CACHE_MAX_BYTES: number = Number(
-  process.env.ATTACHMENT_CACHE_MAX_BYTES || 10 * 1024 * 1024
-);
-
 // Messages larger than this are parsed in a worker thread (contract).
 export const LARGE_PARSE_THRESHOLD: number = Number(
   process.env.MAIL_PARSE_WORKER_THRESHOLD_BYTES || 5 * 1024 * 1024

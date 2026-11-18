@@ -1,10 +1,8 @@
-import nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
 import { makeSmtpTransporter, accountToImap } from './imapUtil.js';
-import type { ImapAccount } from './imapUtil.js';
 import type { AccountRow } from './db.js';
 
-// Nodemailer MailComposer has no bundled types; declare the module loosely.
+// MailComposer types come from @types/nodemailer.
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 
 export interface SendMailInput {
@@ -14,7 +12,9 @@ export interface SendMailInput {
   subject: string;
   text?: string;
   html?: string;
-  attachments?: { filename: string; content: Buffer; contentType?: string }[];
+  // 附件二选一：content（内存 Buffer，旧调用）或 path（磁盘临时文件，
+  // 发信路由用 multer diskStorage 落盘后传 path，不再把大附件全放内存）。
+  attachments?: { filename: string; content?: Buffer; path?: string; contentType?: string; size?: number }[];
 }
 
 // One cached transporter per account id; invalidated on credential/server change.
@@ -52,17 +52,13 @@ function splitAddrs(v: string | string[] | undefined): string[] {
   return String(v).split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-// Build the raw MIME buffer (for APPEND to Sent) and send via nodemailer.
-// Returns { messageId, raw }.
-export async function sendMail(
-  account: AccountRow,
-  password: string,
-  input: SendMailInput,
-): Promise<{ messageId: string | null; raw: Buffer }> {
+// Build the nodemailer mail options (from / to / cc / bcc / subject /
+// text / html / attachments) — shared by buildRawMail and sendMail.
+function buildMailOptions(account: AccountRow, input: SendMailInput) {
   const from = account.display_name
     ? `"${account.display_name.replace(/"/g, '')}" <${account.email}>`
     : account.email;
-  const mailOptions = {
+  return {
     from,
     to: splitAddrs(input.to),
     cc: splitAddrs(input.cc),
@@ -73,13 +69,47 @@ export async function sendMail(
     attachments: (input.attachments || []).map((a) => ({
       filename: a.filename,
       content: a.content,
+      path: a.path,
       contentType: a.contentType,
     })),
   };
-  const raw: Buffer = await new MailComposer(mailOptions).compile().build();
-  const transporter = getTransporter(account, password);
-  const info = await transporter.sendMail(mailOptions);
-  return { messageId: (info.messageId as string) || null, raw };
 }
 
-export type { ImapAccount };
+// Compile the raw MIME buffer + Message-ID once.
+// F4: 发信重试必须复用同一份 raw / 同一 Message-ID——每次重调
+// sendMail 都 new MailComposer 会生成新的 Message-ID，APPEND 的副本
+// 与实际发出的邮件就对不上号。调用方（发信路由）在第一次发送前调
+// 一次，重试时把结果传给 sendMail。
+export async function buildRawMail(
+  account: AccountRow,
+  input: SendMailInput,
+): Promise<{ raw: Buffer; messageId: string | null }> {
+  const mailOptions = buildMailOptions(account, input);
+  // 只生成一次 Message-ID：先 build raw，取其 Message-ID，再显式传给
+  // sendMail。否则两个独立的 MailComposer 各生成一个不同的 Message-ID，
+  // raw（APPEND 进已发送）与实际发出的邮件对不上号，之后按 Message-ID
+  // 关联、去重、墓碑判断都会错位。
+  const composer = new MailComposer(mailOptions).compile();
+  const raw: Buffer = await composer.build();
+  return { raw, messageId: composer.messageId() };
+}
+
+// Build the raw MIME buffer (for APPEND to Sent) and send via nodemailer.
+// Returns { messageId, raw, rejected }.
+// prebuilt: buildRawMail 的结果——重试时传同一份，不再重新编译
+// （否则重试会生成新的 Message-ID，见 F4）。
+export async function sendMail(
+  account: AccountRow,
+  password: string,
+  input: SendMailInput,
+  prebuilt?: { raw: Buffer; messageId: string | null },
+): Promise<{ messageId: string | null; raw: Buffer; rejected: string[] }> {
+  const mailOptions = buildMailOptions(account, input);
+  const { raw, messageId } = prebuilt ?? (await buildRawMail(account, input));
+  const transporter = getTransporter(account, password);
+  const info = await transporter.sendMail({ ...mailOptions, messageId: messageId ?? undefined });
+  // nodemailer 只在全部收件人都被拒时才抛错；单个收件人被拒（550）时
+  // 只记进 info.rejected、继续发给其他人，调用方必须检查它。
+  const rejected = Array.isArray(info?.rejected) ? (info.rejected as string[]) : [];
+  return { messageId: (info.messageId as string) || messageId || null, raw, rejected };
+}

@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, reactive, computed, watch } from 'vue'
-import { api } from '../api'
+import { api, ApiError } from '../api'
 import { createRealtime } from '../realtime'
 import type {
   Account, AggregateKind, Folder, FolderType, LocalDraft,
@@ -101,6 +101,13 @@ export const useMailStore = defineStore('mail', () => {
     } catch { /* 读不到就当没记 */ }
   }
   let deleteStatusTimer: ReturnType<typeof setInterval> | null = null
+  // 异步批量删除的待收尾信息（F14）：后端只回 taskId 时，deleteChecked 不立即
+  // 做本地对账，等轮询确认 running===false 后，用状态接口的 deleted.length
+  // 一次扣减 total 并弹最终 toast（与审计 #2 的 M4 对账逻辑一致，不 double）。
+  let pendingBatchDelete: { permanent: boolean; draftCount: number; taskId?: string } | null = null
+  function stopDeletePolling(): void {
+    if (deleteStatusTimer) { clearInterval(deleteStatusTimer); deleteStatusTimer = null }
+  }
   // 启动删除状态轮询（1.5 秒一次）：deleteChecked 里删除开始时调一次，
   // init 里刷新回来时由 syncDeleteStatus 调一次；跑完由 syncDeleteStatus 停掉。
   function startDeletePolling(): void {
@@ -111,9 +118,16 @@ export const useMailStore = defineStore('mail', () => {
   // 查后端批量删除任务状态：刷新/切页回来后，任务未完成时继续显示“删除中…”。
   // 任务还在跑就每 1.5 秒轮询一次，跑完停掉轮询并刷新列表。
   // deleteView 刷新后从 localStorage 恢复：只在发起删除的视图显示删除中。
+  // F3：连续失败计数，≥3 次停表并清“删除中”状态，避免泄漏后每 1.5 秒
+  // 无限请求（登出/会话重置时也由 resetSessionState/disconnectRealtime 停表）。
+  let deleteStatusFailures = 0
   async function syncDeleteStatus(): Promise<void> {
     try {
-      const st = await api.getDeleteStatus()
+      // 审计 #4：本会话发起的异步任务带上 taskId 轮询，避免两标签页同时
+      // 批量删除时轮询到对方的任务；刷新回来恢复的旧任务（pending 为空）
+      // 不带 taskId，走后端“返回最近任务”的兼容。
+      const st = await api.getDeleteStatus(pendingBatchDelete?.taskId)
+      deleteStatusFailures = 0
       if (st.running) {
         batchDeleting.value = true
         // 恢复发起删除的视图：以后端 delete-status 里记的 view 为准（刷新后也准），
@@ -130,17 +144,45 @@ export const useMailStore = defineStore('mail', () => {
         if (batchDeleting.value) {
           batchDeleting.value = false
           deleteRemaining.value = 0
+          // 收尾前记下发起删除的视图：用户若已切走，别在新视图自动打开首封（审计 #4 LOW）。
+          const deleteViewAtStart = deleteView.value
           deleteView.value = null
           saveDeleteView()
           await loadMessages()
+          // 异步批量删除收尾（F14）：本会话发起的任务跑完后，用状态接口的
+          // deleted.length 一次结算（total 由刚拉的列表重算，不再另减），
+          // 并弹最终 toast；刷新回来恢复的旧任务（pending 为空）不弹。
+          if (pendingBatchDelete) {
+            const deletedCount = (st.deleted || 0) + pendingBatchDelete.draftCount
+            const permanent = pendingBatchDelete.permanent
+            pendingBatchDelete = null
+            if (selectedId.value !== null && !mailList.value.some((m) => m.id === selectedId.value)) {
+              selectedId.value = null
+              selectedMessage.value = null
+            }
+            await autoOpenFirstAfterDelete(deleteViewAtStart ?? undefined)
+            showToast(permanent ? `已彻底删除 ${deletedCount} 封` : `已移到已删除 ${deletedCount} 封`)
+          }
         }
-        if (deleteStatusTimer) { clearInterval(deleteStatusTimer); deleteStatusTimer = null }
+        stopDeletePolling()
       }
-    } catch { /* 状态查不到就当没在删，不阻塞列表 */ }
+    } catch {
+      // 状态查不到就当没在删，不阻塞列表；连续失败 ≥3 次停表并清状态（F3），
+      // 避免网络断了还每 1.5 秒请求、删除中提示永远挂着。
+      deleteStatusFailures += 1
+      if (deleteStatusFailures >= 3) {
+        deleteStatusFailures = 0
+        pendingBatchDelete = null
+        stopDeletePolling()
+        batchDeleting.value = false
+        deleteRemaining.value = 0
+        deleteView.value = null
+        saveDeleteView()
+      }
+    }
   }
   const readingLoading = ref<boolean>(false)
   const refreshingAll = ref<boolean>(false)
-  const refreshingAccounts = ref<Set<number>>(new Set())
   const settings = ref<Settings>({ signature: '', defaultAccountId: null })
   const localDrafts = ref<LocalDraft[]>(loadLocalDrafts())
   const composeDraft = ref<LocalDraft | null>(null) // 点本地草稿时，交给写信弹窗回填
@@ -149,6 +191,9 @@ export const useMailStore = defineStore('mail', () => {
   // requestConfirm 返回 Promise，点确定 resolve(true)、点取消 resolve(false)。
   const confirmRequest = ref<{ message: string; danger: boolean; resolve: (ok: boolean) => void } | null>(null)
   function requestConfirm(message: string, danger = false): Promise<boolean> {
+    // 覆盖保护：上一个确认框还没点，新的就来了——先把旧的按“取消” resolve，
+    // 否则旧调用方永远等不到结果（deleteChecked 会一直卡在 await）。
+    if (confirmRequest.value) confirmRequest.value.resolve(false)
     return new Promise<boolean>((resolve) => { confirmRequest.value = { message, danger, resolve } })
   }
   function resolveConfirm(ok: boolean): void {
@@ -222,7 +267,6 @@ export const useMailStore = defineStore('mail', () => {
   const checkedCount = computed<number>(() => checkedIds.value.size)
   const isAllChecked = computed<boolean>(() => mailList.value.length > 0 && mailList.value.every((m) => checkedIds.value.has(m.id)))
   const isSomeChecked = computed<boolean>(() => checkedIds.value.size > 0 && !isAllChecked.value)
-  const currentAccount = computed<Account | null>(() => accounts.value.find((a) => a.id === view.value.accountId) || null)
   const mobileAccount = computed<Account | null>(() => accounts.value.find((a) => a.id === mobileAccountId.value) || null)
   const isTrashView = computed<boolean>(() => {
     if (view.value.kind === 'all-trash') return true
@@ -236,6 +280,14 @@ export const useMailStore = defineStore('mail', () => {
     toast.value = msg
     if (toastTimer) clearTimeout(toastTimer)
     toastTimer = setTimeout(() => { toast.value = '' }, ms)
+  }
+  // 发信成功后 4 秒内抑制“邮件列表加载失败”这类加载失败 toast（F2）：
+  // 发信后切视图会触发 loadMessages，若它恰好失败，失败 toast 会盖掉
+  // 刚显示的“发送成功”，用户以为没发出去。只抑制加载失败 toast，
+  // 其他 toast（删除/标记失败等）不受影响。
+  let suppressLoadFailToastUntil = 0
+  function suppressLoadFailToast(ms: number): void {
+    suppressLoadFailToastUntil = Date.now() + ms
   }
 
   function persistLocalDrafts(): void {
@@ -281,17 +333,28 @@ export const useMailStore = defineStore('mail', () => {
   }
 
   // ---- 视图切换 ----
+  // 视图切换时统一重置列表状态：清搜索/选中、回第 1 页，手机端进列表级，再拉列表。
+  // 先清旧列表再拉新列表：否则加载期间列表里还是上一个文件夹的旧邮件，
+  // 标题已是新视图、内容却是旧的（审计 #4 主修）；失败分支本来就会把
+  // 列表置空，先清与失败行为一致。
+  async function resetListState(): Promise<void> {
+    searchQuery.value = ''
+    selectedId.value = null
+    selectedMessage.value = null
+    clearChecked()
+    page.value = 1
+    mailList.value = []
+    total.value = 0
+    if (window.innerWidth < 1024) backToMobileAccount()
+    await loadMessages()
+  }
+
   async function setAggregate(kind: AggregateKind): Promise<void> {
     const agg = AGGREGATES.find((a) => a.kind === kind) || AGGREGATES[0]
     view.value = { kind: agg.kind, label: agg.label, accountId: null, folderId: null }
     activeAccountId.value = null
     activeFolder.value = null
-    searchQuery.value = ''
-    selectedId.value = null
-    selectedMessage.value = null
-    page.value = 1
-    if (window.innerWidth < 1024) mview.value = 'account'
-    await loadMessages()
+    await resetListState()
   }
 
   async function setFolderView(accountId: number, folder: Folder | null): Promise<void> {
@@ -303,13 +366,8 @@ export const useMailStore = defineStore('mail', () => {
     }
     activeAccountId.value = accountId
     activeFolder.value = folder || null
-    searchQuery.value = ''
-    selectedId.value = null
-    selectedMessage.value = null
     mobileAccountId.value = accountId
-    page.value = 1
-    if (window.innerWidth < 1024) mview.value = 'account'
-    await loadMessages()
+    await resetListState()
   }
 
   // 移动端“未读邮件”页签：只看当前账号的未读（view=all-unread + accountId）
@@ -317,12 +375,8 @@ export const useMailStore = defineStore('mail', () => {
     view.value = { kind: 'all-unread', label: '未读邮件', accountId, folderId: null }
     activeAccountId.value = accountId
     activeFolder.value = null
-    searchQuery.value = ''
-    selectedId.value = null
-    selectedMessage.value = null
     mobileAccountId.value = accountId
-    if (window.innerWidth < 1024) mview.value = 'account'
-    await loadMessages()
+    await resetListState()
   }
 
   // 点邮箱行：未展开时展开文件夹 + 切单邮箱收件箱视图；已展开时再点则折叠（不切视图、不重载）
@@ -341,12 +395,8 @@ export const useMailStore = defineStore('mail', () => {
     view.value = { kind: 'folder', label: inbox ? `${accountLabel(accountId)} - ${inbox.name}` : accountLabel(accountId), accountId, folderId: fid }
     activeAccountId.value = accountId
     activeFolder.value = inbox
-    searchQuery.value = ''
-    selectedId.value = null
-    selectedMessage.value = null
     mobileAccountId.value = accountId
-    if (window.innerWidth < 1024) mview.value = 'account'
-    await loadMessages()
+    await resetListState()
   }
 
   // 点行首 `>`：只展开/折叠，不切视图（懒加载：展开时才要文件夹）
@@ -373,6 +423,10 @@ export const useMailStore = defineStore('mail', () => {
       await loadFolders(saved.accountId)
       expanded.value = new Set(expanded.value).add(saved.accountId)
       const folders = foldersByAccount.value[saved.accountId] || []
+      // folderId 为 null 是合法值（账号级视图，如该账号当时没有文件夹），
+      // 按原样恢复成账号级视图；只有 key 缺失（undefined）才算“没存”，
+      // 走下面的收件箱兜底。
+      if (saved.folderId === null) { await setFolderView(saved.accountId, null); return }
       const folder = (typeof saved.folderId === 'number' ? folders.find((f) => f.id === saved.folderId) : null)
         || folders.find((f) => f.type === 'inbox') || folders[0] || null
       if (!folder) { await setAggregate('all-inbox'); return }
@@ -414,8 +468,6 @@ export const useMailStore = defineStore('mail', () => {
     return a ? (a.displayName || a.email) : ''
   }
 
-  function folderLabel(folder: Folder | null): string { return folder ? folder.name : '' }
-
   // ---- 邮件列表 ----
   function currentFolderType(): FolderType | null {
     if (view.value.kind !== 'folder') return null
@@ -441,11 +493,17 @@ export const useMailStore = defineStore('mail', () => {
       }))
   }
 
+  // 请求序号（S1 竞态守卫）：每次 loadMessages 递增；await 返回后序号变了
+  // 说明已有更新的请求在跑，旧响应直接丢弃，不覆盖列表、不触发自动打开。
+  let loadSeq = 0
   // 分页加载：每页 50 条，后端按 offset/limit 只返回当页，不一次全拉。
   // 切视图/搜索时回到第 1 页；点上一页/下一页时按页拉取并替换列表。
-  async function loadMessages({ page: p }: { page?: number } = {}): Promise<void> {
+  async function loadMessages({ page: p, autoOpenFirst, keepChecked = false, background = false }: { page?: number; autoOpenFirst?: boolean; keepChecked?: boolean; background?: boolean } = {}): Promise<void> {
+    const seq = ++loadSeq
     if (p !== undefined) page.value = Math.max(1, p)
-    checkedIds.value = new Set() // 切视图/搜索/翻页时清空批量选择
+    // 刷新（refreshAll/refreshAccount/同步/重连对账）不清空批量选择；
+    // 只在切视图/搜索/翻页时清（默认）。
+    if (!keepChecked) checkedIds.value = new Set()
     // 草稿视图且无后端数据时也允许只显示本地草稿
     if (view.value.kind === 'folder' && !view.value.folderId) {
       mailList.value = localDraftEnvelopes()
@@ -467,9 +525,15 @@ export const useMailStore = defineStore('mail', () => {
       // folderId 只在 view=folder 时带。
       if (view.value.kind !== 'folder') params.folderId = undefined
       const data = await api.messages(params)
-      // 本地草稿只挂在第 1 页顶部；翻到后面几页不带草稿
-      const drafts = page.value === 1 ? localDraftEnvelopes() : []
-      mailList.value = [...drafts, ...(data.messages || [])]
+      if (seq !== loadSeq) return // 已被更新的请求取代，丢弃旧响应（含自动打开那段）
+      // 本地草稿只挂在第 1 页顶部（搜索时不拼：后端 FTS 只覆盖服务端邮件，
+      // 本地草稿搜不到；拼进来既与查询无关，还会被自动打开误触成写信弹窗）；
+      // 翻到后面几页不带草稿
+      const drafts = (page.value === 1 && !searchQuery.value.trim()) ? localDraftEnvelopes() : []
+      // 按 id 去重（审计 #4 LOW 加固）：防后端某次返回同一 id 两次时前端
+      // 渲染双行；只挡同一 id 的重复，对“不同 id 的两行”无效。
+      const seenIds = new Set<number | string>()
+      mailList.value = [...drafts, ...(data.messages || [])].filter((m) => !seenIds.has(m.id) && (seenIds.add(m.id), true))
       total.value = (data.total || 0) + drafts.length
       // “所有未读”视图：以后端返回的未读总数为准对齐角标。事件驱动的计数
       // 若有漂移（比如某封信在别的视图被标已读），点进这个视图就自动纠正，
@@ -477,15 +541,42 @@ export const useMailStore = defineStore('mail', () => {
       if (view.value.kind === 'all-unread' && !view.value.accountId) {
         unreadCounts.set('total', data.total || 0)
       }
-      if (mailList.value.length && !selectedId.value) {
-        // 桌面端默认选中第一封；手机端不自动打开，等用户点
-        if (window.innerWidth >= 1024) await openMessage(mailList.value[0].id)
+      // 当前页已空且不是第 1 页（比如删光了本页最后一封），自动回上一页，避免停在空白页
+      if (!mailList.value.length && page.value > 1) {
+        await goToPage(page.value - 1)
+        return
+      }
+      // 第 1 页空列表（搜不到结果、文件夹本来就空）时清空选择，避免阅读窗残留旧邮件
+      if (!mailList.value.length) {
+        selectedId.value = null
+        selectedMessage.value = null
+      }
+      // 自动打开：仅搜索触发的那一次加载（setSearch 传 autoOpenFirst），
+      // 或无选中时的桌面端默认选中；翻页/刷新/同步不自动打开；
+      // 手机端一律不自动打开，等用户点；本地草稿不自动打开
+      if (mailList.value.length && window.innerWidth >= 1024) {
+        if (autoOpenFirst) {
+          const first = mailList.value.find((m) => !m.isLocalDraft)
+          if (first && first.id !== selectedId.value) await openMessage(first.id)
+        } else if (!selectedId.value) {
+          const first = mailList.value.find((m) => !m.isLocalDraft)
+          if (first) await openMessage(first.id)
+        }
       }
     } catch {
+      if (seq !== loadSeq) return // 旧请求失败了也不覆盖新请求的列表、不弹错
+      if (background) {
+        // 后台触发的加载（sync-done 重载、重连对账）失败时保留旧列表、
+        // 不清选中、不闪空列表，也不弹 toast（审计 #4 LOW：后台失败静默，
+        // 网络抖动时反复弹提示反而扰民；用户可点刷新重试）。
+        return
+      }
       mailList.value = localDraftEnvelopes(); total.value = mailList.value.length
-      showToast('邮件列表加载失败，请点刷新重试')
+      if (!mailList.value.length) { selectedId.value = null; selectedMessage.value = null }
+      if (Date.now() >= suppressLoadFailToastUntil) showToast('邮件列表加载失败，请点刷新重试')
     } finally {
-      loading.value = false
+      // 只有最新请求能清 loading，避免旧请求先跑完把“加载中”提前关掉
+      if (seq === loadSeq) loading.value = false
     }
   }
 
@@ -494,13 +585,17 @@ export const useMailStore = defineStore('mail', () => {
     if (target === page.value && mailList.value.length) return
     await loadMessages({ page: target })
   }
+  // 删信/移信后当前页变空且不是第 1 页时，自动回上一页，避免停在空白页
+  async function backIfPageEmpty(): Promise<void> {
+    if (!mailList.value.length && page.value > 1) await goToPage(page.value - 1)
+  }
   async function nextPage(): Promise<void> { await goToPage(page.value + 1) }
   async function prevPage(): Promise<void> { await goToPage(page.value - 1) }
 
   function setSearch(q: string): void {
     searchQuery.value = q
     page.value = 1
-    void loadMessages()
+    void loadMessages({ autoOpenFirst: true })
   }
 
   // ---- 读信 ----
@@ -513,6 +608,9 @@ export const useMailStore = defineStore('mail', () => {
     readingLoading.value = true
     try {
       const data = await api.message(id)
+      // S1：返回时若选中已换成别的信（用户快速连点），丢弃这次旧响应，
+      // 不覆盖新信的正文，也不切阅读窗。
+      if (selectedId.value !== id) return
       selectedMessage.value = data.message
       // 打开即标已读（后端 GET 详情已标已读并推 Socket.io 更新；这里同步本地列表与未读数）
       const row = mailList.value.find((m) => m.id === id)
@@ -520,12 +618,15 @@ export const useMailStore = defineStore('mail', () => {
         row.isRead = true
         bumpUnread(row.accountId, row.folderId, -1)
       }
+      // 成功才切到阅读窗：失败时不切，留在列表（M18）。
+      if (window.innerWidth < 1024) mview.value = 'read'
     } catch {
+      // 失败时清掉这次选中，避免阅读窗残留旧信、mview 停在错误的 read。
+      if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
       showToast('打开邮件失败')
     } finally {
       readingLoading.value = false
     }
-    if (window.innerWidth < 1024) mview.value = 'read'
   }
 
   async function setRead(id: number | string, read: boolean): Promise<void> {
@@ -540,17 +641,52 @@ export const useMailStore = defineStore('mail', () => {
     } catch { showToast('标记失败，请重试') }
   }
 
+  // 删信/移垃圾后：若阅读窗已空（删的正是正在读的那封）且列表非空，
+  // 桌面端自动打开当前页第一封，避免阅读窗一直空白；手机端不自动打开。
+  // expectedView：删信开始时的视图——完成时若用户已切到别的视图，
+  // 别在新视图自动打开首封（审计 #4 LOW）。
+  async function autoOpenFirstAfterDelete(expectedView?: { kind: string; accountId: number | null; folderId: number | null }): Promise<void> {
+    if (window.innerWidth < 1024) return
+    if (selectedId.value !== null) return
+    if (expectedView && (view.value.kind !== expectedView.kind || view.value.accountId !== expectedView.accountId || view.value.folderId !== expectedView.folderId)) return
+    const first = mailList.value.find((m) => !m.isLocalDraft)
+    if (first) await openMessage(first.id)
+  }
+
   async function deleteMessage(id: number | string): Promise<void> {
+    // 批量删除进行中：阅读窗的删除按钮已禁用（F4），这里再守一道入口。
+    if (isDeletingHere.value) return
+    const viewAtStart = { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId }
     try {
-      await api.deleteMessage(id, isTrashView.value)
-      // 状态同步：mailList 与 unreadCounts 一起即时更新，不重新拉全量
+      await api.deleteMessage(id)
+      // 状态同步：mailList 与 unreadCounts 一起即时更新，不重新拉全量。
+      // 单删接口是同步的，后端删完发 mail-deleted（io.emit，全员含发起方）
+      // 才响应，实时事件可能已提前把行拿掉并减过 total：这里只在行还在
+      // 列表里时才减，避免与实时事件重复计数。
       const row = mailList.value.find((m) => m.id === id)
-      if (row && !row.isRead) bumpUnread(row.accountId, row.folderId, -1)
+      if (row) {
+        if (!row.isRead) bumpUnread(row.accountId, row.folderId, -1)
+        total.value = Math.max(0, total.value - 1)
+      }
       mailList.value = mailList.value.filter((m) => m.id !== id)
-      total.value = Math.max(0, total.value - 1)
       if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
+      await backIfPageEmpty()
+      await autoOpenFirstAfterDelete(viewAtStart)
       showToast(isTrashView.value ? '已彻底删除' : '已移到已删除')
-    } catch { showToast('删除失败，请重试') }
+    } catch (e) {
+      // F1：失败先对账再提示——先重拉列表，行已不在说明服务端其实删成了
+      //（如 DELETE 404 前行已被实时事件拿掉），不要再报“删除失败”；
+      // 行还在才是真失败；404 透传后端原话“邮件不存在”。
+      // 对账不清空批量勾选（keepChecked）：失败一次不应把用户已勾的别的邮件全取消。
+      await loadMessages({ keepChecked: true })
+      if (!mailList.value.some((m) => m.id === id)) {
+        if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
+        await autoOpenFirstAfterDelete(viewAtStart)
+        showToast(isTrashView.value ? '已彻底删除' : '已移到已删除')
+      } else {
+        showToast(e instanceof ApiError ? e.message : '删除失败，请重试')
+      }
+    }
   }
 
   // ---- 批量选择与批量删除（复选框 + 全选） ----
@@ -575,65 +711,127 @@ export const useMailStore = defineStore('mail', () => {
   async function deleteChecked(): Promise<void> {
     const ids = [...checkedIds.value]
     if (!ids.length || batchDeleting.value) return
+    // 删信开始时的视图：结算时若用户已切走，别按旧视图的数扣新视图的 total、
+    // 别在新视图自动打开首封（审计 #4 LOW）。
+    const viewAtStart = { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId }
     const permanent = isTrashView.value
     const label = permanent ? '彻底删除' : '移到已删除'
     if (!await requestConfirm(`确定${label}选中的 ${ids.length} 封邮件吗？`, true)) return
+    // 本地草稿按 isLocalDraft 字段划分（不用 typeof id：服务端 id 也可能是字符串）。
+    const isDraftId = (id: number | string): boolean =>
+      mailList.value.some((m) => m.id === id && m.isLocalDraft)
+    const draftIds = ids.filter(isDraftId)
+    const serverIds = ids.filter((id) => !isDraftId(id))
     batchDeleting.value = true
     // 记下发起删除的视图：删除中提示与列表锁定只属于这个视图，切到别的视图不受影响。
     deleteView.value = { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId }
     saveDeleteView()
     try {
-      // 本地草稿（id 为 local- 开头的字符串）直接从本地删，不走服务器
-      const draftIds = ids.filter((id) => typeof id === 'string')
-      const serverIds = ids.filter((id) => typeof id === 'number')
       // 剩余数先按待删的服务端邮件数显示，再由轮询按后端进度更新（15、14、13…）。
-      if (serverIds.length > 0) {
-        deleteRemaining.value = serverIds.length
-        startDeletePolling()
-      }
+      if (serverIds.length > 0) deleteRemaining.value = serverIds.length
       draftIds.forEach((id) => deleteLocalDraft(id as string))
       let deleted: number[] = []
       let failedCount = 0
       if (serverIds.length) {
         // 把发起删除的视图一并传给后端：刷新后 delete-status 靠它恢复“只在该视图显示删除中”。
         const res = await api.batchDeleteMessages(serverIds, permanent, { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId })
+        if (res.taskId) {
+          // F14 异步返回：后端只给了 taskId，删除在后台跑——这里不做本地
+          // 对账、不弹 toast，等 syncDeleteStatus 确认 running===false 后，
+          // 用状态接口的 deleted.length 一次结算（见 syncDeleteStatus）。
+          // 本地草稿已在上面删掉；勾选先清掉，避免用户重复点删除。
+          // taskId 存下来供轮询透传（审计 #4）：不存会轮询到“最近任务”，
+          // 两标签页同时批量删除时可能串台。
+          pendingBatchDelete = { permanent, draftCount: draftIds.length, taskId: res.taskId }
+          checkedIds.value = new Set()
+          startDeletePolling()
+          return
+        }
         deleted = res.deleted || []
         failedCount = (res.failed || []).length
+        // POST 已返回、服务端任务已入队，再开始轮询：轮询若抢在入队前看到
+        // running=false，会误清“删除中”状态。
+        startDeletePolling()
       }
-      // 状态同步：从 mailList 移除已删的，未读数即时更新，不重新拉全量
+      // 状态同步：从 mailList 移除已删的，未读数即时更新，不重新拉全量。
+      // removed 只用来补未读数（行还在列表里才需要补；已被实时事件提前拿掉的，
+      // handler 删行时已补过，不会重复）。
       const removed = mailList.value.filter((m) => deleted.includes(m.id as number) || draftIds.includes(m.id))
       removed.forEach((row) => { if (!row.isRead) bumpUnread(row.accountId, row.folderId, -1) })
       mailList.value = mailList.value.filter((m) => !deleted.includes(m.id as number) && !draftIds.includes(m.id))
-      total.value = Math.max(0, total.value - removed.length)
+      // total 与 toast 按后端返回的实际删除数计：批量删除接口是同步的，
+      // 服务端删完发 mail-deleted（io.emit）才响应，实时事件一定抢在本地
+      // 更新之前把行拿掉，列表过滤计数会是 0；但 handler 在本次批量删除
+      // 期间不减 total（见 handleRealtime），所以这里按后端数减一次，不重复。
+      const deletedCount = deleted.length + draftIds.length
+      // 切视图后 total 已是新视图的数，别按旧视图的删除数扣（审计 #4 LOW）；
+      // 等轮询重拉会把新视图的 total 纠回来。
+      if (isDeletingHere.value) total.value = Math.max(0, total.value - deletedCount)
       if (selectedId.value !== null && (deleted.includes(selectedId.value as number) || draftIds.includes(selectedId.value))) {
         selectedId.value = null
         selectedMessage.value = null
       }
       checkedIds.value = new Set()
-      const okCount = removed.length
-      showToast(failedCount > 0 ? `已删除 ${okCount} 封，${failedCount} 封失败` : (permanent ? `已彻底删除 ${okCount} 封` : `已移到已删除 ${okCount} 封`))
+      await backIfPageEmpty()
+      if (!serverIds.length) {
+        // 只有本地草稿：没有服务端任务，直接清状态（不等轮询）。
+        batchDeleting.value = false
+        deleteRemaining.value = 0
+        deleteView.value = null
+        saveDeleteView()
+      }
+      // 有服务端任务时这里不清“删除中”：等 syncDeleteStatus 确认
+      // running===false 再清（旧 finally 在这里提前清，提示会闪一下就没了）。
+      await autoOpenFirstAfterDelete(viewAtStart)
+      showToast(failedCount > 0 ? `已删除 ${deletedCount} 封，${failedCount} 封失败` : (permanent ? `已彻底删除 ${deletedCount} 封` : `已移到已删除 ${deletedCount} 封`))
     } catch {
       showToast('批量删除失败，请重试')
-    } finally {
-      batchDeleting.value = false
-      deleteRemaining.value = 0
-      deleteView.value = null
-      saveDeleteView()
+      if (serverIds.length) {
+        // POST 失败也可能服务端已入队：查一次真实状态再决定，未跑完就继续轮询；
+        // 确认没跑才由 syncDeleteStatus 清状态。
+        startDeletePolling()
+        void syncDeleteStatus()
+      } else {
+        batchDeleting.value = false
+        deleteRemaining.value = 0
+        deleteView.value = null
+        saveDeleteView()
+      }
     }
   }
 
   async function moveToSpam(id: number | string): Promise<void> {
+    // 批量删除进行中：阅读窗的移垃圾按钮已禁用（F4），这里再守一道入口。
+    if (isDeletingHere.value) return
     const msg = mailList.value.find((m) => m.id === id) || selectedMessage.value
     if (!msg) return
+    const viewAtStart = { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId }
     const folders = await loadFolders(msg.accountId)
     const spam = folders.find((f) => f.type === 'spam')
     if (!spam) { showToast('该邮箱没有垃圾邮件文件夹'); return }
     try {
       await api.moveMessage(id, spam.id)
+      // 移走的若是未读，未读数减一（与 deleteMessage 一致；移动只发
+      // mail-updated(folderId)，不发 mail-deleted，不会重复减）。
+      if (!msg.isRead) bumpUnread(msg.accountId, msg.folderId, -1)
       mailList.value = mailList.value.filter((m) => m.id !== id)
+      total.value = Math.max(0, total.value - 1)
       if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
+      await backIfPageEmpty()
+      await autoOpenFirstAfterDelete(viewAtStart)
       showToast('已标记为垃圾邮件')
-    } catch { showToast('标记失败，请重试') }
+    } catch (e) {
+      // F1：与 deleteMessage 同理——先重拉对账，行已不在说明服务端其实移成了。
+      // 对账不清空批量勾选（keepChecked），理由同 deleteMessage。
+      await loadMessages({ keepChecked: true })
+      if (!mailList.value.some((m) => m.id === id)) {
+        if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
+        await autoOpenFirstAfterDelete(viewAtStart)
+        showToast('已标记为垃圾邮件')
+      } else {
+        showToast(e instanceof ApiError ? e.message : '标记失败，请重试')
+      }
+    }
   }
 
   // ---- 发信 / 草稿 ----
@@ -660,30 +858,103 @@ export const useMailStore = defineStore('mail', () => {
 
   // ---- 刷新 ----
   async function refreshAll(): Promise<void> {
+    if (refreshingAll.value) return // 防重入：手机端按钮与桌面端按钮可能被连点
     refreshingAll.value = true
     try {
       await api.refreshAll()
-      await Promise.all([loadAccounts(), loadMessages()])
+      await Promise.all([loadAccounts(), loadMessages({ keepChecked: true })])
       showToast('已刷新全部邮箱')
     } catch { showToast('刷新失败，请重试') }
     finally { refreshingAll.value = false }
   }
 
   async function refreshAccount(accountId: number): Promise<void> {
-    refreshingAccounts.value = new Set(refreshingAccounts.value).add(accountId)
     try {
       await api.refreshAccount(accountId)
-      await loadMessages()
+      await loadMessages({ keepChecked: true })
     } catch { showToast('刷新该邮箱失败') }
-    finally {
-      const next = new Set(refreshingAccounts.value)
-      next.delete(accountId)
-      refreshingAccounts.value = next
-    }
   }
 
-  // ---- 移动端导航 ----
-  function goMobileHome(): void { mview.value = 'home'; drawerOpen.value = false }
+  // ---- 手机/平板浏览器历史（2026-11-18 重设计）----
+  // 问题：单页应用不写历史，手机系统“从左边缘右滑返回”手势无记录可退，
+  // 直接退出到浏览器空白页/首页。解法：mview 每深入一级就 pushState，
+  // 系统返回手势/返回键触发 popstate，应用按 state 里的 mview 回退一级，
+  // 而不是退出。返回按钮与中部右滑手势也统一走 history.back()，
+  // 让历史栈与 mview 始终同步（直接改 mview 会让栈与界面错位，
+  // 下一次系统返回要多按一次才生效）。
+  // 层级：home（0）→ account（1）→ read（2），只记层级，不改 URL。
+  let historyInitialized = false
+  let suppressHistoryPush = false
+  function historyStateFor(m: 'home' | 'account' | 'read'): { mview: string } {
+    return { mview: m }
+  }
+  function initMobileHistory(): void {
+    if (historyInitialized) return
+    historyInitialized = true
+    if (typeof window === 'undefined' || !window.history) return
+    // 桌面端不用手机历史：不搭栈、不注册 popstate（否则桌面端每次返回
+    // 都会进到这个监听里，且监听永不注销）。
+    if (window.innerWidth >= 1024) return
+    // 按恢复到的 mview 把历史栈搭成 home → account → read，
+    // 让返回路径正好是 read → account → home。
+    const cur = mview.value
+    window.history.replaceState(historyStateFor('home'), '')
+    if (cur === 'account') window.history.pushState(historyStateFor('account'), '')
+    if (cur === 'read') {
+      window.history.pushState(historyStateFor('account'), '')
+      window.history.pushState(historyStateFor('read'), '')
+    }
+    window.addEventListener('popstate', onHistoryPop)
+  }
+  function onHistoryPop(e: PopStateEvent): void {
+    const state = (e.state || {}) as { mview?: string }
+    const target = state.mview === 'account' || state.mview === 'read' ? state.mview : 'home'
+    // popstate 引起的 mview 变化不 push（watch 的方向判断已排除后退，
+    // 这里再加一道保险，防浏览器前进按钮导致的前进式 popstate 重复入栈）。
+    suppressHistoryPush = true
+    drawerOpen.value = false
+    mview.value = target
+    // watch 是微任务里跑，setTimeout（宏任务）清标志能确保它读到 suppress。
+    setTimeout(() => { suppressHistoryPush = false }, 0)
+  }
+  // mview 深入时（home→account、account→read）入栈；后退时不动历史
+  //（后退由 popstate / history.back() 驱动，栈已同步）。
+  // init 完成前不入栈（恢复状态时的 mview 变化由 initMobileHistory 一次性搭好）。
+  watch(mview, (next, prev) => {
+    if (!historyInitialized || suppressHistoryPush) return
+    if (typeof window === 'undefined' || !window.history) return
+    if (next === prev) return
+    if ((prev === 'home' && next === 'account') || (prev === 'account' && next === 'read')) {
+      window.history.pushState(historyStateFor(next), '')
+    }
+  })
+  // 移动端返回上一级（2026-11-18 重设计）：抽屉开着先关抽屉；
+  // 否则走 history.back()，由 popstate 把 mview 退一级——
+  // 这样历史栈与界面同步，系统返回手势也不会多退一级。
+  // home 已是顶层，不动（再按返回就是退出应用，交给系统）。
+  function goMobileBack(): void {
+    if (drawerOpen.value) { drawerOpen.value = false; return }
+    if (mview.value === 'read' || mview.value === 'account') {
+      if (typeof window !== 'undefined' && window.history) window.history.back()
+      return
+    }
+  }
+  // 切视图时回到列表级：若在阅读窗，走 history.back() 让 popstate 驱动回退，
+  // 保持历史栈与界面同步（直接改 mview 会让栈顶多一个 read，
+  // 下一次系统返回要多按一次才生效）；历史未初始化（init 恢复阶段）时直接改。
+  function backToMobileAccount(): void {
+    if (window.innerWidth >= 1024) return
+    if (mview.value === 'read' && historyInitialized && typeof window !== 'undefined' && window.history) {
+      window.history.back()
+      return
+    }
+    mview.value = 'account'
+  }
+  // 供 MailView 卸载时注销 popstate（store 是单例常驻，监听需手动清）。
+  function destroyMobileHistory(): void {
+    if (typeof window !== 'undefined') window.removeEventListener('popstate', onHistoryPop)
+    historyInitialized = false
+  }
   function enterMobileAccount(accountId: number): void { void selectAccount(accountId) }
   function setMobileAccount(accountId: number | null): void { mobileAccountId.value = accountId }
 
@@ -692,20 +963,42 @@ export const useMailStore = defineStore('mail', () => {
   // 事件驱动 unreadCounts：new-mail 未读+1、mail-updated 按 isRead 变化增减，
   // 删信时未读总数即时减少；导航树红色角标绑定 unreadCounts，即时亮起，
   // 不轮询、不整页刷新、不重新拉全量。
+  // 同步完成后的重载防抖：多个账号挨个 done 时合并成一次 loadAccounts + loadMessages，
+  // 否则 28 个邮箱的 done 事件会把列表反复冲刷 28 次（M3）。
+  let syncReloadTimer: ReturnType<typeof setTimeout> | null = null
+  function scheduleSyncReload(): void {
+    if (syncReloadTimer) clearTimeout(syncReloadTimer)
+    syncReloadTimer = setTimeout(() => {
+      syncReloadTimer = null
+      void loadAccounts()
+      // 后台重载（F7）：失败时保留旧列表、不闪空，只弹 toast。
+      void loadMessages({ keepChecked: true, background: true })
+    }, 1500)
+  }
   let realtime: ReturnType<typeof createRealtime> | null = null
   function handleRealtime(msg: RealtimeEvent): void {
     if (!msg || !msg.type) return
     if (msg.type === 'new-mail') {
       const m = msg.message
       if (!m) return
+      // 文件夹类型（懒加载：未点开过的账号可能没有）：供 all-sent/all-trash 判断。
+      const folderType = (foldersByAccount.value[m.accountId] || []).find((f) => f.id === m.folderId)?.type
       const inView =
         (view.value.kind === 'all-inbox' && m.folderPath?.includes('INBOX')) ||
         (view.value.kind === 'all-unread' && !m.isRead) ||
-        (view.value.kind === 'folder' && m.accountId === view.value.accountId && m.folderId === view.value.folderId)
+        (view.value.kind === 'folder' && m.accountId === view.value.accountId && m.folderId === view.value.folderId) ||
+        (view.value.kind === 'all-sent' && folderType === 'sent') ||
+        (view.value.kind === 'all-trash' && folderType === 'trash')
       // 分页：新邮件只挂在第 1 页顶部；在第 2 页以后时只加总数、不插进当前页
       if (inView && !mailList.value.some((x) => x.id === m.id)) {
         if (page.value === 1) mailList.value.unshift(m)
         total.value += 1
+      } else if (!inView && (view.value.kind === 'all-sent' || view.value.kind === 'all-trash') && !folderType) {
+        // 当前在已发送/已删除视图、且该账号文件夹未加载过，无法判断新邮件
+        // 是否属于当前视图：防抖重载一次兜底（1.5 秒合并，不会刷屏）。
+        // 注：后端目前只对收件箱发 new-mail（engine.ts:786），此分支现为
+        // 防御性兜底；若后端以后对已发送/已删除也发事件，这里直接生效。
+        scheduleSyncReload()
       }
       if (!m.isRead) bumpUnread(msg.accountId, msg.folderId, 1)
     } else if (msg.type === 'mail-updated') {
@@ -717,31 +1010,74 @@ export const useMailStore = defineStore('mail', () => {
         // 或同步时 IMAP 已读标记变了），但后端只在“未读→已读”的转变时才发
         // 这个事件，所以直接减一次，避免角标滞后、与“所有未读”列表对不上。
         bumpUnread(msg.accountId, msg.folderId ?? null, -1)
+      } else if (!row && msg.changes && msg.changes.isRead === false && msg.accountId) {
+        // 反向：在别处被标为未读（读→未读的转变，后端只在转变时发，见
+        // engine.setRead 开头的无变化返回与同步路径的 readChanged 判断），
+        // 不在当前列表里也加一次未读，避免角标滞后。
+        bumpUnread(msg.accountId, msg.folderId ?? null, 1)
       }
       if (row) Object.assign(row, msg.changes || {})
       if (selectedMessage.value?.id === msg.messageId) Object.assign(selectedMessage.value, msg.changes || {})
     } else if (msg.type === 'mail-deleted') {
       const row = mailList.value.find((m) => m.id === msg.messageId)
-      if (row && !row.isRead) bumpUnread(row.accountId, row.folderId, -1)
-      mailList.value = mailList.value.filter((m) => m.id !== msg.messageId)
+      if (row) {
+        if (!row.isRead) bumpUnread(row.accountId, row.folderId, -1)
+        mailList.value = mailList.value.filter((m) => m.id !== msg.messageId)
+        // 自己发起的批量删除正在跑（同视图）：total 由 deleteChecked 按后端
+        // deleted.length 一次性减，这里只删行、不再减，避免重复计数；
+        // 其他来源（别的标签页/设备/同步发现）的删除在这里减 total 并回页。
+        if (!(batchDeleting.value && isDeletingHere.value)) {
+          total.value = Math.max(0, total.value - 1)
+          void backIfPageEmpty()
+        }
+      }
       if (selectedId.value === msg.messageId) { selectedId.value = null; selectedMessage.value = null }
     } else if (msg.type === 'sync') {
       const acct = accounts.value.find((a) => a.id === msg.accountId)
       if (acct) acct.status = msg.state === 'started' ? 'syncing' : (msg.state === 'error' ? 'error' : 'online')
-      if (msg.state === 'done') { void loadAccounts(); void loadMessages() }
+      if (msg.state === 'done') scheduleSyncReload()
     } else if (msg.type === 'account') {
       void loadAccounts()
     }
   }
   function connectRealtime(): void {
     if (typeof window === 'undefined' || realtime) return
-    realtime = createRealtime(handleRealtime)
+    // M2：Socket 断线重连后对账一次——断线期间可能漏了新邮件/已读/删除事件，
+    // 只靠事件驱动会一直对不上；轻量拉一次账号与当前视图即可。
+    realtime = createRealtime(handleRealtime, {
+      onConnect: () => { void loadAccounts(); void loadMessages({ keepChecked: true, background: true }) }
+    })
   }
   function disconnectRealtime(): void {
     if (realtime) { realtime.disconnect(); realtime = null }
+    // 断开实时连接时也停掉删除状态轮询（F3）：登出后不再每 1.5 秒请求。
+    stopDeletePolling()
+    deleteStatusFailures = 0
+  }
+
+  // 退出后重进（或刷新后重进）：先清掉上一次会话残留的选择/搜索/页码/列表，
+  // 再由 restoreView/restoreMobileState 按 localStorage 恢复导航与阅读状态。
+  // MailView 的 logout 会调它（与 disconnectRealtime 一起），退出时清干净，
+  // 下次 init 重进时再统一清一次。
+  function resetSessionState(): void {
+    // 会话重置时停掉删除状态轮询（F3）：登出后不再每 1.5 秒请求 delete-status。
+    stopDeletePolling()
+    deleteStatusFailures = 0
+    pendingBatchDelete = null
+    batchDeleting.value = false
+    deleteRemaining.value = 0
+    deleteView.value = null
+    selectedId.value = null
+    selectedMessage.value = null
+    searchQuery.value = ''
+    page.value = 1
+    mailList.value = []
+    total.value = 0
+    checkedIds.value = new Set()
   }
 
   async function init(): Promise<void> {
+    resetSessionState()
     // 懒加载：初始化只加载一级账号名，不预加载任何账号的文件夹；
     // 文件夹在点邮箱行 / 折叠箭头时才按需加载。
     await Promise.all([loadAccounts(), loadSettings()])
@@ -755,6 +1091,9 @@ export const useMailStore = defineStore('mail', () => {
     await restoreView()
     // 手机/平板再恢复在哪一级（列表/正在读的信），桌面端这步直接跳过。
     await restoreMobileState(savedMobile)
+    // 手机/平板浏览器历史：按恢复到的 mview 搭好 home → account → read，
+    // 让系统返回手势/返回键先退应用内一级，而不是直接退出到浏览器空白页。
+    initMobileHistory()
     // 刷新回来后，若后端批量删除任务还在跑，继续显示“删除中…”并轮询到完成。
     void syncDeleteStatus()
     connectRealtime()
@@ -764,16 +1103,16 @@ export const useMailStore = defineStore('mail', () => {
     accounts, foldersByAccount, expanded, view, mailList, total, loading, page, totalPages,
     activeAccountId, activeFolder,
     searchQuery, selectedId, selectedMessage, checkedIds, checkedCount, isAllChecked, isSomeChecked, batchDeleting, deleteRemaining, isDeletingHere,
-    readingLoading, refreshingAll, refreshingAccounts,
-    settings, localDrafts, composeDraft, toast, confirmRequest, resolveConfirm, unreadCounts, unreadOfAccount, unreadOfFolder,
+    readingLoading, refreshingAll,
+    settings, localDrafts, composeDraft, toast, confirmRequest, requestConfirm, resolveConfirm, suppressLoadFailToast, unreadCounts, unreadOfAccount, unreadOfFolder,
     mview, mobileAccountId, drawerOpen,
-    totalUnread, currentAccount, mobileAccount, isTrashView,
-    showToast, loadAccounts, loadSettings, loadFolders, inboxFolderId, accountLabel, folderLabel,
+    totalUnread, mobileAccount, isTrashView,
+    showToast, loadAccounts, loadFolders, inboxFolderId,
     setAggregate, setFolderView, setAccountUnread, selectAccount, toggleAccountExpand,
     loadMessages, goToPage, nextPage, prevPage, setSearch, openMessage, setRead, deleteMessage, moveToSpam,
     toggleCheck, toggleCheckAll, clearChecked, deleteChecked,
     saveLocalDraft, deleteLocalDraft, refreshAll, refreshAccount,
-    goMobileHome, enterMobileAccount, setMobileAccount,
-    connectRealtime, disconnectRealtime, handleRealtime, init
+    goMobileBack, enterMobileAccount, setMobileAccount,
+    disconnectRealtime, resetSessionState, destroyMobileHistory, init
   }
 })

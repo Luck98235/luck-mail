@@ -106,15 +106,15 @@ export function allPresets(): Record<string, Preset & { label?: string }> {
   return out;
 }
 
-export function resolvePreset(email: string): (Preset & { preset: string | null }) | null {
+export function resolvePreset(email: string): Preset | null {
   const at = String(email || '').lastIndexOf('@');
   if (at < 0) return null;
   const domain = String(email).slice(at + 1).toLowerCase();
   if (!domain) return null;
-  if (RAW[domain]) return { ...toPreset(RAW[domain]), preset: domain };
+  if (RAW[domain]) return toPreset(RAW[domain]);
   return {
     imapHost: 'imap.' + domain, imapPort: 993, imapSecure: 'SSL',
     smtpHost: 'smtp.' + domain, smtpPort: 465, smtpSecure: 'SSL',
-    note: '', preset: null,
+    note: '',
   };
 }

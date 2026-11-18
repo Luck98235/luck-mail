@@ -37,7 +37,7 @@ export interface Attachment {
   filename: string
   size: number
   contentType: string
-  /** 后端可能多给 large 字段：>10MB 的附件只存元信息 */
+  /** 恒为 false（历史字段，仅兼容） */
   large?: boolean
 }
 

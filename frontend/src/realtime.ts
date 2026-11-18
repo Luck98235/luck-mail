@@ -10,9 +10,14 @@ import type { RealtimeEvent } from './types'
 
 const EVENT_TYPES = ['new-mail', 'mail-updated', 'mail-deleted', 'sync', 'account'] as const
 
-export function createRealtime(onEvent: (msg: RealtimeEvent) => void): { readonly connected: boolean; disconnect: () => void } {
+export function createRealtime(
+  onEvent: (msg: RealtimeEvent) => void,
+  opts?: { onConnect?: () => void }
+): { disconnect: () => void } {
   let socket: Socket | null = null
   let pingTimer: ReturnType<typeof setInterval> | null = null
+  // 首次连接由应用 init() 拉全量；只有重连才需要对账（断线期间可能漏事件）。
+  let firstConnect = true
 
   socket = io({
     path: '/socket.io/',
@@ -27,29 +32,22 @@ export function createRealtime(onEvent: (msg: RealtimeEvent) => void): { readonl
     pingTimer = setInterval(() => {
       try { socket?.emit('ping', { type: 'ping' }) } catch { /* 忽略 */ }
     }, 30000)
+    if (!firstConnect) opts?.onConnect?.()
+    firstConnect = false
   })
   socket.on('disconnect', () => {
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
   })
 
-  // 服务端按事件名分发；同时兼容统一 'message' 事件带 {type} 的发法
+  // 服务端按事件名分发（new-mail / mail-updated / mail-deleted / sync / account）
   for (const t of EVENT_TYPES) {
     socket.on(t, (payload: unknown) => {
       const p = (payload ?? {}) as Record<string, unknown>
       onEvent({ type: t, ...p } as RealtimeEvent)
     })
   }
-  socket.on('message', (payload: unknown) => {
-    const msg = (typeof payload === 'string' ? safeJson(payload) : payload) as RealtimeEvent | null
-    if (msg && msg.type) onEvent(msg)
-  })
-
-  function safeJson(s: string): unknown {
-    try { return JSON.parse(s) as unknown } catch { return null }
-  }
 
   return {
-    get connected(): boolean { return !!socket?.connected },
     disconnect(): void {
       if (pingTimer) clearInterval(pingTimer)
       try { socket?.disconnect() } catch { /* 忽略 */ }

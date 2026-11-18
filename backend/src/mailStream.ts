@@ -12,7 +12,7 @@ import type { ParsedMessage } from './mailUtil.js';
 // (filename, type, exact size) is kept; the content stream is drained
 // and discarded. Download later streams live from IMAP by part number.
 //
-// Returns the same shape as mailUtil.parseRawMessage.
+// Returns a ParsedMessage (see mailUtil.ts).
 type ParserDataEvent =
   | { type: 'text'; text?: string; html?: string }
   | {
@@ -32,7 +32,6 @@ interface MailParserLike {
 
 export async function streamToParsed(
   readable: Readable,
-  messageDbId: number | null,
   sizeHint = 0,
 ): Promise<ParsedMessage> {
   const parser = new MailParser() as unknown as MailParserLike & NodeJS.WritableStream;

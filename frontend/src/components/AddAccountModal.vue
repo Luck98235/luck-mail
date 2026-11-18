@@ -150,6 +150,10 @@ async function autofill(): Promise<void> {
   if (cached) { apply(cached, cached.note || ''); return }
   try {
     const data = await api.preset(domain)
+    // 竞态：等接口回来时用户可能已改了邮箱域名，若不一致就丢弃这次结果，
+    // 避免把 A 域名的服务器填进已改成 B 域名的表单里。
+    const nowDomain = (form.value.email.trim().split('@')[1] || '').toLowerCase()
+    if (nowDomain !== domain) return
     const p = data.preset
     if (p) apply(p, data.note || '')
     else apply(null, '')

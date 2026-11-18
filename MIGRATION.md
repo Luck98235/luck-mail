@@ -64,7 +64,7 @@ sudo tar -czf luck-mail-backup-$(date +%Y%m%d).tar.gz -C /opt/luck-mail .key dat
 scp luck-mail-backup-*.tar.gz root@<new-server>:/tmp/
 ```
 
-The whole data directory is small (5.5 MB as of 2026-11-17, with 27 mailboxes
+The whole data directory is small (5.5 MB as of 2026-11-17 — reference value — with 27 mailboxes
 and 374 messages), so a daily tarball is cheap. Keep backups **off** the same
 server.
 
@@ -118,6 +118,7 @@ Environment=DATA_DIR=/opt/luck-mail/data
 Environment=PUBLIC_DIR=/opt/luck-mail/backend/public
 Environment=KEY_FILE=/opt/luck-mail/.key
 Environment=COOKIE_SECURE=1
+Environment=DEEPL_API_KEY=<your DeepL key>
 Restart=always
 RestartSec=5
 

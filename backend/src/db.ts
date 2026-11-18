@@ -13,15 +13,6 @@ export interface UserRow {
   created_at: string;
 }
 
-export interface SessionRow {
-  id: number;
-  token_hash: string;
-  user_id: number;
-  expires_at: string;
-  created_at: string;
-  username?: string;
-}
-
 export interface AccountRow {
   id: number;
   email: string;
@@ -88,14 +79,6 @@ export interface AttachmentRow {
   path: string | null;
   cached: number;
   part: string | null;
-}
-
-export interface SyncStateRow {
-  folder_id: number;
-  uidvalidity: number | null;
-  uidnext: number | null;
-  modseq: number | null;
-  last_sync_at: string | null;
 }
 
 type Db = Database.Database;
@@ -235,6 +218,20 @@ function initSchema(db: Db): void {
     deleted_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (account_id, message_id)
   );
+
+  -- B12 发信幂等键：前端每封新邮件生成一个 UUID 随请求传，同一封重试
+  -- 复用同一 key。先 INSERT 占位（message_db_id/message_id 为 NULL，
+  -- 表示“发送进行中”）；成功后回填；发送失败则删除占位行（可再重试）。
+  -- 占位冲突时查已有行：已有 message_id 表示已发过，直接返回原结果；
+  -- 仍为 NULL 表示首发进行中，返回 409。
+  CREATE TABLE IF NOT EXISTS sent_idempotency (
+    account_id INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    message_db_id INTEGER,
+    message_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (account_id, idempotency_key)
+  );
   `);
 
   // ---- Migrations (dev DBs created by earlier revisions) ----
@@ -278,26 +275,29 @@ function initSchema(db: Db): void {
   backfillFts(db);
 }
 
-// Re-index any message that has a body on disk but no FTS row (e.g. after
-// the FTS table was recreated). Cheap at this scale (<=50 mailboxes).
+// Re-index any message that has no FTS row (e.g. after the FTS table was
+// recreated, or envelopes synced before their bodies were fetched).
+// 以前只补有正文的信，结果 156/208 封信完全搜不到（连主题/发件人都搜不到）。
+// 现在无正文的信也建 FTS 行（主题+发件人），有正文的再把正文读进来。
+// Cheap at this scale (<=50 mailboxes).
 function backfillFts(db: Db): void {
   const rows = db.prepare(
-    'SELECT m.id, m.subject, m.from_addr FROM messages m WHERE m.body_path IS NOT NULL'
-  ).all() as { id: number; subject: string; from_addr: string }[];
+    'SELECT m.id, m.subject, m.from_addr, m.body_path FROM messages m WHERE NOT EXISTS (SELECT 1 FROM messages_fts f WHERE f.rowid = m.id)'
+  ).all() as { id: number; subject: string; from_addr: string; body_path: string | null }[];
   let added = 0;
   for (const r of rows) {
-    const exists = (db.prepare('SELECT COUNT(*) c FROM messages_fts WHERE rowid=?').get(r.id) as { c: number }).c;
-    if (exists) continue;
-    const txtPath = path.join(BODIES_DIR, `${r.id}.txt`);
-    if (!fs.existsSync(txtPath)) continue;
-    try {
-      const bodyText = fs.readFileSync(txtPath, 'utf8');
-      db.prepare('INSERT INTO messages_fts(rowid, subject, from_addr, body_text) VALUES (?,?,?,?)')
-        .run(r.id, r.subject, r.from_addr, bodyText);
-      added++;
-    } catch { /* unreadable body file: skip */ }
+    let bodyText = '';
+    if (r.body_path) {
+      const txtPath = path.join(BODIES_DIR, `${r.id}.txt`);
+      if (fs.existsSync(txtPath)) {
+        try { bodyText = fs.readFileSync(txtPath, 'utf8'); } catch { /* unreadable body file: skip */ }
+      }
+    }
+    db.prepare('INSERT INTO messages_fts(rowid, subject, from_addr, body_text) VALUES (?,?,?,?)')
+      .run(r.id, r.subject, r.from_addr, bodyText);
+    added++;
   }
-  if (added) log(`FTS backfill: re-indexed ${added} message(s) from disk bodies`);
+  if (added) log(`FTS backfill: indexed ${added} message(s) without FTS row`);
 }
 
 // ---- FTS maintenance (called by the engine / routes when bodies change) ----
@@ -306,6 +306,17 @@ export function indexMessageFts(id: number, subject: string, fromAddr: string, b
   // FTS5 虚表不支持 UPSERT（ON CONFLICT），先删后插。
   // 之前用 UPSERT 会在发信/收信时抛 SqliteError，收信处被 catch 只记日志，
   // 发信处没 catch 直接拖垮进程、前端拿 502（邮件其实已发出）。
+  db.prepare('DELETE FROM messages_fts WHERE rowid=?').run(id);
+  db.prepare('INSERT INTO messages_fts(rowid, subject, from_addr, body_text) VALUES (?,?,?,?)').run(id, subject, fromAddr, bodyText);
+}
+
+// 新信封一到就建 FTS 行（只写主题+发件人），不等正文拉取。
+// 以前只在正文解析时才建 FTS 行，没拉过正文的信永远搜不到。
+// 已有正文的保留正文（先读出来再重插），不被空正文冲掉。
+export function indexMessageEnvelope(id: number, subject: string, fromAddr: string): void {
+  const db = getDb();
+  const existing = db.prepare('SELECT body_text FROM messages_fts WHERE rowid=?').get(id) as { body_text: string } | undefined;
+  const bodyText = existing?.body_text || '';
   db.prepare('DELETE FROM messages_fts WHERE rowid=?').run(id);
   db.prepare('INSERT INTO messages_fts(rowid, subject, from_addr, body_text) VALUES (?,?,?,?)').run(id, subject, fromAddr, bodyText);
 }
@@ -323,28 +334,35 @@ export function removeMessagesFtsByFolder(folderId: number): void {
 }
 
 // ---------- search ----------
-// FTS5 trigram cannot match 1-2 char terms, so:
-//   terms >= 3 chars -> FTS MATCH (quoted phrases, implicit AND)
-//   terms < 3 chars  -> LIKE '%term%' on the FTS table's stored columns
-//     (subject / from_addr / body_text — the searchable text lives there)
-// The two id sets are UNIONed. `extraWhere`/`extraParams` scope the search
-// (e.g. to one view); q is the raw user query string.
-export function searchMessageIds(q: string, extraWhere = '', extraParams: unknown[] = []): number[] | null {
+// 搜索逻辑（2026-11-18 全面优化）：
+//   1. 多词一律 AND：一封信必须含全部词才命中。以前长词走 FTS 是 AND、
+//      短词走 LIKE 是 OR、两组再 UNION，同一个查询里混用两种逻辑，结果不可预测。
+//   2. 相关度排序：FTS 命中按 bm25 排（越相关越前），纯 LIKE 命中（无 bm25 分）
+//      排在 FTS 命中之后、按时间倒序。以前只按时间排，标题完全命中的旧信
+//      会被正文弱命中的新信压在下面。
+//   3. FTS5 trigram 匹配不了 1-2 字词：>=3 字走 FTS MATCH（引号短语，隐含 AND），
+//      <3 字走 LIKE '%词%'（subject / from_addr / body_text）。
+// 返回按相关度排好序的 id 列表（调用方直接按此顺序分页、展示，不再按时间重排）。
+export function searchMessageIds(q: string): number[] | null {
   const db = getDb();
   const terms = String(q || '').split(/\s+/).map((t) => t.trim()).filter(Boolean);
   if (!terms.length) return null; // no filtering
-  const ids = new Set<number>();
-
   const longTerms = terms.filter((t) => [...t].length >= 3);
   const shortTerms = terms.filter((t) => [...t].length < 3);
 
+  // FTS 命中集 + bm25 分（分越小越相关）。
+  let ftsIds: Set<number> | null = null;
+  const ftsRank = new Map<number, number>();
   if (longTerms.length) {
     const match = longTerms.map((t) => `"${t.replace(/"/g, '')}"`).join(' ');
     const rows = db.prepare(
-      'SELECT rowid AS id FROM messages_fts WHERE messages_fts MATCH ?'
-    ).all(match) as { id: number }[];
-    for (const r of rows) ids.add(r.id);
+      'SELECT rowid AS id, bm25(messages_fts) AS rank FROM messages_fts WHERE messages_fts MATCH ? ORDER BY rank'
+    ).all(match) as { id: number; rank: number }[];
+    ftsIds = new Set(rows.map((r) => r.id));
+    for (const r of rows) ftsRank.set(r.id, r.rank);
   }
+  // LIKE 命中集：每个短词都必须命中（词与词之间 AND；单个词在主题/发件人/正文任一处命中即可）。
+  let likeIds: Set<number> | null = null;
   if (shortTerms.length) {
     const likeClauses = shortTerms.map(
       () => `(subject LIKE ? ESCAPE '\\' OR from_addr LIKE ? ESCAPE '\\' OR body_text LIKE ? ESCAPE '\\')`
@@ -355,19 +373,30 @@ export function searchMessageIds(q: string, extraWhere = '', extraParams: unknow
       params.push(esc, esc, esc);
     }
     const rows = db.prepare(
-      `SELECT rowid AS id FROM messages_fts WHERE ${likeClauses.join(' OR ')}`
+      `SELECT rowid AS id FROM messages_fts WHERE ${likeClauses.join(' AND ')}`
     ).all(...params) as { id: number }[];
-    for (const r of rows) ids.add(r.id);
+    likeIds = new Set(rows.map((r) => r.id));
   }
-  // Apply the view scope (extraWhere) by intersecting with scoped ids.
-  if (extraWhere) {
-    const scoped = db.prepare(
-      `SELECT id FROM messages WHERE ${extraWhere}`
-    ).all(...(extraParams as never[])) as { id: number }[];
-    const scopedSet = new Set(scoped.map((r) => r.id));
-    for (const id of [...ids]) if (!scopedSet.has(id)) ids.delete(id);
+  // 交集：必须同时满足长词组与短词组（以前是并集，任一组命中就算，太宽）。
+  let ids: Set<number>;
+  if (ftsIds && likeIds) {
+    ids = new Set([...ftsIds].filter((id) => likeIds.has(id)));
+  } else if (ftsIds) {
+    ids = ftsIds;
+  } else if (likeIds) {
+    ids = likeIds;
+  } else {
+    return [];
   }
-  return [...ids];
+  // 按相关度排序：FTS 命中按 bm25 升序；纯 LIKE 命中无分，排在后面、按 id 倒序（越新越前）。
+  return [...ids].sort((a, b) => {
+    const ra = ftsRank.get(a);
+    const rb = ftsRank.get(b);
+    if (ra !== undefined && rb !== undefined) return ra - rb;
+    if (ra !== undefined) return -1;
+    if (rb !== undefined) return 1;
+    return b - a;
+  });
 }
 
 export function refreshFolderCounts(folderId: number): void {

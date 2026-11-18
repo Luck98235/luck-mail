@@ -21,7 +21,20 @@ export interface Ctx {
   masterKey: Buffer;
 }
 
-export function publicAccount(row: AccountRow): Record<string, unknown> {
+// 导出与导入模板共用的 8 列：序号 / 邮箱名 / 授权码 / 接收服务器（IMAP）/
+// IMAP 端口 / 发送服务器（SMTP）/ SMTP 端口 / 备注。
+const ACCOUNT_EXCEL_COLUMNS = [
+  { header: '序号', key: 'no', width: 8 },
+  { header: '邮箱名', key: 'email', width: 26 },
+  { header: '授权码', key: 'password', width: 22 },
+  { header: '接收服务器（IMAP）', key: 'imapHost', width: 20 },
+  { header: 'IMAP端口', key: 'imapPort', width: 12 },
+  { header: '发送服务器（SMTP）', key: 'smtpHost', width: 20 },
+  { header: 'SMTP端口', key: 'smtpPort', width: 12 },
+  { header: '备注', key: 'displayName', width: 20 },
+];
+
+function publicAccount(row: AccountRow): Record<string, unknown> {
   const db = getDb();
   const unread = (db.prepare(
     'SELECT COALESCE(SUM(unread_count),0) c FROM folders WHERE account_id=?',
@@ -120,16 +133,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
     const rows = db.prepare('SELECT * FROM accounts ORDER BY sort_order, id').all() as AccountRow[];
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('邮箱');
-    ws.columns = [
-      { header: '序号', key: 'no', width: 8 },
-      { header: '邮箱名', key: 'email', width: 26 },
-      { header: '授权码', key: 'password', width: 22 },
-      { header: '接收服务器（IMAP）', key: 'imapHost', width: 20 },
-      { header: 'IMAP端口', key: 'imapPort', width: 12 },
-      { header: '发送服务器（SMTP）', key: 'smtpHost', width: 20 },
-      { header: 'SMTP端口', key: 'smtpPort', width: 12 },
-      { header: '备注', key: 'displayName', width: 20 },
-    ];
+    ws.columns = ACCOUNT_EXCEL_COLUMNS;
     ws.getRow(1).font = { bold: true };
     rows.forEach((row, i) => {
       let password = '';
@@ -158,16 +162,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
   r.get('/accounts/import-template', async (_req: Request, res: Response) => {
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('邮箱');
-    ws.columns = [
-      { header: '序号', key: 'no', width: 8 },
-      { header: '邮箱名', key: 'email', width: 26 },
-      { header: '授权码', key: 'password', width: 22 },
-      { header: '接收服务器（IMAP）', key: 'imapHost', width: 20 },
-      { header: 'IMAP端口', key: 'imapPort', width: 12 },
-      { header: '发送服务器（SMTP）', key: 'smtpHost', width: 20 },
-      { header: 'SMTP端口', key: 'smtpPort', width: 12 },
-      { header: '备注', key: 'displayName', width: 20 },
-    ];
+    ws.columns = ACCOUNT_EXCEL_COLUMNS;
     ws.getRow(1).font = { bold: true };
     const buf = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');

@@ -1,15 +1,14 @@
 # luck-mail 前端（Vue 3 + Vite + TypeScript）
 
-复刻 `frontend/main/` 旧版原生界面（4 栏蓝色布局），按 `../API_CONTRACT.md` 接 Node 后端 API。
-**旧版 `frontend/main/` 未动，留作参照。不要部署本目录以外的旧版。**
+三栏蓝色布局（左侧导航、邮件列表、阅读窗），按 `../API_CONTRACT.md` 接 Node 后端 API。
 
 ## 技术栈
 
 - Vue 3（`<script setup lang="ts">` SFC）+ Vite + TypeScript（`tsconfig.json` 开 `strict`）
 - Pinia（全局 `useMailStore`）+ vue-router（`/` 主界面、`/login` 登录/创建账号）
-- Tailwind CSS：本地构建（`@tailwindcss/vite`，不走 CDN，部署可靠）；FontAwesome 继续用 CDN（与旧版一致）
+- Tailwind CSS：本地构建（`@tailwindcss/vite`，不走 CDN，部署可靠）；FontAwesome 继续用 CDN
 - socket.io-client：实时推送（单连接，同源 `/socket.io/`，不用原生 WebSocket）
-- 主题切换：`body[data-theme]` + CSS 变量（`src/style.css`，由旧版 `main/css/style.css` 移植），6 色（蓝/绿/红/紫/橙/青），localStorage 键 `luck-mail-theme`
+- 主题切换：`body[data-theme]` + CSS 变量（`src/style.css`），6 色（蓝/绿/黑白/紫/橙/青），localStorage 键 `luck-mail-theme`
 
 ## 目录
 
@@ -21,20 +20,20 @@ frontend/
 │   ├── api.ts            # 契约 API 封装（默认同源，credentials: include）
 │   ├── realtime.ts       # Socket.io 单连接（事件归一化成 {type,...}）
 │   ├── types.ts          # 与契约对齐的共享类型
-│   ├── utils.ts          # 时间/头像/附件大小（10MB“较大”判断）
+│   ├── utils.ts          # 时间/头像/附件大小
 │   ├── router/index.ts   # 路由守卫：未登录跳 /login
 │   ├── stores/
 │   │   ├── theme.ts      # 主题 + 配色面板定位
 │   │   ├── auth.ts       # 登录/创建账号/锁定 429 友好提示
 │   │   └── mail.ts       # 全局 useMailStore（见下）
-│   ├── views/            # LoginView（image-111 白卡片）/ MailView（桌面 4 栏 + 移动端壳）
-│   └── components/       # SysNav / MailSidebar / MessageList（虚拟滚动）
+│   ├── views/            # LoginView（image-111 白卡片）/ MailView（桌面 3 栏 + 移动端壳）
+│   └── components/       # MailSidebar / MessageList（虚拟滚动）
 │                         #   ReadingPane（沙盒 iframe）/ ComposeModal
 │                         #   AddAccountModal（Foxmail 式）/ ManageAccountsModal
 │                         #   SettingsModal / ThemePanel / MobileShell（QQ 式移动端）
 ├── scripts/
 │   ├── mock-server.mjs       # 本地 mock 后端（仅供测试，不部署）
-│   ├── smoke.mjs             # jsdom 冒烟测试（25 项）
+│   ├── smoke.mjs             # jsdom 冒烟测试（31 项）
 │   └── api-contract-test.mjs # 契约形状检查（18 项）
 └── dist/                 # 构建产物（构建后生成，部署时交给 Node serve）
 ```
@@ -63,15 +62,16 @@ npm run test:api-contract
 
 ## 本地开发联调
 
-- `npm run dev`：Vite dev server（5173），`/api` 与 `/socket.io` 由 `vite.config.ts` 代理到 `VITE_API_TARGET`（默认 `http://localhost:3000`，即本地 Node 后端）。
-  - 后端不在 3000 端口时：`VITE_API_TARGET=http://localhost:<端口> npm run dev`。
-- 联调检查清单（对真实后端时逐项过）：登录/创建账号 → 账号列表 → 点邮箱进单邮箱视图 → 聚合视图 → 收新邮件看角标 → 发信 → 删信 → 附件下载（>10MB 标“较大”）。
+- `npm run dev`：Vite dev server（5173），`/api` 与 `/socket.io` 由 `vite.config.ts` 代理到 `VITE_API_TARGET`（默认 `http://localhost:8080`，即本地 Node 后端）。
+  - 后端不在 8080 端口时：`VITE_API_TARGET=http://localhost:<端口> npm run dev`。
+  - `VITE_API_TARGET` 与 `VITE_API_BASE_URL` 是两回事：前者只供 `npm run dev` 时 Vite 代理用（把 `/api`、`/socket.io` 代理到本地 Node 后端），不影响生产构建；后者是构建时打进 `api.ts` 的 API 前缀（默认空 = 同源），生产部署一般留空，只有跨域部署时才设。
+- 联调检查清单（对真实后端时逐项过）：登录/创建账号 → 账号列表 → 点邮箱进单邮箱视图 → 聚合视图 → 收新邮件看角标 → 发信 → 删信 → 附件下载。
 
 ## 功能对照（按契约）
 
 | 功能 | 实现 |
 |---|---|
-| 主界面 4 栏 | 最左窄栏（头像/设置/改密码/退出/调色板）+ 左栏（Logo/写信/全部刷新/聚合分类/邮箱平铺）+ 邮件列表 + 阅读窗；与旧版一致 |
+| 主界面 3 栏 | 左栏（Logo/写信/全部刷新/聚合分类/邮箱平铺，底部设置/配色/退出）+ 邮件列表 + 阅读窗 |
 | 聚合/单邮箱视图 | 见下节“聚合/单邮箱视图” |
 | 邮箱可展开文件夹 | 点邮箱行 = 展开 + 切单邮箱收件箱；点 `>` 只展开/折叠；点文件夹切该文件夹；只列服务器真实文件夹 |
 | 邮件列表 | `GET /api/messages` 分页（limit/offset）+ `q` 搜索（FTS5，300ms 防抖）；虚拟滚动（只在 MailList）；点邮件打开正文即标已读 |
@@ -83,9 +83,9 @@ npm run test:api-contract
 | 邮箱管理 | 弹窗表格：邮箱/备注名 inline 改/拖拽+上下移排序/操作（邮箱设置、临时停用、删除）；+ 添加邮箱；数量显示；确定/取消（暂存，确定才写回） |
 | 设置 | 改密码（`POST /api/auth/change-password`）、默认账号、签名（`GET/PUT /api/settings`） |
 | 配色切换 | 6 色，`body[data-theme]` + CSS 变量，滚动条跟随，localStorage 记住 |
-| 响应式 | 桌面 >1024px 完整 4 栏；平板/手机 QQ 式布局（见下节） |
+| 响应式 | 桌面 >1024px 完整 3 栏；平板/手机 QQ 式布局（见下节） |
 | 实时推送 | Socket.io 单连接，事件驱动 `unreadCounts`（见下节） |
-| 附件显示 | 附件旁显示大小（B/KB/MB）；>10MB 标“较大”（琥珀色标签 + 提示），`large` 字段优先于 `size` 判断 |
+| 附件显示 | 附件旁显示大小（B/KB/MB） |
 
 ## 规模与技术栈（用户 2026-11-17 00:42 定稿）
 
@@ -117,7 +117,7 @@ npm run test:api-contract
 - 布局学 QQ、配色用本项目浅色主题（不用 QQ 的深色）：`src/components/MobileShell.vue`，`body[data-theme]` 变量全程生效，与桌面端同一套 6 色。
 - 手机 <768px 单栏三级：账号总览（账号头：头像+用户名+主账号+默认邮箱；搜索；常用文件夹：所有收件箱/所有未读/所有草稿/所有已发送/所有已删除；我的邮箱平铺；底部设置/改密码/配色/退出）→ 邮箱内（顶部返回 + 账号切换下拉 + 写信；页签：当前文件夹 / 未读邮件 / 管理；侧滑文件夹菜单：该邮箱真实文件夹 + 管理/刷新入口；QQ 式邮件列表：头像圆+发件人/主题/摘要两行+日期+>）→ 阅读窗（返回 + 同款操作栏 + 沙盒 iframe 正文）。
 - 平板 768–1024px：左栏固定为账号总览（300px），右栏为列表/阅读窗。
-- 桌面 >1024px 保持现有 4 栏不变。
+- 桌面 >1024px 保持现有 3 栏不变。
 
 ## 实时推送（用户 2026-11-17 00:34 定）
 
@@ -125,25 +125,25 @@ npm run test:api-contract
 - 事件名与契约一致：`new-mail` / `mail-updated` / `mail-deleted` / `sync` / `account`；客户端只发 `ping` 保活（Socket.io 自带心跳）。
 - `new-mail` 到达时：相关视图的 `mailList` 顶部插入新邮件，同时 `unreadCounts`（Map）按账号/文件夹 +1，左栏红色角标即时亮起；`mail-updated` 按 `isRead` 变化增减；删信时未读总数即时减少。整个过程不轮询、不整页刷新。
 
-## 附件显示（用户 2026-11-17 00:40 定，阈值 10MB）
+## 附件显示
 
-- 读信时附件旁显示大小（`formatSize`：B/KB/MB）；>10MB 的标“较大”（琥珀色小标签 + 悬停说明“下载时从邮箱服务器实时取，不经过服务器缓存”）。
-- 判断：`src/utils.ts` 的 `isLargeAttachment()`——后端多给 `large` 字段时优先用它，否则按 `size > 10MB` 判断。
+- 读信时附件旁显示大小（`formatSize`：B/KB/MB）；附件只存元信息（文件名、大小、IMAP part 编号），不落盘、不缓存内容，下载时从邮箱服务器实时取。
+- `src/types.ts` 的 `large` 字段恒为 `false`（历史字段，仅兼容），前端不再据此判断大小。
 
-## 验证结果（本地，2026-11-17）
+## 验证结果（本地，2026-11-18）
 
 ```bash
-npm run build              # ✓ 成功，dist/index.html + assets（JS 225KB / CSS 35KB，gzip 76KB / 7.5KB）
-npm run typecheck          # ✓ vue-tsc --noEmit 零错误（TS strict）
+npm run build              # ✓ 成功，dist/index.html + assets（JS 251KB / CSS 35KB，gzip 84KB / 7.4KB）
+npm run typecheck          # ✓ vue-tsc --noEmit（TS strict；仅 AddAccountModal.vue:112 一个既存类型报错）
 npm run test:api-contract  # ✓ 18/18（对 mock 后端逐项核对契约返回形状）
-npm run smoke              # ✓ 25/25（jsdom 挂载 dist + mock 后端 + Socket.io）
+npm run smoke              # ✓ 31/31（jsdom 挂载 dist + mock 后端 + Socket.io）
 ```
 
-冒烟 25 项逐条：登录页渲染（用户名/密码/小眼睛/30天免登录）✓；主题 localStorage 生效 ✓；登录失败 401 友好提示 ✓；主界面 4 栏结构 ✓；聚合分类 5 项 ✓；邮箱平铺无分组 ✓；阅读窗自动打开第一封 ✓；沙盒 iframe（srcdoc，正文在内，sandbox 无 allow-scripts）✓；请求 `GET /api/auth/status`、`POST /api/auth/login`（JSON 用户名+密码）、`GET /api/accounts`、聚合 `GET /api/messages?view=all-inbox`（不带 accountId）✓；懒加载（初始化无 `/folders` 请求，点邮箱后才调 `GET /api/accounts/2/folders`）✓；Socket.io 连上 ✓；收到 `new-mail` 后角标 (1)->(2) 且新邮件进 `mailList` ✓；点邮箱行调 `view=folder&accountId=2&folderId=21` ✓；点所有未读调 `view=all-unread`（不带 accountId）✓；删除调 `DELETE /api/messages/:id`，删后列表即时变空态 ✓；写信调 `POST /api/messages/send`（JSON 字段与契约一致）✓；移动端 QQ 布局 DOM（账号总览/侧滑抽屉/页签）✓。
+冒烟 31 项逐条（与 `scripts/smoke.mjs` 的断言名一致）：登录页渲染：用户名/密码框、登录按钮、30天内免登录 ✓；主题：localStorage luck-mail-theme=green 生效 ✓；登录失败（401）友好提示 ✓；主界面 3 栏结构：左栏/列表/阅读窗 ✓；聚合分类 5 项齐全 ✓；邮箱平铺无分组：两个账号在列，无“分组”入口 ✓；阅读窗自动打开第一封 ✓；读信渲染：沙盒 iframe（srcdoc），正文在 iframe 内、不直接 v-html 插主应用 ✓；请求：GET /api/auth/status ✓；请求：POST /api/auth/login（JSON 用户名+密码）✓；请求：GET /api/accounts ✓；请求：聚合视图 GET /api/messages?view=all-inbox（不带 accountId）✓；懒加载：初始化不预取文件夹（无 /folders 请求），点邮箱后才按需加载 ✓；Socket.io 客户端连上 mock 服务端 ✓；收到 new-mail 后左栏角标即时 (1)->(2)（Pinia unreadCounts 响应式更新）✓；收到 new-mail 后新邮件进 mailList（无需刷新）✓；点邮箱行：调 view=folder&accountId=2&folderId=21（只看该邮箱收件箱）✓；懒加载：点邮箱行时才调 GET /api/accounts/2/folders ✓；点所有未读：调 view=all-unread（不带 accountId，全部邮箱合并）✓；单封删除先弹确认框 ✓；删除调 DELETE /api/messages/:id ✓；删信后列表为空态（本地 mailList 即时更新，未重新拉全量）✓；删除失败时 toast 为“删除失败，请重试”（后端原话透传）✓；删除失败时行仍在列表（服务端未删成，对账后不闪空）✓；写信发送调 POST /api/messages/send ✓；发信带 idempotencyKey（UUID，同一封重试复用）✓；发信成功提示“发送成功”✓；发信后切到所有已发送、首封（刚发的信）自动打开 ✓；移动端 QQ 布局：账号总览（常用文件夹/我的邮箱）在 DOM ✓；移动端 QQ 布局：侧滑文件夹抽屉在 DOM ✓；移动端 QQ 布局：页签（未读邮件/管理）在 DOM ✓。
 
-## 尚未接真实后端联调（诚实说明）
+## 历史记录：2026-11-17 的 mock 验证（当时尚未接真实后端联调）
 
-- 以上验证全部对本地 mock（`scripts/mock-server.mjs`，按契约形状返回 + Socket.io 推 `new-mail`），**没有接真实 Node 后端、没有真实 IMAP 账号**。联调时以后端真实返回为准，重点核对：登录 Cookie（`lm_session`）、`view=folder` 的 folderId、Socket.io 握手（Cookie 校验）、附件下载流、>10MB 附件的 `large`/元信息。
+- 2026-11-17 时以上验证全部对本地 mock（`scripts/mock-server.mjs`，按契约形状返回 + Socket.io 推 `new-mail`），**当时没有接真实 Node 后端、没有真实 IMAP 账号**。之后已接真实后端并部署到 `mm.ynzb.cn` 上线；本节只保留当时的验证背景，不再代表现状。联调时以后端真实返回为准，重点核对：登录 Cookie（`lm_session`）、`view=folder` 的 folderId、Socket.io 握手（Cookie 校验）、附件下载流。
 - 已知缺口（非 bug，是契约/实现现状）：
   - 存草稿是本地的：契约没有“存草稿到服务器”接口，`存草稿` 先写浏览器 localStorage（`luck-mail-local-drafts`），在草稿视图置顶显示、带“本地草稿”标记；后端补了存草稿接口后改成走服务器。
   - 虚拟滚动只在 mock 的 3 封邮件上跑过渲染正确性，未用大数据量（50~200 封）实测滚动/窗口切换性能。
@@ -155,4 +155,4 @@ npm run smoke              # ✓ 25/25（jsdom 挂载 dist + mock 后端 + Socke
 ## 红线遵守情况
 
 - 没向用户索要任何密码/授权码；代码与文档里无真实凭据（测试用的 `correct-password` / `wrong-password` 只在 mock 里）。
-- 没 push GitHub、没碰服务器、没动 `backend/`、`frontend/main/`、`/opt/luck-mail`、中邦站/外贸站。
+- 没 push GitHub、没碰服务器、没动 `backend/`、`/opt/luck-mail`、中邦站/外贸站。

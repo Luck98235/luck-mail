@@ -1,6 +1,6 @@
 // 冒烟测试：用 jsdom 挂载 Vite 产物（dist/），对接 scripts/mock-server.mjs，验证：
 //  1. 应用能挂载，登录页渲染（用户名/密码/小眼睛/30天免登录/登录按钮）
-//  2. 登录成功进主界面，桌面 4 栏结构在（窄栏/左栏/列表/阅读窗），关键按钮都在
+//  2. 登录成功进主界面，桌面 3 栏结构在（左栏/列表/阅读窗），关键按钮都在
 //  3. 请求路径/方法/字段与契约一致（通过 mock 的请求日志断言）
 //  4. 聚合视图 vs 单邮箱视图：所有未读调 view=all-unread（不带 accountId）；
 //     点邮箱调 view=folder&accountId=&folderId=（收件箱文件夹）
@@ -64,6 +64,13 @@ async function main() {
     beforeParse(window) {
       // jsdom 窗口没有 fetch：注入 Node fetch，并把相对地址按当前 origin 解析
       window.fetch = (input, init) => fetch(new URL(input, window.location.href), init)
+      // AbortController 也须注入 Node 的同款：应用代码用它做 30 秒超时，
+      // jsdom 自带的 AbortSignal 传给 Node fetch 会抛 TypeError（跨实现不认），
+      // 真浏览器里 fetch 与 AbortController 是同一套，不存在这个问题。
+      window.AbortController = AbortController
+      window.AbortSignal = AbortSignal
+      // jsdom 没有 ResizeObserver：阅读窗用它做 iframe 自适应高度，这里给个空实现即可
+      window.ResizeObserver = class { constructor() {} observe() {} unobserve() {} disconnect() {} }
       try { window.localStorage.setItem('luck-mail-theme', 'green') } catch { /* 忽略 */ }
     }
   })
@@ -83,14 +90,14 @@ async function main() {
   window.eval(bundle)
 
   // 1. 登录页渲染
-  await waitFor(() => q('input[placeholder*="用户名"]'), 15000, '登录页用户名框')
+  await waitFor(() => q('input[autocomplete="username"]'), 15000, '登录页用户名框')
   check('登录页渲染：用户名/密码框、登录按钮、30天内免登录', !!(
-    q('input[placeholder*="用户名"]') && q('input[type="password"]') && text().includes('30天内免登录') && text().includes('登录')
+    q('input[autocomplete="username"]') && q('input[type="password"]') && text().includes('30天内免登录') && text().includes('登录')
   ))
   check('主题：localStorage luck-mail-theme=green 生效', document.body.getAttribute('data-theme') === 'green', document.body.getAttribute('data-theme'))
 
   // 2. 错误密码 → 友好提示（401）
-  const userInput = q('input[placeholder*="用户名"]')
+  const userInput = q('input[autocomplete="username"]')
   const pwInput = q('input[type="password"]')
   setInput(userInput, 'tester')
   setInput(pwInput, 'wrong-password')
@@ -106,7 +113,7 @@ async function main() {
   await waitFor(() => q('#account-list')?.textContent.includes('zm235@163.com'), 15000, '账号列表加载')
   await waitFor(() => text().includes('欢迎使用 Luck-Mail'), 15000, '邮件列表加载')
   const layout = q('#desktop-layout')
-  check('主界面 4 栏结构：窄栏/左栏/列表/阅读窗', !!(
+  check('主界面 3 栏结构：左栏/列表/阅读窗', !!(
     layout && text().includes('Luck-Mail') && q('#btn-refresh-all') && q('#message-list, section') && text().includes('欢迎使用 Luck-Mail')
   ))
   check('聚合分类 5 项齐全', ['所有收件箱', '所有未读', '所有草稿', '所有已发送', '所有已删除'].every((s) => text().includes(s)))
@@ -168,24 +175,50 @@ async function main() {
   // 此时在“所有未读”视图，桌面端已自动打开第一封未读（'未读测试邮件'，id 2）；删它。
   await waitFor(() => q('h1')?.textContent?.includes('未读测试邮件'), 10000, '自动打开第一封未读')
   click(q('[title="删除"]'))
+  // S3：单封删除先弹确认框，点“确定”后才发 DELETE
+  await waitFor(() => text().includes('确定删除这封邮件吗'), 10000, '删除确认框')
+  check('单封删除先弹确认框', text().includes('确定删除这封邮件吗'))
+  click(qa('button').find((b) => b.textContent.trim() === '确定'))
   await waitFor(() => mock.log.some((e) => e.method === 'DELETE' && /^\/api\/messages\/\d+/.test(e.path)), 10000, 'DELETE 请求')
   const delEntry = mock.log.find((e) => e.method === 'DELETE')
   check('删除调 DELETE /api/messages/:id', !!delEntry, delEntry?.path || '')
   await sleep(500)
   check('删信后列表为空态（本地 mailList 即时更新，未重新拉全量）', text().includes('这里没有邮件'))
 
+  // 7b. 删除失败路径（F1/F13）：服务端 500 时行必须仍在、toast 为失败，
+  // 而不是列表被清空或误报成功。先回所有收件箱（自动打开第一封 Socket.io 新邮件），
+  // 再打开 mock 的删除失败开关删它。
+  const inboxAgg = qa('#desktop-layout [class*="cursor-pointer"]').find((el) => el.textContent.trim().startsWith('所有收件箱'))
+  click(inboxAgg)
+  await waitFor(() => q('h1')?.textContent?.includes('Socket.io 新邮件'), 10000, '回到收件箱并自动打开第一封')
+  mock.setDeleteFail(true)
+  click(q('[title="删除"]'))
+  await waitFor(() => text().includes('确定删除这封邮件吗'), 10000, '删除确认框（失败路径）')
+  click(qa('button').find((b) => b.textContent.trim() === '确定'))
+  await waitFor(() => text().includes('删除失败'), 10000, '删除失败 toast')
+  check('删除失败时 toast 为“删除失败，请重试”（后端原话透传）', text().includes('删除失败，请重试'))
+  check('删除失败时行仍在列表（服务端未删成，对账后不闪空）', text().includes('Socket.io 新邮件'))
+  mock.setDeleteFail(false)
+
   // 8. 写信发送
   click(q('#btn-compose'))
   await waitFor(() => q('#compose-to, input[placeholder*="收件人"]'), 10000, '写信弹窗')
   const toInput = document.querySelector('#compose-to') || q('input[placeholder*="收件人"]')
   setInput(toInput, 'a@example.com')
-  setInput(q('#compose-subject') || document.querySelector('input[placeholder="主题"]'), '冒烟测试')
+  setInput(q('#compose-subject') || document.querySelector('input[placeholder="主题（必填）"]'), '冒烟测试')
   setInput(q('#compose-body') || document.querySelector('textarea[placeholder*="正文"]'), 'hello')
   const sendBtn = qa('button').find((b) => b.textContent.trim() === '发送')
   click(sendBtn)
   await waitFor(() => mock.log.some((e) => e.method === 'POST' && e.path === '/api/messages/send'), 10000, '发信请求')
   const sendEntry = mock.log.find((e) => e.method === 'POST' && e.path === '/api/messages/send')
   check('写信发送调 POST /api/messages/send', !!sendEntry, JSON.stringify(sendEntry?.body || sendEntry?.raw || ''))
+  check('发信带 idempotencyKey（UUID，同一封重试复用）', typeof sendEntry?.body?.idempotencyKey === 'string' && sendEntry.body.idempotencyKey.length > 0, String(sendEntry?.body?.idempotencyKey || ''))
+  // F2：发信成功 toast 为“发送成功”（4 秒），随后切到所有已发送，
+  // 并用 201 返回的 id 直接打开刚发的信（mock 里 id 100）。
+  await waitFor(() => text().includes('发送成功'), 10000, '发送成功 toast')
+  check('发信成功提示“发送成功”', text().includes('发送成功'))
+  await waitFor(() => q('h1')?.textContent?.includes('冒烟测试'), 10000, '切到已发送并打开刚发的信')
+  check('发信后切到所有已发送、首封（刚发的信）自动打开', !!q('h1')?.textContent?.includes('冒烟测试'))
 
   // 9. 移动端 QQ 布局 DOM
   check('移动端 QQ 布局：账号总览（常用文件夹/我的邮箱）在 DOM', text().includes('常用文件夹') && text().includes('我的邮箱'))

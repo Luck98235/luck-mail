@@ -23,7 +23,7 @@
               v-for="(row, i) in rows" :key="row.id"
               draggable="true" class="border-b border-slate-50 hover:bg-blue-50/50"
               :class="{ 'opacity-50': row._deleted }"
-              @dragstart="dragIndex = i" @dragover.prevent @drop="onDrop(i)"
+              @dragstart="dragIndex = i" @dragover.prevent @drop="onDrop(i)" @dragend="dragIndex = null"
             >
               <td class="py-2 text-slate-300 cursor-grab" title="拖拽排序"><i class="fa-solid fa-grip-vertical"></i></td>
               <td class="py-2 pr-2 text-xs text-slate-400 tabular-nums">{{ String(i + 1).padStart(2, '0') }}</td>
@@ -34,7 +34,7 @@
                 </div>
               </td>
               <td class="py-2 pr-2">
-                <input v-model="row.displayName" type="text" placeholder="完整邮箱地址" :disabled="row._deleted" class="w-full border border-slate-200 rounded px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400 disabled:bg-slate-50">
+                <input v-model="row.displayName" type="text" placeholder="备注名（选填）" :disabled="row._deleted" class="w-full border border-slate-200 rounded px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400 disabled:bg-slate-50">
               </td>
               <td class="py-2">
                 <div class="flex gap-1">
@@ -43,7 +43,7 @@
                 </div>
               </td>
               <td class="py-2 text-right whitespace-nowrap">
-                <button class="text-blue-500 hover:text-blue-600 text-xs px-1.5" :disabled="row._deleted || testingId === row.id" @click="testRow(row)">{{ testingId === row.id ? '测试中…' : '测试' }}</button>
+                <button class="text-blue-500 hover:text-blue-600 text-xs px-1.5" :disabled="row._deleted || testingId !== null" @click="testRow(row)">{{ testingId === row.id ? '测试中…' : '测试' }}</button>
                 <button class="text-blue-500 hover:text-blue-600 text-xs px-1.5" :disabled="row._deleted" @click="editRow(row)">邮箱设置</button>
                 <button class="text-xs px-1.5" :class="row.enabled === false ? 'text-green-600 hover:text-green-700' : 'text-amber-500 hover:text-amber-600'" :disabled="row._deleted" @click="row.enabled = row.enabled === false ? true : false">
                   {{ row.enabled === false ? '启用' : '停用' }}
@@ -90,6 +90,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { api, ApiError } from '../api'
+import { downloadBlob } from '../utils'
 import { useMailStore } from '../stores/mail'
 import AddAccountModal from './AddAccountModal.vue'
 import type { Account } from '../types'
@@ -98,7 +99,7 @@ const props = defineProps({ open: { type: Boolean, default: false } })
 const emit = defineEmits(['close'])
 const mail = useMailStore()
 
-type ManageRow = Account & { displayName: string; _deleted: boolean }
+type ManageRow = Account & { _deleted: boolean }
 
 const rows = ref<ManageRow[]>([])
 const dragIndex = ref<number | null>(null)
@@ -151,11 +152,49 @@ function editRow(row: ManageRow): void {
   editingRow.value = mail.accounts.find((a) => a.id === row.id) || null
   addOpen.value = true
 }
+
+// 重建 rows：以服务器最新账号为准；但表格里未保存的改动（备注名/启用/删除标记/顺序）
+// 要合并回来，避免一次导入/保存把用户正在改的表格内容丢掉。
+// 例外：excludeId 指定的行（刚在邮箱设置里保存过的）以服务器值为准，不覆盖。
+function rebuildRowsPreservingEdits(excludeId: number | null = null): void {
+  const prev = new Map(rows.value.map((r) => [r.id, r]))
+  const prevOrder = rows.value.map((r) => r.id)
+  const fresh = mail.accounts.map((a) => ({ ...a, displayName: a.displayName || '', _deleted: false }))
+  const merged: ManageRow[] = []
+  for (const id of prevOrder) {
+    const f = fresh.find((x) => x.id === id)
+    if (!f) continue
+    if (id !== excludeId) {
+      const old = prev.get(id)!
+      f.displayName = old.displayName
+      f.enabled = old.enabled
+      f._deleted = old._deleted
+    }
+    merged.push(f)
+  }
+  for (const f of fresh) if (!prev.has(f.id)) merged.push(f)
+  rows.value = merged
+}
+// 表格里是否还有未保存的改动（备注名/启用/删除标记/顺序任一与服务器不一致）
+function hasUnsavedEdits(): boolean {
+  if (rows.value.some((r) => r._deleted)) return true
+  let order = 0
+  for (const row of rows.value) {
+    if (row._deleted) continue
+    const orig = mail.accounts.find((a) => a.id === row.id)
+    if (!orig) return true
+    if ((row.displayName || '') !== (orig.displayName || '') || row.enabled !== orig.enabled || orig.sortOrder !== order) return true
+    order++
+  }
+  return false
+}
 async function onAccountSaved(): Promise<void> {
+  const savedId = editingRow.value?.id ?? null
   addOpen.value = false
   editingRow.value = null
   await mail.loadAccounts()
-  rows.value = mail.accounts.map((a) => ({ ...a, displayName: a.displayName || '', _deleted: false }))
+  rebuildRowsPreservingEdits(savedId)
+  if (hasUnsavedEdits()) mail.showToast('邮箱管理里的改动尚未保存，点“确定”保存')
 }
 
 async function confirm(): Promise<void> {
@@ -174,19 +213,30 @@ async function confirm(): Promise<void> {
       if (row.enabled !== orig.enabled) changes.enabled = row.enabled
       if (Object.keys(changes).length) await api.updateAccount(row.id, changes)
     }
-    // 排序写回（sortOrder 按行顺序）
-    for (let i = 0; i < rows.value.length; i++) {
-      const row = rows.value[i]
+    // 排序写回：按未删除行重排（已删除行不占序号，避免排序值留空洞）
+    let sortFailed = false
+    let order = 0
+    for (const row of rows.value) {
       if (row._deleted) continue
       const orig = mail.accounts.find((a) => a.id === row.id)
-      if (orig && orig.sortOrder !== i) {
-        try { await api.updateAccount(row.id, { sortOrder: i }) } catch { /* 排序失败不阻塞 */ }
+      if (orig && orig.sortOrder !== order) {
+        try { await api.updateAccount(row.id, { sortOrder: order }) } catch { sortFailed = true }
       }
+      order++
     }
     await mail.loadAccounts()
+    if (sortFailed) {
+      // 排序没全存上：重建 rows 回到服务器真实状态，报错留在弹窗里让用户重试
+      rows.value = mail.accounts.map((a) => ({ ...a, displayName: a.displayName || '', _deleted: false }))
+      error.value = '部分排序未保存，请重试。'
+      return
+    }
     mail.showToast('邮箱管理已保存')
     close()
   } catch (e) {
+    // 部分失败：重载账号并重建 rows，让表格回到服务器真实状态，不留半截改动
+    await mail.loadAccounts()
+    rows.value = mail.accounts.map((a) => ({ ...a, displayName: a.displayName || '', _deleted: false }))
     error.value = e instanceof ApiError ? e.message : '保存失败，请重试。'
   } finally {
     busy.value = false
@@ -199,15 +249,10 @@ async function exportAll(): Promise<void> {
   exporting.value = true
   try {
     const { blob, filename } = await api.exportAccounts()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
-    mail.showToast(`已导出 ${rows.value.length} 个邮箱`)
+    downloadBlob(blob, filename)
+    // 计数用未删除行：与表格里显示的有效邮箱一致（已标记删除的不计入）
+    const count = rows.value.filter((r) => !r._deleted).length
+    mail.showToast(`已导出 ${count} 个邮箱`)
   } catch (e) {
     error.value = e instanceof ApiError ? e.message : '导出失败，请重试。'
   } finally {
@@ -221,14 +266,7 @@ async function downloadTemplate(): Promise<void> {
   downloadingTemplate.value = true
   try {
     const { blob, filename } = await api.downloadImportTemplate()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
+    downloadBlob(blob, filename)
   } catch (e) {
     error.value = e instanceof ApiError ? e.message : '下载失败，请重试。'
   } finally {
@@ -246,6 +284,7 @@ async function onImportFile(ev: Event): Promise<void> {
   try {
     const r = await api.importAccounts(file)
     await mail.loadAccounts() // 刷新列表与左栏序号
+    rebuildRowsPreservingEdits() // 新邮箱进表，表格里未保存的改动合并保留
     const parts: string[] = []
     if (r.added > 0) parts.push(`已添加 ${r.added} 个邮箱`)
     if (r.skipped > 0) parts.push(`跳过 ${r.skipped} 个已存在的邮箱`)

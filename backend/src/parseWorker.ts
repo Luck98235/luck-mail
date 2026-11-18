@@ -7,14 +7,13 @@ import { parentPort, workerData } from 'node:worker_threads';
 import fs from 'node:fs';
 import { streamToParsed } from './mailStream.js';
 
-const { filePath, messageDbId, sizeHint } = workerData as {
+const { filePath, sizeHint } = workerData as {
   filePath: string;
-  messageDbId: number | null;
   sizeHint: number;
 };
 
 try {
-  const result = await streamToParsed(fs.createReadStream(filePath), messageDbId, sizeHint);
+  const result = await streamToParsed(fs.createReadStream(filePath), sizeHint);
   parentPort?.postMessage({ ok: true, result });
 } catch (e) {
   parentPort?.postMessage({ ok: false, error: String((e as Error)?.message || e) });

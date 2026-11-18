@@ -1,8 +1,3 @@
-import { simpleParser } from 'mailparser';
-import fs from 'node:fs';
-import path from 'node:path';
-import { ATTACHMENTS_DIR, ATTACHMENT_CACHE_MAX_BYTES } from './config.js';
-import { sanitizeBodyHtml } from './sanitize.js';
 import type { MessageStructureObject } from 'imapflow';
 
 // ---- Folder type detection (special-use + Chinese/English name heuristics) ----
@@ -38,7 +33,27 @@ export interface ListEntry {
   delimiter?: string;
   // imapflow 1.x types this as a single string (e.g. "\\Sent").
   specialUse?: string | string[];
+  // imapflow LIST 返回的 flags 是 Set<string>（含 \Noselect /
+  // \NonExistent 等）；防御性地也接受 string[]（假客户端/旧数据）。
+  flags?: Set<string> | string[];
   children?: ListEntry[];
+}
+
+// F2: LIST 项是否不可选（\Noselect / \NonExistent）——父级命名空间等
+// 不能存邮件的文件夹（如 QQ 的“其他文件夹”）。imapflow 对它
+// mailboxOpen 不报错、实际仍停留在上一个文件夹，同步会读错邮箱。
+// 注意：QQ 服务器实测返回的是 \NoSelect（大写 S），不是 RFC 标准的
+// \Noselect（2026-11-18 线上复核：\NoSelect 拼写致跳过失效，化石行
+// 重启后又被插回）。为防各服务商的大小写/拼写变体，按去反斜杠后
+// 小写比对。
+export function isNonSelectable(entry: ListEntry): boolean {
+  const flags = entry.flags;
+  if (!flags) return false;
+  const norm = (f: string): string => String(f).replace(/^\\/, '').toLowerCase();
+  const list: string[] = typeof (flags as Set<string>).has === 'function'
+    ? [...(flags as Set<string>)]
+    : (Array.isArray(flags) ? (flags as string[]) : [String(flags)]);
+  return list.some((f) => norm(f) === 'noselect' || norm(f) === 'nonexistent');
 }
 
 export function displayNameOf(listEntry: ListEntry): string {
@@ -52,7 +67,7 @@ export function makeSnippet(text: string, len = 200): string {
   return String(text || '').replace(/\s+/g, ' ').trim().slice(0, len);
 }
 
-// ---- IMAP BODYSTRUCTURE attachment parts (for the 10 MB rule) ----
+// ---- IMAP BODYSTRUCTURE attachment parts (metadata-only downloads) ----
 export interface AttachmentPart {
   part: string | null;
   filename: string | null;
@@ -98,14 +113,19 @@ export interface ParsedAttachment {
 }
 
 // Match streamed-parse attachments (document order) to BODYSTRUCTURE parts.
-// Prefer a filename match, fall back to the same index.
+// Index-first (same rule as the send path): part[i] belongs to attachment
+// [i]. Filename is only a fallback/validation — same-name attachments must
+// not collapse onto one part.
 export function matchAttachmentParts(
   parsedAttachments: ParsedAttachment[],
   parts: AttachmentPart[],
 ): ParsedAttachment[] {
   return (parsedAttachments || []).map((att, i) => {
-    const byName = (parts || []).find((p) => p.filename && att.filename && p.filename === att.filename);
-    const m = byName || parts?.[i] || null;
+    const byIndex = parts?.[i] || null;
+    const byName = !byIndex
+      ? (parts || []).find((p) => p.filename && att.filename && p.filename === att.filename)
+      : null;
+    const m = byIndex || byName || null;
     return { ...att, part: m?.part || null };
   });
 }
@@ -127,93 +147,4 @@ export interface ParsedMessage {
   snippet: string;
   hasAttachments: boolean;
   attachments: ParsedAttachment[];
-}
-
-interface AddressValue {
-  name?: string;
-  address?: string;
-  text?: string;
-}
-
-// mailparser types ParsedMail.from/to/cc as AddressObject | AddressObject[].
-function headerAddresses(v: unknown): AddressValue[] {
-  const o = v as { value?: AddressValue[] } | { value?: AddressValue[] }[] | undefined;
-  if (!o) return [];
-  if (Array.isArray(o)) return o.flatMap((x) => x.value || []);
-  return o.value || [];
-}
-
-function addressList(v: unknown): { name: string; address: string }[] {
-  return headerAddresses(v).filter(Boolean).map((a) => ({
-    name: a.name || '',
-    address: a.address || a.text || '',
-  }));
-}
-
-function addrString(list: { name: string; address: string }[]): string {
-  return list.map((a) => (a.name ? `${a.name} <${a.address}>` : a.address)).filter(Boolean).join(', ');
-}
-
-// ---- Parse a raw RFC822 message (Buffer) — test/utility path only ----
-// The production path is streaming (mailStream.streamToParsed). This helper
-// is kept for the verification script and small ad-hoc parsing.
-export async function parseRawMessage(source: Buffer, messageDbId: number | null): Promise<ParsedMessage> {
-  const parsed = await simpleParser(source);
-  const from = headerAddresses(parsed.from)[0];
-  const toList = addressList(parsed.to);
-  const ccList = addressList(parsed.cc);
-  const bodyText = parsed.text || '';
-  const bodyHtml = sanitizeBodyHtml(parsed.html || '');
-  const attachments: ParsedAttachment[] = [];
-  if (messageDbId && parsed.attachments?.length) {
-    const dir = path.join(ATTACHMENTS_DIR, String(messageDbId));
-    fs.mkdirSync(dir, { recursive: true });
-    parsed.attachments.forEach((att, i) => {
-      const safeName = String(att.filename || `attachment-${i + 1}`).replace(/[\\/:*?"<>|]/g, '_');
-      const fileName = `${i + 1}-${safeName}`;
-      const filePath = path.join(dir, fileName);
-      const size = att.content?.length || 0;
-      if (size > ATTACHMENT_CACHE_MAX_BYTES) {
-        // 10 MB rule also applies here: metadata only, no file on disk.
-        attachments.push({
-          filename: att.filename || safeName,
-          contentType: att.contentType || 'application/octet-stream',
-          size,
-          path: null,
-          cached: false,
-          large: true,
-          part: null,
-        });
-        return;
-      }
-      fs.writeFileSync(filePath, att.content);
-      attachments.push({
-        filename: att.filename || safeName,
-        contentType: att.contentType || 'application/octet-stream',
-        size,
-        path: path.relative(ATTACHMENTS_DIR, filePath),
-        cached: true,
-        large: false,
-        part: null,
-      });
-    });
-  }
-  return {
-    envelope: {
-      messageId: parsed.messageId || null,
-      subject: parsed.subject || '',
-      fromAddr: from?.address || '',
-      fromName: from?.name || '',
-      to: toList.map((a) => a.address),
-      toDisplay: addrString(toList),
-      cc: ccList.map((a) => a.address),
-      date: parsed.date ? parsed.date.toISOString() : null,
-      size: source.length,
-    },
-    bodyText,
-    bodyHtml,
-    snippet: makeSnippet(bodyText),
-    hasAttachments: (parsed.attachments?.length || 0) > 0,
-    attachments,
-  };
 }
