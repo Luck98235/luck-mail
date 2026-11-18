@@ -13,7 +13,7 @@ All luck-mail data lives in **two places** on the server:
 | Path | What it holds |
 | --- | --- |
 | `/opt/luck-mail/.key` | The 32-byte AES-256-GCM encryption key (file mode `0600`). Every mailbox password is encrypted with this key before it is stored in the database. |
-| `/opt/luck-mail/data/` | The SQLite database `luck-mail.db`, message bodies in `bodies/`, and pre-2026-11-17 cached attachments in `attachments/`. |
+| `/opt/luck-mail/data/` | The SQLite database `luck-mail.db`, message bodies in `bodies/`, and `attachments/` (empty since 2026-11-18 — attachments are metadata-only; content is streamed live from IMAP on download, never cached on disk). |
 
 The database holds: the login account, all mailbox accounts (address, **encrypted**
 password, server settings, alias, sort order, enabled state), folders synced from
@@ -48,6 +48,7 @@ useless for the mailbox passwords:
 ## What does NOT migrate
 
 - **Theme preference** — also browser `localStorage`.
+- **New mail notification toggle** — also browser `localStorage`.
 - **Login sessions** — log in again after the migration.
 - **TLS certificate** — re-issue it on the new server (Let's Encrypt).
 
@@ -64,7 +65,7 @@ sudo tar -czf luck-mail-backup-$(date +%Y%m%d).tar.gz -C /opt/luck-mail .key dat
 scp luck-mail-backup-*.tar.gz root@<new-server>:/tmp/
 ```
 
-The whole data directory is small (6.0 MB as of 2026-11-18 — reference value — with 27 mailboxes and 227 messages: DB 1.7 MB + WAL 4.1 MB + bodies 280 KB + attachments 4.0 KB, an empty directory), so a daily tarball is cheap. Keep backups **off** the same server.
+The whole data directory is small (6.1 MB as of 2026-11-18 — reference value — with 27 mailboxes and 228 messages: DB 1.7 MB + WAL 4.1 MB + bodies 292 KB + attachments 4.0 KB, an empty directory), so a daily tarball is cheap. Keep backups **off** the same server.
 
 ### Automatic daily backup
 
@@ -124,6 +125,15 @@ service cannot decrypt the stored mailbox passwords.
 
 `/etc/systemd/system/luck-mail.service`:
 
+Create the DeepL key file first — the key must **not** go into the unit file
+itself (unit files are world-readable by default). One line,
+`DEEPL_API_KEY=<your DeepL key>`, mode `0600`:
+
+```bash
+sudo nano /opt/luck-mail/.deepl-env   # one line: DEEPL_API_KEY=<your DeepL key>
+sudo chmod 600 /opt/luck-mail/.deepl-env
+```
+
 ```ini
 [Unit]
 Description=luck-mail
@@ -139,7 +149,9 @@ Environment=DATA_DIR=/opt/luck-mail/data
 Environment=PUBLIC_DIR=/opt/luck-mail/backend/public
 Environment=KEY_FILE=/opt/luck-mail/.key
 Environment=COOKIE_SECURE=1
-Environment=DEEPL_API_KEY=<your DeepL key>
+EnvironmentFile=/opt/luck-mail/.deepl-env
+UMask=0077
+MemoryMax=1G
 Restart=always
 RestartSec=5
 

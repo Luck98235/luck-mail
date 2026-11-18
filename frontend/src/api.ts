@@ -159,13 +159,20 @@ export const api = {
     request<{ ok: boolean }>(`/api/messages/${id}/move`, { method: 'POST', body: { folderId } }),
   // 单封删除：彻底删除与否以后端实际文件夹为准（folder.type==='trash'），
   // 客户端 permanent 查询参数已废弃（后端已忽略），不再发（F12c）。
-  deleteMessage: (id: number | string) =>
-    request<{ ok: boolean }>(`/api/messages/${id}`, { method: 'DELETE' }),
+  // 删信幂等键（审计 #6）：每次删除动作生成一个 key 传给后端（body 的
+  // idempotencyKey，后端 query/body 都认）；响应丢失后重试同一动作时复用
+  // 同一个 key，后端直接返回第一次的结果，不再执行第二次删除——否则一次
+  // “移到已删除”重试后会变成永久删除。key 由调用方（store）生成并保管，
+  // 这里只负责透传。
+  deleteMessage: (id: number | string, idempotencyKey?: string) =>
+    request<{ ok: boolean; duplicate?: boolean }>(`/api/messages/${id}`, { method: 'DELETE', body: idempotencyKey ? { idempotencyKey } : undefined }),
   // 批量删除：后端永远异步返回 { ok, taskId, status:'running' }，
   // 进度走 getDeleteStatus；请求体不带 permanent（彻底与否以后端实际
   // 文件夹为准，后端忽略该字段）。同步返回分支仅作防御兼容。
-  batchDeleteMessages: (ids: Array<number | string>, view?: { kind: string; accountId: number | null; folderId: number | null }) =>
-    request<{ ok: boolean; deleted?: number[]; failed?: Array<{ id: number; error: string }>; taskId?: string; status?: string }>('/api/messages/batch-delete', { method: 'POST', body: { ids, view } }),
+  // 删信幂等键（审计 #6）：与单删同一字段、同一语义——同一 key 重复提交时
+  // 后端直接返回第一次的 taskId，不另起任务、不重复删。
+  batchDeleteMessages: (ids: Array<number | string>, view?: { kind: string; accountId: number | null; folderId: number | null }, idempotencyKey?: string) =>
+    request<{ ok: boolean; deleted?: number[]; failed?: Array<{ id: number; error: string }>; taskId?: string; status?: string; duplicate?: boolean }>('/api/messages/batch-delete', { method: 'POST', body: { ids, view, ...(idempotencyKey ? { idempotencyKey } : {}) } }),
   // 批量删除任务状态：刷新/切页回来后查它，任务未完成时继续显示“删除中…”。
   // view 是发起删除的视图（后端记的），刷新后靠它只在该视图显示删除中。
   // taskId（可选）：本会话发起的异步任务传自己的 taskId，避免两标签页

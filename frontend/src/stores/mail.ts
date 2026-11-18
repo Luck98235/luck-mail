@@ -102,6 +102,36 @@ export const useMailStore = defineStore('mail', () => {
   // 做本地对账，等轮询确认 running===false 后，用状态接口的 deleted（数字计数）
   // 一次结算 toast（total 由刚拉的列表重算，不再另减）。
   let pendingBatchDelete: { permanent: boolean; draftCount: number; taskId?: string } | null = null
+  // 删信幂等键（审计 #6）：后端 delete_idempotency 早已支持，但前端以前
+  // 从不传 key，保护从未生效。响应丢失后用户重试同一删除动作时，同一 key
+  // 让后端直接返回第一次的结果，不再执行第二次删除——否则一次“移到已删除”
+  // 重试后会变成永久删除。key 生成规则与发信的 idempotencyKey 一致
+  //（crypto.randomUUID，有回落）。单删按邮件 id 存一份，删成后清掉，
+  // 删失败（行还在）时留着，下次再点同一封复用；批量删按待删 id 集合存
+  // 一份，任务跑完后清掉（轮询查不到任务状态时不清，留给重试复用）。
+  function newDeleteKey(): string {
+    try {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+    } catch { /* 回落到时间戳+随机数 */ }
+    return `lm-del-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  }
+  const singleDeleteKeys = new Map<string, string>()
+  function singleDeleteKey(id: number | string): string {
+    const k = String(id)
+    const old = singleDeleteKeys.get(k)
+    if (old) return old
+    const next = newDeleteKey()
+    singleDeleteKeys.set(k, next)
+    return next
+  }
+  let lastBatchDeleteKey: { key: string; idsKey: string } | null = null
+  function batchDeleteKey(ids: Array<number | string>): string {
+    const idsKey = [...ids].map(String).sort().join(',')
+    if (lastBatchDeleteKey && lastBatchDeleteKey.idsKey === idsKey) return lastBatchDeleteKey.key
+    const next = newDeleteKey()
+    lastBatchDeleteKey = { key: next, idsKey }
+    return next
+  }
   function stopDeletePolling(): void {
     if (deleteStatusTimer) { clearInterval(deleteStatusTimer); deleteStatusTimer = null }
   }
@@ -138,6 +168,9 @@ export const useMailStore = defineStore('mail', () => {
         deleteRemaining.value = Math.max(0, (st.total || 0) - (st.deleted || 0))
         startDeletePolling()
       } else {
+        // 任务跑完：批量删除动作结束，本次的幂等 key 不再留给重试（下次删
+        // 同一批 id 是新的删除动作，重新生成；见 lastBatchDeleteKey）。
+        lastBatchDeleteKey = null
         if (batchDeleting.value) {
           batchDeleting.value = false
           deleteRemaining.value = 0
@@ -550,7 +583,7 @@ export const useMailStore = defineStore('mail', () => {
       // folderId 只在 view=folder 时带。
       if (view.value.kind !== 'folder') params.folderId = undefined
       const data = await api.messages(params)
-      if (seq !== loadSeq) return // 已被更新的请求取代，丢弃旧响应（含自动打开那段）
+      if (seq !== loadSeq) return // 已被更新的请求取代，丢弃旧响应
       // 按 id 去重（审计 #4 LOW 加固）：防后端某次返回同一 id 两次时前端
       // 渲染双行；只挡同一 id 的重复，对“不同 id 的两行”无效。
       // 草稿不在这里拼：草稿视图上面已提前返回，搜索时草稿也不进结果。
@@ -666,7 +699,12 @@ export const useMailStore = defineStore('mail', () => {
     // 批量删除进行中：阅读窗的删除按钮已禁用（F4），这里再守一道入口。
     if (isDeletingHere.value) return
     try {
-      await api.deleteMessage(id)
+      // 删信幂等键（审计 #6）：同一封的重试复用同一个 key（singleDeleteKey
+      // 按 id 缓存），响应丢失后用户再点删除，后端返回第一次的结果，不重删。
+      await api.deleteMessage(id, singleDeleteKey(id))
+      // 删成了：本次动作的 key 使命结束，清掉；以后再删这封（它已不在列表，
+      // 只能是重新出现后的新动作）重新生成。
+      singleDeleteKeys.delete(String(id))
       // 状态同步：mailList 与 unreadCounts 一起即时更新，不重新拉全量。
       // 单删接口是同步的，后端删完发 mail-deleted（io.emit，全员含发起方）
       // 才响应，实时事件可能已提前把行拿掉并减过 total：这里只在行还在
@@ -687,9 +725,13 @@ export const useMailStore = defineStore('mail', () => {
       // 对账不清空批量勾选（keepChecked）：失败一次不应把用户已勾的别的邮件全取消。
       await loadMessages({ keepChecked: true })
       if (!mailList.value.some((m) => m.id === id)) {
+        // 行已不在说明服务端其实删成了，本次动作的 key 使命结束，清掉。
+        singleDeleteKeys.delete(String(id))
         if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
         showToast(isTrashView.value ? '已彻底删除' : '已移到已删除')
       } else {
+        // 行还在才是真失败：key 留着，用户下次再点同一封删除时复用它，
+        // 后端认得出这是同一删除动作的重试，不会把“移到已删除”变成永久删除。
         showToast(e instanceof ApiError ? e.message : '删除失败，请重试')
       }
     }
@@ -742,7 +784,10 @@ export const useMailStore = defineStore('mail', () => {
       let failedCount = 0
       if (serverIds.length) {
         // 把发起删除的视图一并传给后端：刷新后 delete-status 靠它恢复“只在该视图显示删除中”。
-        const res = await api.batchDeleteMessages(serverIds, { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId })
+        // 删信幂等键（审计 #6）：同一批 id 的重试复用同一个 key（batchDeleteKey
+        // 按 id 集合缓存），POST 响应丢失后用户再点批量删除，后端返回第一次
+        // 的 taskId，不另起任务、不重复删。
+        const res = await api.batchDeleteMessages(serverIds, { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId }, batchDeleteKey(serverIds))
         if (res.taskId) {
           // F14 异步返回：后端只给了 taskId，删除在后台跑。最终结算仍等
           // syncDeleteStatus 确认 running===false 后，用状态接口的
@@ -1195,6 +1240,7 @@ export const useMailStore = defineStore('mail', () => {
     stopDeletePolling()
     deleteStatusFailures = 0
     pendingBatchDelete = null
+    lastBatchDeleteKey = null
     batchDeleting.value = false
     deleteRemaining.value = 0
     deleteView.value = null

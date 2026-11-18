@@ -7,7 +7,7 @@
 
 ## 认证（单用户，Cookie 会话）
 
-- Cookie 名 `lm_session`，httpOnly，SameSite=Lax，Path=/。除下述三个接口外，所有 `/api/*` 与 `/socket.io/` 都必须带有效会话，否则 401。
+- Cookie 名 `lm_session`，httpOnly，SameSite=Lax，Path=/。除下述三个接口与健康检查接口外，所有 `/api/*` 与 `/socket.io/` 都必须带有效会话，否则 401。
 - `GET /api/auth/status` → `{ok:true, setupRequired:boolean, loggedIn:boolean, username?:string}`
   - `setupRequired=true` 表示还没有任何用户（首次使用），前端显示“创建账号”页。
 - `POST /api/auth/setup` `{username, password, confirm}` → 201 `{ok:true}`。
@@ -15,6 +15,10 @@
 - `POST /api/auth/login` `{username, password, rememberMe?}` → 200 `{ok:true, username}` + Set-Cookie。错 401；锁定 429。`rememberMe=true` 时建 30 天会话，否则 1 天（不传默认 1 天）。
 - `POST /api/auth/logout` → 200，清 Cookie。
 - `POST /api/auth/change-password` `{current, next}` → 200。`next` ≥8 位。
+
+## 健康检查
+
+- `GET /api/health` → `{"ok":true,"db":"ok"}`，免登录。只返回服务与数据库是否正常，不暴露账号数等信息。
 
 ## 服务商预设（知名邮箱自动填服务器）
 

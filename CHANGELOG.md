@@ -11,7 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Refresh-all button on the mobile/tablet account overview (same refresh-all as desktop)
-- Search results switch the reading pane to the first result on desktop
 - Drafts are now stored on the server (audit #5, 2026-11-18): new /api/drafts CRUD, auto-save while composing, sending a draft deletes it, and existing local drafts are migrated once on first load
 - Browser notifications for new mail (2026-11-18): a "New mail notifications" toggle in Settings; when the page is in the background, a system notification shows the sender and subject (click opens the mail); multiple mails within 3 seconds merge into one summary notification
 
@@ -28,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit #5b follow-up fixes (2026-11-18): send route now has an outer catch (unexpected errors return 500 instead of crashing the process); re-claiming an in-progress send key checks the Sent folder first (the Message-ID is planned and stored at claim time) so a crash after SMTP success no longer resends; batch delete isolates per-message errors into the failed list; sending with a draftId now verifies the draft belongs to the sending account; /api/health no longer exposes the online account count; app-layer security headers removed (OpenResty is the single layer)
 - Docs: migration sizes updated to measured values; automatic daily backup documented, and the backup script is now in the repo (scripts/backup-cron.sh)
 - No more auto-open (2026-11-18): clicking a folder, searching, clearing a search, or deleting the message being read no longer opens the first/next message automatically — everything opens on click; the reading pane shows an empty state until a message is chosen
+- Audit #6 fixes (2026-11-18, third pre-launch review): delete actions now send an idempotencyKey so the backend delete-idempotency protection actually applies; QQ accounts' last-sync time now updates on IDLE-driven syncs; login lockout messages no longer distinguish unknown usernames from known ones; graceful shutdown no longer hangs on open Socket.io connections (the old process used to exit 1 after 30s); docs corrected (stale search auto-open line removed, README mail-flow/IDLE wording, migration service template now includes UMask/MemoryMax and an EnvironmentFile for the DeepL key)
 
 ### Removed
 - Dead-code cleanup across frontend, backend and config: unused functions, dead endpoints (`/api/search`, `/api/status`), SnappyMail scaffolding, old `frontend/main/` and `research/` references

@@ -29,7 +29,7 @@ Moving to a new server? See [MIGRATION.md](MIGRATION.md).
 7. **Compose** — subject required, attachments supported; an empty subject is auto-filled with the first attachment's filename. The sender dropdown shows serial numbers (【01】, 【02】…). Attachments are metadata-only when sent; the body lives on the mail server's Sent folder, and downloading a sent attachment streams it live from IMAP.
 8. **Themes** — six color themes (blue default, green, black-white, purple, orange, cyan) via the palette button; saved in localStorage; scrollbars follow the theme.
 9. **Search** — full-text search over subjects, senders and bodies (SQLite FTS5 trigram).
-10. **Settings** — change username, change password (entered twice), default account (with serial numbers), signature, logout. A **Backup to local** button downloads a `.tar.gz` containing the encryption key plus a consistent database snapshot, bodies and attachments — extract it to restore the whole installation (see [MIGRATION.md](MIGRATION.md)).
+10. **Settings** — change username, change password (entered twice), default account (with serial numbers), signature, a **New mail notifications** toggle (system notifications for unread new mail while the page is in the background; stored in localStorage), logout. A **Backup to local** button downloads a `.tar.gz` containing the encryption key plus a consistent database snapshot, bodies and attachments — extract it to restore the whole installation (see [MIGRATION.md](MIGRATION.md)).
 
 ## Architecture
 
@@ -38,12 +38,12 @@ Single Node process + SQLite. No PostgreSQL, Redis, S3 or Elasticsearch.
 | Layer | Stack |
 |---|---|
 | Backend | Node 22 + Express + TypeScript (strict) + Socket.io + better-sqlite3 |
-| Mail | imapflow (IDLE + incremental sync) + Nodemailer (send) + mailparser (streaming parse) |
+| Mail | imapflow (IDLE for most providers; NetEase 163/126/yeah/188 poll every ~5 min instead) + Nodemailer (send) + mailparser (streaming parse) |
 | Frontend | Vue 3 + Vite + TypeScript (strict) + Pinia + Tailwind + socket.io-client |
 | Storage | SQLite (WAL + FTS5 trigram); sanitized HTML bodies as files; attachments are metadata-only — content is streamed live from IMAP on download, never stored on disk |
 | Security | AES-256-GCM mailbox password encryption; DOMPurify + JSDOM sanitization; sandboxed iframe (srcdoc) for bodies |
 
-**How mail flows:** the frontend talks only to the Node backend over one WebSocket (Socket.io). imapflow keeps an IDLE connection per mailbox; on new mail the backend pushes JSON to Vue, which updates unread counts and the list. Deleting a message performs the IMAP operation on the server first (move to trash, or expunge for permanent delete), then updates the local database — client and server stay in sync.
+**How mail flows:** the frontend talks only to the Node backend over one WebSocket (Socket.io). For most providers imapflow keeps one IDLE connection per mailbox; on new mail the backend pushes JSON to Vue, which updates unread counts and the list. NetEase accounts (163/126/yeah/188) do not use IDLE at all — 163 silently drops IDLE after ~3 minutes, so those accounts poll all folders every ~4.5–5.5 minutes over a short-lived connection instead, and new mail there can take up to ~5 minutes to appear. Other providers keep IDLE, with a 5-minute periodic INBOX sync as the fallback when IDLE does not push (e.g. QQ). Deleting a message performs the IMAP operation on the server first (move to trash, or expunge for permanent delete), then updates the local database — client and server stay in sync.
 
 ## Known provider presets
 
@@ -122,6 +122,9 @@ frontend/                # Vue 3 + Vite + TypeScript + Pinia
     stores/              # mail (global), auth, theme
     api.ts               # REST client
     realtime.ts          # Socket.io client
+  scripts/
+    noautoopen-test.mjs  # static regression test: nothing auto-opens a message (all opens are manual clicks)
+    notify-test.mjs      # browser-notification logic test (3s merge window, hidden-tab only, unread only)
 API_CONTRACT.md          # backend/frontend API contract
 scripts/backup-cron.sh   # daily automatic backup (cron 03:00, keeps 7 copies)
 LICENSE                  # AGPL-3.0
@@ -137,15 +140,16 @@ LICENSE                  # AGPL-3.0
 ## Troubleshooting
 
 - Service status: `systemctl status luck-mail`; logs: `journalctl -u luck-mail -f`.
-- Health check: `GET /api/health` → `{ok:true}` when the server is up (no login required).
+- Health check: `GET /api/health` → `{"ok":true,"db":"ok"}` when the server and database are up (no login required).
 - Cannot log in: check the 5-failure lockout (15 minutes) and that the username has no email suffix; the password is the login password, not a mailbox authorization code.
-- A mailbox shows offline/error: open **Manage mailboxes → Test** for that mailbox; IMAP/SMTP errors are shown there. QQ Mail does not push IDLE notifications, so new mail can take up to 5 minutes to appear (periodic sync fallback).
+- A mailbox shows offline/error: open **Manage mailboxes → Test** for that mailbox; IMAP/SMTP errors are shown there. QQ Mail does not push IDLE notifications, so new QQ mail can take up to 5 minutes to appear (periodic sync fallback). NetEase (163/126/yeah/188) accounts poll every ~5 minutes instead of IDLE, so new mail there can also take up to ~5 minutes.
 - Sync seems stuck: use the refresh button (desktop header / mobile account overview); check `journalctl -u luck-mail` for sync errors.
 
 ## Known limitations
 
 - Scale: up to 50 mailboxes; single Node process + SQLite.
 - QQ Mail IMAP IDLE does not push new-mail notifications; a 5-minute periodic sync is the fallback, so new QQ mail can take up to 5 minutes to show.
+- NetEase (163/126/yeah/188) accounts do not use IDLE at all — they poll all folders every ~5 minutes over short-lived connections, so new mail can take up to ~5 minutes to show.
 - After deleting mail, the list can take about 5–6 seconds to reflect the change (async batch delete).
 - TLS certificates must be renewed (Let's Encrypt, auto-renewal via cron — see [MIGRATION.md](MIGRATION.md)).
 

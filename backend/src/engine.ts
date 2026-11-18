@@ -352,6 +352,10 @@ export class SyncEngine {
       ).get(accountId) as FolderRow | undefined;
       if (inbox) {
         await this._syncFolder(c, accountId, inbox);
+        // Audit #6：收件箱同步完成后更新 last_sync_at——之前只有
+        // 初始连接、网易轮询、手动刷新三处更新，QQ 等 IDLE 账号走
+        // _onExists 兜底同步时不更新，前端账号列表长期显示旧时间。
+        getDb().prepare("UPDATE accounts SET last_sync_at=datetime('now') WHERE id=?").run(accountId);
         await this._openInbox(c, accountId);
       }
     }).catch((e: unknown) => logError(`inbox sync on exists failed account ${accountId}:`, (e as Error)?.message || e))

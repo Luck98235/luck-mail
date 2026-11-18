@@ -193,6 +193,9 @@ async function main() {
   await waitFor(() => mock.log.some((e) => e.method === 'DELETE' && /^\/api\/messages\/\d+/.test(e.path)), 10000, 'DELETE 请求')
   const delEntry = mock.log.find((e) => e.method === 'DELETE')
   check('删除调 DELETE /api/messages/:id', !!delEntry, delEntry?.path || '')
+  // 审计 #6：单封删除请求体带 idempotencyKey（删信幂等前端接线），响应丢失
+  // 后重试同一删除时后端认得出是同一动作，不会把“移到已删除”变成永久删除。
+  check('单封删除请求带 idempotencyKey', typeof delEntry?.body?.idempotencyKey === 'string' && delEntry.body.idempotencyKey.length > 0, String(delEntry?.body?.idempotencyKey || ''))
   await sleep(500)
   // 删掉 id 2 后未读列表里还剩 Socket.io 新邮件（id 99）；2026-11-18 定夺
   // “全部手动点开”：删信后不再自动打开下一封，阅读窗回到空状态。

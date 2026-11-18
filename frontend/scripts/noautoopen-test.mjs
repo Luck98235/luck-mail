@@ -23,8 +23,8 @@ function fnBody(src, fnStart, nextStart) {
   return b === -1 ? src.slice(a) : src.slice(a, b)
 }
 
-// 1. 没有任何调用点再传 autoOpenFirst（setSearch 也不传）。
-check('no autoOpenFirst: call argument', !/autoOpenFirst\s*:/.test(storeSrc))
+// 1. 源码里不再出现 autoOpenFirst（调用参数、裸引用一律不留）。
+check('no autoOpenFirst anywhere', !/autoOpenFirst/.test(storeSrc))
 
 // 2. loadMessages 体内不再调用 openMessage（搜/切文件夹/翻页/刷新都不自动打开）。
 const loadBody = fnBody(storeSrc, 'async function loadMessages(', '\n  async function goToPage(')

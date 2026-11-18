@@ -13,7 +13,7 @@ luck-mail 的所有数据都在服务器上的**两个地方**：
 | 路径 | 存什么 |
 | --- | --- |
 | `/opt/luck-mail/.key` | 32 字节 AES-256-GCM 加密密钥（文件权限 `0600`）。所有邮箱密码都用这个密钥加密后才存进数据库。 |
-| `/opt/luck-mail/data/` | SQLite 数据库 `luck-mail.db`、邮件正文 `bodies/`、2026-11-17 之前缓存的旧附件 `attachments/`。 |
+| `/opt/luck-mail/data/` | SQLite 数据库 `luck-mail.db`、邮件正文 `bodies/`、`attachments/`（2026-11-18 已清空——附件默认只存元数据，下载走 IMAP 实时流，不缓存在磁盘上）。 |
 
 数据库里存的是：登录账号、全部邮箱账号（地址、**加密后的**密码、服务器
 设置、别名、排序、停用状态）、从各邮件服务器同步来的文件夹、邮件元信息
@@ -42,6 +42,7 @@ luck-mail 的所有数据都在服务器上的**两个地方**：
 ## 哪些东西不会跟着迁移
 
 - **配色偏好** — 也是浏览器 `localStorage`。
+- **新邮件通知开关** — 也是浏览器 `localStorage`。
 - **登录会话** — 迁移后需要重新登录。
 - **TLS 证书** — 新服务器上重新签发（Let's Encrypt）。
 
@@ -61,7 +62,7 @@ sudo tar -czf luck-mail-backup-$(date +%Y%m%d).tar.gz -C /opt/luck-mail .key dat
 scp luck-mail-backup-*.tar.gz root@<新服务器>:/tmp/
 ```
 
-整个数据目录很小（截至 2026-11-18 的参考值：27 个邮箱、227 封邮件，一共 6.0MB：DB 1.7MB + WAL 4.1MB + bodies 280KB + attachments 4.0KB，空目录），每天备一份也不贵。备份要放在**服务器之外**的地方。
+整个数据目录很小（截至 2026-11-18 的参考值：27 个邮箱、228 封邮件，一共 6.1MB：DB 1.7MB + WAL 4.1MB + bodies 292KB + attachments 4.0KB，空目录），每天备一份也不贵。备份要放在**服务器之外**的地方。
 
 ### 每日自动备份
 
@@ -115,6 +116,13 @@ sudo ls -l /opt/luck-mail/.key /opt/luck-mail/data/luck-mail.db
 
 `/etc/systemd/system/luck-mail.service`：
 
+先建 DeepL 密钥文件——密钥**不要**写进单元文件本身（单元文件默认全局可读）。只写一行 `DEEPL_API_KEY=<DeepL 密钥>`，权限 `0600`：
+
+```bash
+sudo nano /opt/luck-mail/.deepl-env   # 只写一行：DEEPL_API_KEY=<DeepL 密钥>
+sudo chmod 600 /opt/luck-mail/.deepl-env
+```
+
 ```ini
 [Unit]
 Description=luck-mail
@@ -130,7 +138,9 @@ Environment=DATA_DIR=/opt/luck-mail/data
 Environment=PUBLIC_DIR=/opt/luck-mail/backend/public
 Environment=KEY_FILE=/opt/luck-mail/.key
 Environment=COOKIE_SECURE=1
-Environment=DEEPL_API_KEY=<DeepL 密钥>
+EnvironmentFile=/opt/luck-mail/.deepl-env
+UMask=0077
+MemoryMax=1G
 Restart=always
 RestartSec=5
 

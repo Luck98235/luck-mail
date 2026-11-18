@@ -156,15 +156,30 @@ async function main(): Promise<void> {
 
   const shutdown = (): void => {
     log('shutting down…');
-    server.close(() => {
+    // Audit #6 查因：旧进程 16:32:10 停服、16:32:40 才退出（正好 30 秒），
+    // systemd 记 status=1/FAILURE。根因是 server.close() 要等全部连接
+    // 结束才回调，而 io.close() 原来在回调里——Socket.io 的 websocket
+    // 一直占着，回调永远等不到，30 秒兜底触发 process.exit(1)。
+    // 修法：先断所有 Socket.io 连接，再关 HTTP 服务；兜底也退出 0
+    // （主动停服本身不是失败）。Node 默认 keepAliveTimeout 5 秒，
+    // 闲置的浏览器连接会自己断，回调一般几秒内就到。
+    try { io.close(); } catch { /* ignore */ }
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
       try { engine.stopAll(); } catch { /* ignore */ }
-      try { io.close(); } catch { /* ignore */ }
-      closeDb();
+      try { closeDb(); } catch { /* ignore */ }
       process.exit(0);
-    });
-    // L8: 关机宽限从 5 秒提到 30 秒——部署重启时 5 秒会直接砍掉
-    // 进行中的发信（systemd 默认 TimeoutStopSec 90 秒，30 秒安全）。
-    setTimeout(() => process.exit(1), 30000).unref();
+    };
+    try {
+      server.close(() => finish());
+    } catch {
+      finish();
+    }
+    // L8: 关机宽限 30 秒——部署重启时太短会直接砍掉进行中的发信
+    // （systemd 默认 TimeoutStopSec 90 秒，30 秒安全）。
+    setTimeout(() => finish(), 30000).unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

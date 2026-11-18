@@ -653,7 +653,7 @@ export function messageRoutes(ctx: Ctx): express.Router {
         res.status(400).json({ ok: false, error: '收件人合计超过 50 人上限，请分批发送' });
         return;
       }
-      // B14: 附件总大小上限 50MB（单文件 25MB 由 multer 限，见 server.ts）。
+      // B14: 附件总大小上限 50MB（单文件 25MB 由本文件 :32 的 multer limits 限）。
       const totalBytes = files.reduce((s, f) => s + (f.size || 0), 0);
       if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
         res.status(413).json({ ok: false, error: '附件总大小超过 50MB 上限' });

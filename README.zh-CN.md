@@ -28,7 +28,7 @@
 7. **写信** — 主题必填，支持附件；主题为空时自动用第一个附件的文件名填充。发件人下拉列表带序号（【01】、【02】…）。发信附件只记元信息，本体只存邮箱服务器的已发送文件夹，下载已发附件时从 IMAP 实时取。
 8. **配色** — 6 种配色（蓝默认、绿、黑白、紫、橙、青），点调色板切换，localStorage 记住选择，滚动条跟着变色。
 9. **搜索** — 全文搜索主题、发件人、正文（SQLite FTS5 trigram）。
-10. **设置** — 改用户名、改密码（输两次）、默认账号（带序号）、签名、退出。**备份到本地**按钮下载一个 `.tar.gz`，里面是加密密钥 + 一致的数据库快照、正文和附件，解压即可恢复整个安装（见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。
+10. **设置** — 改用户名、改密码（输两次）、默认账号（带序号）、签名、“新邮件通知”开关（页面不在前台时有未读新邮件弹系统通知，存在 localStorage）、退出。**备份到本地**按钮下载一个 `.tar.gz`，里面是加密密钥 + 一致的数据库快照、正文和附件，解压即可恢复整个安装（见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。
 
 ## 架构
 
@@ -37,12 +37,12 @@
 | 层 | 技术 |
 |---|---|
 | 后端 | Node 22 + Express + TypeScript（strict）+ Socket.io + better-sqlite3 |
-| 邮件 | imapflow（IDLE + 增量同步）+ Nodemailer（发信）+ mailparser（流式解析） |
+| 邮件 | imapflow（多数服务商 IDLE；网易 163/126/yeah/188 改约 5 分钟轮询）+ Nodemailer（发信）+ mailparser（流式解析） |
 | 前端 | Vue 3 + Vite + TypeScript（strict）+ Pinia + Tailwind + socket.io-client |
 | 存储 | SQLite（WAL + FTS5 trigram）；消毒后的 HTML 正文存文件；附件只记元信息，下载时从 IMAP 实时取，永不落盘 |
 | 安全 | AES-256-GCM 邮箱密码加密；DOMPurify + JSDOM 消毒；沙盒 iframe（srcdoc）渲染正文 |
 
-**邮件怎么走：** 前端只跟 Node 后端建一个 WebSocket（Socket.io），不直连 IMAP。imapflow 给每个邮箱保持一条 IDLE 长连接；收到新邮件时后端经 WebSocket 推 JSON 给 Vue，更新未读数和列表。删信时先在服务器上做 IMAP 操作（移入已删除，或彻底删除时清掉），再改本地数据库——客户端和服务器始终一致。
+**邮件怎么走：** 前端只跟 Node 后端建一个 WebSocket（Socket.io），不直连 IMAP。多数服务商的邮箱由 imapflow 保持一条 IDLE 长连接；收到新邮件时后端经 WebSocket 推 JSON 给 Vue，更新未读数和列表。网易账号（163/126/yeah/188）完全不用 IDLE——163 约 3 分钟就静默断掉 IDLE，所以这些账号改成每约 4.5–5.5 分钟用短命连接轮询全部文件夹，新邮件最长约 5 分钟才出现。其他服务商保留 IDLE，IDLE 不推新邮件时（如 QQ）靠 5 分钟兜底轮询收件箱。删信时先在服务器上做 IMAP 操作（移入已删除，或彻底删除时清掉），再改本地数据库——客户端和服务器始终一致。
 
 ## 知名邮箱自动填服务器
 
@@ -121,6 +121,9 @@ frontend/                # Vue 3 + Vite + TypeScript + Pinia
     stores/              # mail（全局）、auth、theme
     api.ts               # REST 客户端
     realtime.ts          # Socket.io 客户端
+  scripts/
+    noautoopen-test.mjs  # 静态回归测试：没有任何地方自动打开邮件（全部手动点开）
+    notify-test.mjs      # 浏览器通知逻辑测试（3 秒合并、仅页面不在前台、仅未读）
 API_CONTRACT.md          # 前后端 API 合同
 scripts/backup-cron.sh   # 每日自动备份（cron 每天 03:00，只保留最近 7 份）
 LICENSE                  # AGPL-3.0
@@ -136,15 +139,16 @@ LICENSE                  # AGPL-3.0
 ## 排障
 
 - 服务状态：`systemctl status luck-mail`；日志：`journalctl -u luck-mail -f`。
-- 健康检查：`GET /api/health`，服务正常时返回 `{ok:true}`（不用登录）。
+- 健康检查：`GET /api/health`，服务与数据库正常时返回 `{"ok":true,"db":"ok"}`（不用登录）。
 - 登不上：先看是不是 5 次失败锁定了 15 分钟，用户名不要带邮箱后缀；登录密码是登录密码，不是邮箱授权码。
-- 某邮箱显示离线/异常：进**邮箱管理 → 测试**测该邮箱，IMAP/SMTP 哪一步失败会直接显示。QQ 邮箱不推 IDLE 新邮件通知，新邮件最长 5 分钟才出现（5 分钟兜底轮询）。
+- 某邮箱显示离线/异常：进**邮箱管理 → 测试**测该邮箱，IMAP/SMTP 哪一步失败会直接显示。QQ 邮箱不推 IDLE 新邮件通知，新邮件最长 5 分钟才出现（5 分钟兜底轮询）。网易（163/126/yeah/188）账号改约 5 分钟轮询、不走 IDLE，新邮件同样最长约 5 分钟才出现。
 - 同步像卡住了：点刷新按钮（桌面端顶栏 / 手机端账号总览页）；看 `journalctl -u luck-mail` 里有没有同步报错。
 
 ## 已知限制
 
 - 规模：最多 50 个邮箱，单 Node 进程 + SQLite。
 - QQ 邮箱 IMAP IDLE 不推新邮件通知，靠 5 分钟兜底轮询，新邮件最长 5 分钟才显示。
+- 网易（163/126/yeah/188）账号完全不用 IDLE，改每约 5 分钟用短命连接轮询全部文件夹，新邮件最长约 5 分钟才显示。
 - 删信后列表约 5–6 秒才反映变化（异步批量删除）。
 - TLS 证书要续期（Let's Encrypt，cron 自动续期，见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。
 

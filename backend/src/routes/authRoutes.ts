@@ -67,13 +67,14 @@ export function authRoutes(): express.Router {
     if (!username || !password) {
       return res.status(401).json({ ok: false, error: '用户名或密码不正确' });
     }
-    // 用户名不区分大小写：用户建账号用的是 Luck235，保存的登录是 luck235，
+    // 用户名不区分大小写：用户建账号用的是 zm235，保存的登录是 zm235，
     // SQLite 默认 = 是区分大小写的，查不到用户就直接报“用户名或密码不正确”。
     const user = db.prepare('SELECT * FROM users WHERE username=? COLLATE NOCASE').get(String(username).trim()) as UserRow | undefined;
     if (!user) {
       const rec = ipFail(req, 'login');
       if (rec.lockedUntil > Date.now()) {
-        return res.status(429).json({ ok: false, error: '尝试次数过多，已锁定 15 分钟', retryAfter: Math.ceil((rec.lockedUntil - Date.now()) / 1000) });
+        // Audit #6：锁定文案与已知用户完全一致（中性），不泄露用户名是否存在。
+        return res.status(429).json({ ok: false, error: '账号已锁定，请稍后再试', retryAfter: Math.ceil((rec.lockedUntil - Date.now()) / 1000) });
       }
       return res.status(401).json({ ok: false, error: '用户名或密码不正确' });
     }
@@ -92,7 +93,8 @@ export function authRoutes(): express.Router {
     if (!verifyPassword(String(password), user.salt, user.password_hash)) {
       const lockSec = userFail(db, user);
       if (lockSec > 0) {
-        return res.status(429).json({ ok: false, error: '密码错误次数过多，已锁定 15 分钟', retryAfter: lockSec });
+        // Audit #6：锁定文案与未知用户完全一致（中性），不泄露用户名是否存在。
+        return res.status(429).json({ ok: false, error: '账号已锁定，请稍后再试', retryAfter: lockSec });
       }
       return res.status(401).json({ ok: false, error: '用户名或密码不正确' });
     }
