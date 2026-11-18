@@ -151,38 +151,78 @@ export interface ConnectivityResult {
 
 // Combined connectivity test used by account create/update. Returns step
 // results; never throws for a plain connection/auth failure.
+// 总封顶 15 秒：IMAP 单项超时最长 30 秒、SMTP 最长 15+30 秒，一个死服务器
+// 会拖住整次调用（批量导入逐行测时更糟）。Promise.race 只截断等待、不取
+// 消底层的建连尝试（imapflow/nodemailer 不提供取消），超时后底层 socket
+// 仍受各自的 connectionTimeout/socketTimeout 约束、最长 30 秒内自行收敛，
+// 不影响已返回的结果。超时按连接失败返回，文案说明是超时及卡在哪一步。
+const CONNECTIVITY_TEST_TIMEOUT_MS = 15 * 1000;
 export async function testConnectivity(
   account: ImapAccount,
   password: string,
   logger?: unknown,
 ): Promise<ConnectivityResult> {
-  const result: ConnectivityResult = { imapOk: false, smtpOk: false, error: null };
-  try {
-    await testImap(account, password, logger);
-    result.imapOk = true;
-  } catch (e) {
-    result.error = `IMAP 连接失败（${account.imapHost}:${account.imapPort}）：${readableImapError(e)}`;
+  let phase: 'imap' | 'smtp' = 'imap';
+  const run = (async (): Promise<ConnectivityResult> => {
+    const result: ConnectivityResult = { imapOk: false, smtpOk: false, error: null };
+    try {
+      await testImap(account, password, logger);
+      result.imapOk = true;
+    } catch (e) {
+      result.error = `IMAP 连接失败（${account.imapHost}:${account.imapPort}）：${readableImapError(e)}`;
+      return result;
+    }
+    phase = 'smtp';
+    try {
+      await testSmtp(account, password);
+      result.smtpOk = true;
+    } catch (e) {
+      result.error = `SMTP 连接失败（${account.smtpHost}:${account.smtpPort}）：${readableImapError(e)}`;
+      return result;
+    }
     return result;
-  }
+  })();
+  let timer: NodeJS.Timeout | undefined;
   try {
-    await testSmtp(account, password);
-    result.smtpOk = true;
-  } catch (e) {
-    result.error = `SMTP 连接失败（${account.smtpHost}:${account.smtpPort}）：${readableImapError(e)}`;
-    return result;
+    const timeout = new Promise<ConnectivityResult>((resolve) => {
+      timer = setTimeout(() => {
+        const where = phase === 'imap'
+          ? `IMAP 连接失败（${account.imapHost}:${account.imapPort}）`
+          : `SMTP 连接失败（${account.smtpHost}:${account.smtpPort}）`;
+        resolve({ imapOk: false, smtpOk: false, error: `${where}：连接超时（15 秒内服务器无响应）` });
+      }, CONNECTIVITY_TEST_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    return await Promise.race([run, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  return result;
 }
 
 // B2: 判断一次 IMAP/SMTP 错误是不是认证失败（密码/授权码错）。
 // imapflow 把真实结论放在 `authenticationFailed` + `responseText` 里
 // （.message 只是通用的 "Command failed"）；nodemailer 用 code EAUTH /
 // "Invalid login: 550 ..."。
+// 注意 Gmail/Outlook 风格：服务器回 `NO [AUTHENTICATIONFAILED] Invalid
+// credentials`——imapflow 的 responseText 只含 TEXT 段（方括号里的响应码
+// 被解析成 section，不在文本里），message 又是通用的 "Command failed"，
+// 光看文本认不出来；响应码在 err.response（解析后的响应对象）里，直接
+// 按码判定。只看文本的旧版会把这类失败当成普通连接错误：引擎不置
+// authFailed、账号继续拿错凭证重连；导入失败原因也只会是含糊的
+// "Command failed"。密码错与授权码错同等对待：服务器拒绝登录即认证失败。
 export function isAuthError(e: unknown): boolean {
-  const err = e as { message?: string; authenticationFailed?: boolean; responseText?: string; code?: string; response?: string };
+  const err = e as {
+    message?: string; authenticationFailed?: boolean; responseText?: string; code?: string;
+    response?: string | { attributes?: { section?: { value?: unknown }[] }[] };
+  };
   if (err?.authenticationFailed || err?.code === 'EAUTH') return true;
-  const text = `${err?.message || ''} ${err?.responseText || ''} ${err?.response || ''}`;
-  return /Invalid login|AUTHENTICATIONFAILED|Login error/i.test(text);
+  const resp = err?.response;
+  if (resp && typeof resp === 'object') {
+    const code = resp.attributes?.[0]?.section?.[0]?.value;
+    if (typeof code === 'string' && code.toUpperCase() === 'AUTHENTICATIONFAILED') return true;
+  }
+  const text = `${err?.message || ''} ${err?.responseText || ''} ${typeof resp === 'string' ? resp : ''}`;
+  return /Invalid login|AUTHENTICATIONFAILED|Login error|Invalid credentials/i.test(text);
 }
 
 // Audit #8 LOW-1（友好性）：识别服务器的限流/拒绝信号（不是认证失败）。

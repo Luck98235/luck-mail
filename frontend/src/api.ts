@@ -215,12 +215,13 @@ export const api = {
   exportAccounts: () => downloadBlobFile('/api/accounts/export', '导出', 'luck-mail-accounts.xlsx', 'POST'),
   // 下载导入模板：空的 .csv，只有表头一行。
   downloadImportTemplate: () => downloadBlobFile('/api/accounts/import-template', '下载', 'luck-mail-import-template.csv'),
-  // 批量导入邮箱：走统一 request()（30 秒 AbortController 超时 + 401 处理），
-  // 不再用裸 fetch（F6）。
+  // 批量导入邮箱：走统一 request()（5 分钟 AbortController 超时 + 401 处理），
+  // 后端逐行先测连通再建账号，一行约 1-4 秒，行数多时 30 秒默认超时不够用；
+  // 超时后已导入的邮箱已保存，重复的行下次会跳过。
   importAccounts: async (file: File): Promise<{ added: number; skipped: number; failed: { row: number; email: string; reason: string }[]; addedEmails: string[]; skippedEmails: string[] }> => {
     const fd = new FormData()
     fd.append('file', file)
-    const data = await request<{ ok: boolean; added?: number; skipped?: number; failed?: { row: number; email: string; reason: string }[]; addedEmails?: string[]; skippedEmails?: string[] }>('/api/accounts/import', { method: 'POST', body: fd, isForm: true })
+    const data = await request<{ ok: boolean; added?: number; skipped?: number; failed?: { row: number; email: string; reason: string }[]; addedEmails?: string[]; skippedEmails?: string[] }>('/api/accounts/import', { method: 'POST', body: fd, isForm: true, timeoutMs: 5 * 60 * 1000, timeoutMessage: '导入超时，请重试（已导入的邮箱已保存，重复的行下次会跳过）' })
     return { added: data.added || 0, skipped: data.skipped || 0, failed: data.failed || [], addedEmails: data.addedEmails || [], skippedEmails: data.skippedEmails || [] }
   },
 }

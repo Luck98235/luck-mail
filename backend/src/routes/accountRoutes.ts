@@ -224,9 +224,12 @@ export function accountRoutes(ctx: Ctx): express.Router {
 
   // 批量导入邮箱：上传填好的导入模板（.csv），按行读出邮箱信息逐个添加。
   // 同名邮箱（不区分大小写）跳过，不报错；空行跳过；格式不对或服务器信息不全的行
-  // 记入 failed，不中断其余行。导入时不做连通测试（批量测太慢），加完后可用管理
-  // 列表每行的“测试”按钮逐个测。服务器地址/端口留空时按域名自动取预设，取不到则失败。
-  // 须登录；文件限 5MB。exceljs 只留给导出（只写不读），导入不再解析 xlsx。
+  // 记入 failed，不中断其余行。每行先测连通再入库（与单个添加同款
+  // testConnectivity，15 秒封顶）：授权码/密码错的账号不建库、不启动同步，
+  // 直接进 failed（reason 为测试返回的具体原因，前端直接展示）。逐行顺序测、
+  // 不并发——同一 IP 并发登录多家服务商会被当成撞服务器。服务器地址/端口留空
+  // 时按域名自动取预设，取不到则失败。须登录；文件限 5MB。exceljs 只留给导出
+  // （只写不读），导入不再解析 xlsx。
   const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
   r.post('/accounts/import', importUpload.single('file'), async (req: Request, res: Response) => {
     const db = getDb();
@@ -250,9 +253,11 @@ export function accountRoutes(ctx: Ctx): express.Router {
     );
     // 列顺序与导入模板一致：0 序号（忽略），1 邮箱名，2 授权码，3 IMAP 服务器，
     // 4 IMAP 端口，5 SMTP 服务器，6 SMTP 端口，7 备注。第 1 行是表头。
-    rows.forEach((cols, idx) => {
+    // 逐行顺序处理（for + await，不并发）；循环体内用 continue 跳行。
+    for (let idx = 0; idx < rows.length; idx++) {
+      const cols = rows[idx];
       const rnum = idx + 1;
-      if (rnum === 1) return;
+      if (rnum === 1) continue;
       const email = String(cols[1] ?? '').trim().toLowerCase();
       const password = String(cols[2] ?? '').trim();
       const imapHost = String(cols[3] ?? '').trim();
@@ -260,19 +265,19 @@ export function accountRoutes(ctx: Ctx): express.Router {
       const smtpHost = String(cols[5] ?? '').trim();
       const smtpPortRaw = cols[6];
       const displayName = String(cols[7] ?? '').trim();
-      if (!email) return;
+      if (!email) continue;
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         failed.push({ row: rnum, email, reason: '邮箱地址格式不正确' });
-        return;
+        continue;
       }
       if (seenInFile.has(email) || existingEmails.has(email)) {
         skipped.push(email);
-        return;
+        continue;
       }
       seenInFile.add(email);
       if (!password) {
         failed.push({ row: rnum, email, reason: '授权码为空' });
-        return;
+        continue;
       }
       const preset = resolvePreset(email);
       const imapH = imapHost || preset?.imapHost || '';
@@ -283,7 +288,23 @@ export function accountRoutes(ctx: Ctx): express.Router {
       const smtpPort = Number.isInteger(smtpP) && smtpP > 0 && smtpP <= 65535 ? smtpP : (preset?.smtpPort ?? 0);
       if (!imapH || !imapPort || !smtpH || !smtpPort) {
         failed.push({ row: rnum, email, reason: '服务器地址或端口不完整，且该域名无自动预设' });
-        return;
+        continue;
+      }
+      // 先测连通再入库：密码/授权码错（认证失败）与连不上服务器都进 failed，
+      // 不 INSERT、不 startAccount、不发 account 事件。
+      const account: ImapAccount = {
+        email,
+        imapHost: imapH,
+        imapPort,
+        imapSecure: preset?.imapSecure || 'SSL',
+        smtpHost: smtpH,
+        smtpPort,
+        smtpSecure: preset?.smtpSecure || 'SSL',
+      };
+      const test = await testConnectivity(account, password);
+      if (!test.imapOk || !test.smtpOk) {
+        failed.push({ row: rnum, email, reason: test.error || '连接测试失败' });
+        continue;
       }
       const sortOrder = (db.prepare('SELECT COALESCE(MAX(sort_order),-1)+1 v FROM accounts').get() as { v: number }).v;
       const info = db.prepare(
@@ -291,13 +312,13 @@ export function accountRoutes(ctx: Ctx): express.Router {
           imap_secure, smtp_host, smtp_port, smtp_secure, sort_order, status)
          VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
       ).run(email, displayName, encryptSecret(password, masterKey),
-        imapH, imapPort, preset?.imapSecure || 'SSL',
-        smtpH, smtpPort, preset?.smtpSecure || 'SSL', sortOrder);
+        account.imapHost, account.imapPort, account.imapSecure,
+        account.smtpHost, account.smtpPort, account.smtpSecure, sortOrder);
       const newRow = db.prepare('SELECT * FROM accounts WHERE id=?').get(Number(info.lastInsertRowid)) as AccountRow;
       engine.startAccount(newRow.id);
       emit('account', { action: 'added', account: publicAccount(newRow) });
       added.push(email);
-    });
+    }
     res.json({ ok: true, added: added.length, skipped: skipped.length, failed, addedEmails: added, skippedEmails: skipped });
   });
 

@@ -56,7 +56,7 @@
             </tr>
           </tbody>
         </table>
-        <p v-if="error" class="text-xs text-red-500 bg-red-50 border border-red-100 rounded-lg px-3 py-2 mt-3">{{ error }}</p>
+        <p v-if="error" class="text-xs text-red-500 bg-red-50 border border-red-100 rounded-lg px-3 py-2 mt-3 whitespace-pre-line break-words">{{ error }}</p>
       </div>
 
       <div class="flex items-center justify-between px-5 py-3 border-t border-blue-100 bg-slate-50/50">
@@ -71,7 +71,7 @@
             <i class="fa-solid fa-file-arrow-down mr-1"></i>{{ downloadingTemplate ? '下载中…' : '下载导入模板' }}
           </button>
           <button class="px-4 py-2 rounded-md text-sm text-slate-600 hover:bg-slate-100 border border-slate-200 bg-white font-medium disabled:opacity-60" :disabled="importing" @click="importInput?.click()">
-            <i class="fa-solid fa-file-import mr-1"></i>{{ importing ? '导入中…' : '导入' }}
+            <i class="fa-solid fa-file-import mr-1"></i>{{ importing ? '导入中，正在逐个验证…' : '导入' }}
           </button>
           <input ref="importInput" type="file" accept=".csv,text/csv" class="hidden" @change="onImportFile" />
         </div>
@@ -305,7 +305,9 @@ async function onImportFile(ev: Event): Promise<void> {
     if (r.failed.length > 0) parts.push(`${r.failed.length} 行失败`)
     mail.showToast(parts.length ? parts.join('，') : '没有可导入的邮箱')
     if (r.failed.length > 0) {
-      error.value = '导入失败的行：' + r.failed.map((f) => `第 ${f.row} 行 ${f.email || ''}（${f.reason}）`).join('；')
+      // 失败行每行单独一行显示（error 区已加 whitespace-pre-line），长原因
+      // （如认证失败详情）完整显示、不截断；不只显示行号。
+      error.value = '导入失败的行：\n' + r.failed.map((f) => `第 ${f.row} 行 ${f.email || ''}（${f.reason}）`).join('\n')
     } else {
       error.value = ''
     }

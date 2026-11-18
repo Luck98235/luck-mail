@@ -5,11 +5,12 @@
 //  streaming parse + DOMPurify, worker-thread parse, FTS5 trigram (+2-char
 //  LIKE fallback), AES-256-GCM roundtrip, WAL mode, Socket.io push,
 //  bodies on disk, attachments metadata-only. Exits non-zero on any failure.
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import tls from 'node:tls';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
@@ -31,6 +32,24 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'luck-mail-verify-'));
 const DATA_DIR = path.join(TMP, 'data');
 const PUBLIC_DIR = path.join(TMP, 'public');
+
+// 第 18 节用的本机 TLS 假 IMAP 证书（自签名，SAN 127.0.0.1）：导入走预设
+// imapSecure='SSL'，明文假 IMAP 测不了连通；自签证书 + NODE_EXTRA_CA_CERTS
+// 让被测子进程信任它（只影响本次测试进程，不改生产 TLS 校验）。
+// openssl 不可用时 tlsFakeOk=false，第 18 节退化为真实 163 坏凭证行。
+let tlsFakeOk = false;
+let tlsCertPath = '';
+let tlsKeyPath = '';
+try {
+  const tlsDir = path.join(TMP, 'tls');
+  fs.mkdirSync(tlsDir, { recursive: true });
+  tlsCertPath = path.join(tlsDir, 'srv-cert.pem');
+  tlsKeyPath = path.join(tlsDir, 'srv-key.pem');
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-keyout', tlsKeyPath,
+    '-out', tlsCertPath, '-days', '2', '-nodes', '-subj', '/CN=127.0.0.1',
+    '-addext', 'subjectAltName=IP:127.0.0.1'], { stdio: 'ignore' });
+  tlsFakeOk = fs.existsSync(tlsCertPath) && fs.existsSync(tlsKeyPath);
+} catch { tlsFakeOk = false; }
 
 // Env must be set BEFORE importing dist modules (config reads it at import).
 process.env.DATA_DIR = DATA_DIR;
@@ -93,7 +112,8 @@ let serverExit = null;
 function startServer() {
   const srv = spawn('node', ['dist/server.js'], {
     cwd: BACKEND,
-    env: { ...process.env, PORT: String(PORT), DATA_DIR, PUBLIC_DIR },
+    env: { ...process.env, PORT: String(PORT), DATA_DIR, PUBLIC_DIR,
+      ...(tlsFakeOk ? { NODE_EXTRA_CA_CERTS: tlsCertPath } : {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   srv.stdout.on('data', (d) => { serverLog += d.toString(); });
@@ -1246,12 +1266,17 @@ try {
       + '5,csv5@unknown-domain-xyz.com,CODE5,,,,,x\r\n'
       + '6,csv6@163.com,CODE6,imap.163.com,993,smtp.163.com,465,"多行\n备注"\r\n';
     const imp = await apiMultipart('/api/accounts/import', 'import.csv', csv);
-    // resolvePreset 对未知域名也会造 imap./smtp.<domain>（与手动添加一致），
-    // 所以 csv5 同样入库（added=4）；只有格式错的 bad-email 进 failed。
-    check('CSV: import adds 4 (incl. quoted comma + quoted newline + unknown domain), skips 1 dup, fails 1',
-      imp.status === 200 && imp.json?.added === 4 && imp.json?.skipped === 1 && imp.json?.failed?.length === 1,
+    // 导入先测连通再入库：这里 4 行格式有效但凭据是假的，真 163 全部认证拒绝，
+    // 所以 added=0、failed=5（4 行认证失败 + 1 行格式错）；重复行仍在测连通
+    // 之前判重跳过（skipped=1）。引号逗号/引号换行/未知域名行的解析仍被覆盖——
+    // 它们都以正确邮箱名出现在 failed 里（不是解析失败）。
+    check('CSV: import tests connectivity first — fake creds rejected (added 0), skips 1 dup, fails 5',
+      imp.status === 200 && imp.json?.added === 0 && imp.json?.skipped === 1 && imp.json?.failed?.length === 5
+      && (imp.json.failed.filter((f) => /用户名或密码\/授权码不正确/.test(f.reason || '')).length === 3)
+      && (imp.json.failed.find((f) => f.email === 'csv5@unknown-domain-xyz.com')?.reason || '').includes('IMAP 连接失败'),
       `status=${imp.status} body=${JSON.stringify(imp.json)}`);
-    // 清理：删掉刚导入的 4 个账号（API 删除会停 engine，避免假账号连真实 163）。
+    // 清理：本轮应无 csv* 账号入库（都进 failed）；以防万一仍删一遍
+    // （API 删除会停 engine，避免假账号连真实 163）。
     const listAfter = await api('GET', '/api/accounts');
     const csvIds = (listAfter.json?.accounts || []).filter((a) => a.email.startsWith('csv')).map((a) => a.id);
     for (const id of csvIds) await api('DELETE', `/api/accounts/${id}`);
@@ -1666,6 +1691,207 @@ try {
       if (acc18) dropTransporter(acc18);
       if (acc18b) dropTransporter(acc18b);
     } catch { /* ignore */ }
+  }
+
+  // ---------- 18. CSV import tests connectivity first ----------
+  console.log('== csv import connectivity ==');
+  // (a) isAuthError / readableImapError：Gmail/Outlook 风格认证失败。
+  // 密码错与授权码错同等对待——只要是服务器拒绝登录（认证失败），都应识别。
+  {
+    const { isAuthError, readableImapError } = await import('../dist/imapUtil.js');
+    // imapflow 对 `NO [AUTHENTICATIONFAILED] Invalid credentials` 抛的真实形态：
+    // message 是通用 "Command failed"，responseText 只有 TEXT 段（方括号响应码
+    // 被解析成 section，不在文本里），响应码在 response 解析对象里。
+    const gmailErr = {
+      message: 'Command failed',
+      responseText: 'Invalid credentials (Failure)',
+      response: { attributes: [{ section: [{ type: 'ATOM', value: 'AUTHENTICATIONFAILED' }] }] },
+    };
+    check('import18a: isAuthError recognizes Gmail-style [AUTHENTICATIONFAILED] Invalid credentials (response code)',
+      isAuthError(gmailErr) === true);
+    check('import18a: readableImapError gives a clear auth reason for Gmail-style failure',
+      readableImapError(gmailErr).includes('用户名或密码/授权码不正确'),
+      readableImapError(gmailErr).slice(0, 120));
+    // 只有文本、没有 response 对象时也应识别（兜底）。
+    check('import18a: isAuthError recognizes Gmail-style text-only error (no response object)',
+      isAuthError({ message: 'Command failed', responseText: 'Invalid credentials (Failure)' }) === true);
+    // 163/QQ 风格保持识别。
+    check('import18a: isAuthError still recognizes 163-style "Login error"',
+      isAuthError({ message: 'Command failed', responseText: 'LOGIN Login error: invalid user or password' }) === true);
+    // 非认证错误不误判（否则普通断线也会停掉账号）。
+    check('import18a: isAuthError does not misclassify a plain timeout',
+      isAuthError(new Error('Timed out')) === false);
+  }
+
+  // (b) 导入端到端：好凭证建成、163 风格与 Gmail 风格坏凭证都进 failed、不建账号。
+  // 假 IMAP（TLS，自签证书；子进程经 NODE_EXTRA_CA_CERTS 信任）+ 假 SMTP（明文，
+  // gmail 预设 smtpSecure=STARTTLS）。LOGIN 按密码区分：GOODPASS 放行，
+  // WRONG163 回 163 风格、WRONG_GMAIL 回 Gmail 风格。
+  if (tlsFakeOk) {
+    let fakeImap = null;
+    let fakeSmtpImp = null;
+    let goodAccId = 0;
+    const imapLogins = [];
+    try {
+      fakeSmtpImp = await new Promise((resolve, reject) => {
+        const sockets = new Set();
+        const srv = net.createServer((socket) => {
+          sockets.add(socket);
+          socket.on('close', () => sockets.delete(socket));
+          let buf = '';
+          let dataMode = false;
+          let authStep = 0;
+          socket.write('220 localhost fake SMTP\r\n');
+          socket.on('data', (chunk) => {
+            buf += chunk.toString('utf8');
+            let idx;
+            while ((idx = buf.indexOf('\r\n')) >= 0) {
+              const line = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              if (dataMode) {
+                if (line === '.') { dataMode = false; socket.write('250 OK: queued\r\n'); }
+                continue;
+              }
+              const up = line.toUpperCase();
+              if (up.startsWith('EHLO') || up.startsWith('HELO')) socket.write('250-localhost\r\n250 AUTH LOGIN PLAIN\r\n');
+              else if (up.startsWith('AUTH PLAIN')) { authStep = 0; socket.write('235 OK\r\n'); }
+              else if (up.startsWith('AUTH LOGIN')) { authStep = 1; socket.write('334 VXNlcm5hbWU6\r\n'); }
+              else if (authStep === 1) { authStep = 2; socket.write('334 UGFzc3dvcmQ6\r\n'); }
+              else if (authStep === 2) { authStep = 0; socket.write('235 OK\r\n'); }
+              else if (up === 'QUIT') { socket.write('221 Bye\r\n'); socket.end(); }
+              else socket.write('250 OK\r\n');
+            }
+          });
+        });
+        srv.on('error', reject);
+        srv.listen(0, '127.0.0.1', () => { srv._sockets = sockets; resolve(srv); });
+      });
+      const fakeSmtpPort = fakeSmtpImp.address().port;
+      fakeImap = await new Promise((resolve, reject) => {
+        const sockets = new Set();
+        const srv = tls.createServer({ cert: fs.readFileSync(tlsCertPath), key: fs.readFileSync(tlsKeyPath) }, (socket) => {
+          sockets.add(socket);
+          socket.on('close', () => sockets.delete(socket));
+          let buf = '';
+          let idleTag = null;
+          socket.write('* OK fake IMAP ready\r\n');
+          socket.on('data', (chunk) => {
+            buf += chunk.toString('utf8');
+            let idx;
+            while ((idx = buf.indexOf('\r\n')) >= 0) {
+              const line = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              if (idleTag) {
+                if (line.toUpperCase() === 'DONE') { socket.write(`${idleTag} OK IDLE completed\r\n`); idleTag = null; }
+                continue;
+              }
+              const m = line.match(/^(\S+)\s+(\S+)(?:\s+(.*))?$/);
+              if (!m) continue;
+              const [, tag, cmdRaw, rest] = m;
+              const cmd = cmdRaw.toUpperCase();
+              if (cmd === 'CAPABILITY') socket.write(`* CAPABILITY IMAP4rev1 IDLE UIDPLUS\r\n${tag} OK CAPABILITY completed\r\n`);
+              else if (cmd === 'LOGIN') {
+                const parts = (rest || '').split(/\s+/);
+                // imapflow 发 LOGIN 时用户名带引号（"user@x"），密码是 atom；
+                // 两边引号都去掉再比对，否则断言按裸邮箱过滤不到。
+                const user = (parts[0] || '').replace(/^"|"$/g, '');
+                const pass = (parts[1] || '').replace(/^"|"$/g, '');
+                imapLogins.push({ user, pass, ok: pass === 'GOODPASS' });
+                if (pass === 'GOODPASS') socket.write(`${tag} OK LOGIN completed\r\n`);
+                else if (pass === 'WRONG_GMAIL') socket.write(`${tag} NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n`);
+                else socket.write(`${tag} NO [AUTHENTICATIONFAILED] LOGIN Login error: invalid user or password\r\n`);
+              } else if (cmd === 'LOGOUT') { socket.write(`* BYE Logging out\r\n${tag} OK LOGOUT completed\r\n`); socket.end(); }
+              else if (cmd === 'LIST') socket.write(`* LIST (\\HasNoChildren) "/" INBOX\r\n${tag} OK LIST completed\r\n`);
+              else if (cmd === 'SELECT') socket.write(`* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted\r\n* 0 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n* OK [UIDNEXT 1] Predicted next UID\r\n${tag} OK [READ-WRITE] SELECT completed\r\n`);
+              else if (cmd === 'SEARCH') socket.write(`* SEARCH\r\n${tag} OK SEARCH completed\r\n`);
+              else if (cmd === 'IDLE') { idleTag = tag; socket.write('+ idling\r\n'); }
+              else socket.write(`${tag} OK ${cmd} completed\r\n`);
+            }
+          });
+        });
+        srv.on('error', reject);
+        srv.listen(0, '127.0.0.1', () => { srv._sockets = sockets; resolve(srv); });
+      });
+      const fakeImapPort = fakeImap.address().port;
+      const csv = [
+        '序号,邮箱名,授权码,接收服务器（IMAP）,IMAP端口,发送服务器（SMTP）,SMTP端口,备注',
+        `1,goodimport@gmail.com,GOODPASS,127.0.0.1,${fakeImapPort},127.0.0.1,${fakeSmtpPort},good`,
+        `2,bad163import@gmail.com,WRONG163,127.0.0.1,${fakeImapPort},127.0.0.1,${fakeSmtpPort},bad163`,
+        `3,badgmailimport@gmail.com,WRONG_GMAIL,127.0.0.1,${fakeImapPort},127.0.0.1,${fakeSmtpPort},badgmail`,
+      ].join('\r\n');
+      const logBefore = serverLog.length;
+      const t0 = Date.now();
+      const form = new FormData();
+      form.append('file', new Blob([csv], { type: 'text/csv' }), 'import.csv');
+      const impRes = await fetch(BASE + '/api/accounts/import', { method: 'POST', headers: { Cookie: cookie }, body: form });
+      const impDt = Date.now() - t0;
+      const imp = await impRes.json();
+      console.log(`  import took ${impDt}ms for 3 rows (sequential connectivity tests)`);
+      check('import18b: 1 added + 2 failed (good row built, both bad-cred rows rejected)',
+        impRes.status === 200 && imp?.ok === true && imp?.added === 1 && (imp?.failed || []).length === 2,
+        `status=${impRes.status} added=${imp?.added} failed=${JSON.stringify(imp?.failed)?.slice(0, 240)}`);
+      const bad163 = (imp?.failed || []).find((f) => f.email === 'bad163import@gmail.com');
+      const badGmail = (imp?.failed || []).find((f) => f.email === 'badgmailimport@gmail.com');
+      check('import18b: 163-style bad row failed with a clear auth reason',
+        !!bad163 && /认证被拒|用户名或密码/.test(bad163.reason), bad163?.reason || 'missing');
+      check('import18b: Gmail-style bad row failed with a clear auth reason (not "Command failed")',
+        !!badGmail && /用户名或密码\/授权码不正确/.test(badGmail.reason) && !badGmail.reason.includes('Command failed'),
+        badGmail?.reason || 'missing');
+      check('import18b: good row listed in addedEmails',
+        (imp?.addedEmails || []).includes('goodimport@gmail.com'));
+      const goodRow = db.prepare('SELECT * FROM accounts WHERE email=?').get('goodimport@gmail.com');
+      goodAccId = goodRow ? Number(goodRow.id) : 0;
+      check('import18b: good account exists in DB', !!goodRow);
+      check('import18b: bad accounts were NOT inserted into DB',
+        !db.prepare('SELECT id FROM accounts WHERE email=?').get('bad163import@gmail.com')
+        && !db.prepare('SELECT id FROM accounts WHERE email=?').get('badgmailimport@gmail.com'));
+      // 引擎：好账号应连上变 online；坏账号的登录各只发生一次（逐行顺序测、
+      // 失败不重测），且引擎从未为坏账号建 state（serverLog 里无其邮箱）。
+      let goodOnline = false;
+      for (let i = 0; i < 20; i++) {
+        const l = await api('GET', '/api/accounts');
+        const g = (l.json?.accounts || []).find((a) => a.email === 'goodimport@gmail.com');
+        if (g?.status === 'online') { goodOnline = true; break; }
+        await new Promise((r2) => setTimeout(r2, 500));
+      }
+      check('import18b: engine started the good account (status online)', goodOnline);
+      const newLog = serverLog.slice(logBefore);
+      check('import18b: engine connected the good account and never touched the bad ones',
+        newLog.includes('goodimport@gmail.com')
+        && !newLog.includes('bad163import@gmail.com') && !newLog.includes('badgmailimport@gmail.com'),
+        `connected-good=${newLog.includes('goodimport@gmail.com')}`);
+      check('import18b: each bad credential was tried exactly once (sequential, no retry storm)',
+        imapLogins.filter((l) => l.user === 'bad163import@gmail.com').length === 1
+        && imapLogins.filter((l) => l.user === 'badgmailimport@gmail.com').length === 1
+        && imapLogins.filter((l) => l.user === 'goodimport@gmail.com').length >= 1,
+        JSON.stringify(imapLogins));
+    } finally {
+      // 删掉好账号（引擎干净停住，不留 IDLE 连接去撞已关的假服务器），再关假服务。
+      if (goodAccId) { try { await api('DELETE', `/api/accounts/${goodAccId}`); } catch { /* ignore */ } }
+      if (fakeImap) {
+        try { for (const s of fakeImap._sockets || []) s.destroy(); } catch { /* ignore */ }
+        await new Promise((resolve) => fakeImap.close(resolve));
+      }
+      if (fakeSmtpImp) {
+        try { for (const s of fakeSmtpImp._sockets || []) s.destroy(); } catch { /* ignore */ }
+        await new Promise((resolve) => fakeSmtpImp.close(resolve));
+      }
+    }
+  } else {
+    // openssl 不可用、建不了 TLS 假 IMAP 时退化：只测真实 163 坏凭证行进 failed
+    // （与第 7 节同款真实 163）；Gmail 风格只由上面的函数级断言覆盖。
+    console.log('  SKIP import18b end-to-end (no openssl for TLS fake IMAP); falling back to real-163 bad row');
+    const csv = '序号,邮箱名,授权码,接收服务器（IMAP）,IMAP端口,发送服务器（SMTP）,SMTP端口,备注\r\n'
+      + '1,realbadimport@163.com,FAKE_AUTH_CODE_123,imap.163.com,993,smtp.163.com,465,\r\n';
+    const form = new FormData();
+    form.append('file', new Blob([csv], { type: 'text/csv' }), 'import.csv');
+    const impRes = await fetch(BASE + '/api/accounts/import', { method: 'POST', headers: { Cookie: cookie }, body: form });
+    const imp = await impRes.json();
+    const bad = (imp?.failed || []).find((f) => f.email === 'realbadimport@163.com');
+    check('import18b-fallback: real-163 bad row goes to failed with a clear auth reason, no account created',
+      impRes.status === 200 && !!bad && /认证被拒|用户名或密码/.test(bad.reason)
+      && !db.prepare('SELECT id FROM accounts WHERE email=?').get('realbadimport@163.com'),
+      `status=${impRes.status} failed=${JSON.stringify(imp?.failed)?.slice(0, 160)}`);
   }
 
 } catch (e) {
