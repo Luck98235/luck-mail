@@ -101,16 +101,24 @@ function buildMailOptions(account: AccountRow, input: SendMailInput) {
 // sendMail 都 new MailComposer 会生成新的 Message-ID，APPEND 的副本
 // 与实际发出的邮件就对不上号。调用方（发信路由）在第一次发送前调
 // 一次，重试时把结果传给 sendMail。
+// Audit #5b: fixedMessageId——认领时预生成的 Message-ID（见
+// idempotency.ts）：崩溃后重认领也用同一个 ID 发，不再每次请求现生成。
 export async function buildRawMail(
   account: AccountRow,
   input: SendMailInput,
+  fixedMessageId?: string | null,
 ): Promise<{ raw: Buffer; messageId: string | null }> {
   const mailOptions = buildMailOptions(account, input);
+  const safeFixed = typeof fixedMessageId === 'string'
+    ? fixedMessageId.replace(/[\r\n]/g, '').trim()
+    : '';
   // 只生成一次 Message-ID：先 build raw，取其 Message-ID，再显式传给
   // sendMail。否则两个独立的 MailComposer 各生成一个不同的 Message-ID，
   // raw（APPEND 进已发送）与实际发出的邮件对不上号，之后按 Message-ID
   // 关联、去重、墓碑判断都会错位。
-  const composer = new MailComposer(mailOptions).compile();
+  const composer = new MailComposer(
+    safeFixed ? { ...mailOptions, messageId: safeFixed } : mailOptions,
+  ).compile();
   const raw: Buffer = await composer.build();
   return { raw, messageId: composer.messageId() };
 }

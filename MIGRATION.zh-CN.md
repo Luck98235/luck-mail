@@ -61,9 +61,20 @@ sudo tar -czf luck-mail-backup-$(date +%Y%m%d).tar.gz -C /opt/luck-mail .key dat
 scp luck-mail-backup-*.tar.gz root@<新服务器>:/tmp/
 ```
 
-整个数据目录很小（截至 2026-11-18 的参考值：27 个邮箱、228 封邮件，一共 7.8MB：
-DB 1.7MB + WAL 4.1MB + bodies 1.6MB + attachments 556KB），
-每天备一份也不贵。备份要放在**服务器之外**的地方。
+整个数据目录很小（截至 2026-11-18 的参考值：27 个邮箱、227 封邮件，一共 6.0MB：DB 1.7MB + WAL 4.1MB + bodies 280KB + attachments 4.0KB，空目录），每天备一份也不贵。备份要放在**服务器之外**的地方。
+
+### 每日自动备份
+
+仓库自带 `scripts/backup-cron.sh`：先给在线库做一致性快照（`db.backup()`，不用停服务），再把快照 + `.key` + `bodies/` + `attachments/` 打成包，放在 `/opt/luck-mail/backups/auto/`，只保留最近 **7** 份。装一次即可：
+
+```bash
+sudo cp scripts/backup-cron.sh /opt/luck-mail/backup-cron.sh
+sudo chmod 700 /opt/luck-mail/backup-cron.sh
+# crontab -e，加一行：
+0 3 * * * /opt/luck-mail/backup-cron.sh >> /opt/luck-mail/backups/backup-cron.log 2>&1
+```
+
+自动备份的包和手动备份的布局一样（`.key` + `luck-mail.db` + `bodies/` + `attachments/`），恢复方法与手动备份完全相同（见迁移步骤第 3 步）：先停服务，把包解到临时目录，再把文件拷回原位（`.key` 恢复为 `0600` 权限），启动服务。
 
 ## 迁移步骤（在新服务器上）
 

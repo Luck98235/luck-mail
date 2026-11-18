@@ -1241,6 +1241,25 @@ export class SyncEngine {
   // in the Sent folder by Message-ID right away, in the same IMAP session.
   // B11: parts（刚 APPEND 那封信的 BODYSTRUCTURE 附件 part 号）也在同一
   // 次会话里取，调用方不再另开一次 withClient 调 getAttachmentParts。
+  // Audit #5b：按 Message-ID 在已发送文件夹里找一封信（崩溃窗口
+  // 重认领时用）：先由调用方查本地 messages 表，本地没有再调这里查
+  // 服务器。复用 F3 的 _findUidByMessageId（FETCH 最近信封再 JS 比
+  // 对），不依赖服务器端 SEARCH HEADER（QQ 返回 []）。
+  // 查不到或 IMAP 不通时返回 null（调用方按“未发过”继续发送）；
+  // 失败只记日志、不抛错，不让一次重认领检查拖垮发信请求。
+  async findSentByMessageId(accountId: number, messageId: string): Promise<{ folderId: number; uid: number } | null> {
+    const db = getDb();
+    const sent = db.prepare("SELECT * FROM folders WHERE account_id=? AND type='sent' LIMIT 1").get(accountId) as FolderRow | undefined;
+    if (!sent) return null;
+    try {
+      const uid = await this.withClient(accountId, (client) => this._findUidByMessageId(client, sent.path, messageId));
+      return uid != null ? { folderId: sent.id, uid } : null;
+    } catch (e) {
+      logError(`find sent by Message-ID failed account ${accountId}:`, (e as Error)?.message || e);
+      return null;
+    }
+  }
+
   async appendToSent(accountId: number, raw: Buffer, messageId?: string | null): Promise<(FolderRow & { uid: number | null; ok: boolean; parts: AttachmentPart[] }) | null> {
     const db = getDb();
     const sent = db.prepare("SELECT * FROM folders WHERE account_id=? AND type='sent' LIMIT 1").get(accountId) as FolderRow | undefined;

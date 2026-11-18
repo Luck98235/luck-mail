@@ -18,7 +18,15 @@ import { io as ioClient } from 'socket.io-client';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BACKEND = path.resolve(__dirname, '..');
-const PORT = 18082;
+// Audit #5b：固定端口 18082 并行跑会抢占致误报失败——改动态取空闲端口。
+const PORT = await new Promise((resolve, reject) => {
+  const probe = net.createServer();
+  probe.once('error', reject);
+  probe.listen(0, '127.0.0.1', () => {
+    const p = probe.address().port;
+    probe.close(() => resolve(p));
+  });
+});
 const BASE = `http://127.0.0.1:${PORT}`;
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'luck-mail-verify-'));
 const DATA_DIR = path.join(TMP, 'data');
@@ -850,8 +858,8 @@ try {
     const savedCookie = cookie;
     cookie = '';
     const hr = await api('GET', '/api/health');
-    check('health: GET /api/health -> 200 {ok, db, accountsOnline} without login',
-      hr.status === 200 && hr.json?.ok === true && hr.json?.db === 'ok' && typeof hr.json?.accountsOnline === 'number',
+    check('health: GET /api/health -> 200 {ok, db} without login (no accountsOnline leak)',
+      hr.status === 200 && hr.json?.ok === true && hr.json?.db === 'ok' && !('accountsOnline' in (hr.json || {})),
       `status=${hr.status} body=${JSON.stringify(hr.json)}`);
     cookie = savedCookie;
   }
@@ -1145,7 +1153,8 @@ try {
     check('drafts: draft is deleted after successful send',
       !(r.json?.drafts || []).some((d) => d.id === sendDraft?.id), `left=${JSON.stringify((r.json?.drafts || []).map((d) => d.id))}`);
     // 发信失败保留草稿：idemtest 账号走真实 smtp.163.com，假凭据 -> 502。
-    r = await api('POST', '/api/drafts', { accountId: smtpAccId, to: 'y@163.com', subject: 'keep me', text: 'hi' });
+    // （草稿归属 idemAccountId——发信账号与草稿账号必须一致，见 5b-4。）
+    r = await api('POST', '/api/drafts', { accountId: idemAccountId, to: 'y@163.com', subject: 'keep me', text: 'hi' });
     const keepDraft = r.json?.draft;
     r = await api('POST', '/api/messages/send', {
       accountId: idemAccountId, to: 'x@163.com', subject: 'will fail', text: 'hi', draftId: keepDraft?.id,
@@ -1205,6 +1214,200 @@ try {
   check('L1: same key for a different message -> 409', r.status === 409, `status=${r.status}`);
   r = await api('DELETE', '/api/messages/424242?idempotencyKey=' + 'x'.repeat(129));
   check('L1: over-long idempotencyKey -> 400', r.status === 400, `status=${r.status}`);
+
+  // ---------- 18. audit #5b fixes ----------
+  console.log('== audit #5b fixes ==');
+  // 本地假 SMTP（与第 16 节同款：只认 PLAIN/LOGIN + MAIL/RCPT/DATA/QUIT；
+  // 另记 DATA 次数与最后一份原文，供重发断言用）。
+  let fakeSmtp18 = null;
+  let fakePort18 = 0;
+  let smtpDataCount = 0;
+  let lastRaw18 = '';
+  let acc18 = 0;
+  let acc18b = 0;
+  try {
+    fakeSmtp18 = await new Promise((resolve, reject) => {
+      const sockets = new Set();
+      const srv = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+        let buf = '';
+        let dataMode = false;
+        let authStep = 0;
+        socket.write('220 localhost fake SMTP\r\n');
+        socket.on('data', (chunk) => {
+          buf += chunk.toString('utf8');
+          let idx;
+          while ((idx = buf.indexOf('\r\n')) >= 0) {
+            const line = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            if (dataMode) {
+              if (line === '.') { dataMode = false; smtpDataCount += 1; socket.write('250 OK: queued\r\n'); }
+              else lastRaw18 += line + '\r\n';
+              continue;
+            }
+            const up = line.toUpperCase();
+            if (up.startsWith('EHLO') || up.startsWith('HELO')) socket.write('250-localhost\r\n250 AUTH LOGIN PLAIN\r\n');
+            else if (up.startsWith('AUTH PLAIN')) { authStep = 0; socket.write('235 OK\r\n'); }
+            else if (up.startsWith('AUTH LOGIN')) { authStep = 1; socket.write('334 VXNlcm5hbWU6\r\n'); }
+            else if (authStep === 1) { authStep = 2; socket.write('334 UGFzc3dvcmQ6\r\n'); }
+            else if (authStep === 2) { authStep = 0; socket.write('235 OK\r\n'); }
+            else if (up.startsWith('MAIL FROM:')) socket.write('250 OK\r\n');
+            else if (up.startsWith('RCPT TO:')) socket.write('250 OK\r\n');
+            else if (up === 'DATA') { dataMode = true; lastRaw18 = ''; socket.write('354 Go ahead\r\n'); }
+            else if (up === 'RSET' || up === 'NOOP') socket.write('250 OK\r\n');
+            else if (up === 'QUIT') { socket.write('221 Bye\r\n'); socket.end(); }
+            else socket.write('250 OK\r\n');
+          }
+        });
+      });
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        srv._sockets = sockets;
+        resolve(srv);
+      });
+    });
+    fakePort18 = fakeSmtp18.address().port;
+    const mkAcc18 = (email) => {
+      const info = db.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run(email, 'A5b', encryptSecret('FAKEPASS', key),
+        '127.0.0.1', 9999, 'SSL', '127.0.0.1', fakePort18, 'STARTTLS', 1);
+      return Number(info.lastInsertRowid);
+    };
+    acc18 = mkAcc18('a5b@163.com');
+    acc18b = mkAcc18('a5b-b@163.com');
+
+    // 5b-1a：发信前抛错（settings 表临时改名，签名查询在 try 内、局部
+    // catch 之外）→ 500 JSON、不崩溃、占位已释放（SMTP 还没成功）。
+    const settingsRowCount = db.prepare('SELECT COUNT(*) c FROM settings').get().c;
+    db.exec('ALTER TABLE settings RENAME TO settings_bak');
+    try {
+      r = await api('POST', '/api/messages/send', { accountId: acc18, to: 'x@163.com', subject: 't1a', text: 'hi', idempotencyKey: 'a5b-1a' });
+      check('5b-1a: send route unexpected error (pre-SMTP) -> 500 JSON, not a crash',
+        r.status === 500 && r.json?.ok === false, `status=${r.status} body=${JSON.stringify(r.json)?.slice(0, 120)}`);
+      const aliveA = await api('GET', '/api/health');
+      check('5b-1a: server still alive after the error', aliveA.status === 200 && aliveA.json?.ok === true);
+      const leftA = db.prepare('SELECT COUNT(*) c FROM sent_idempotency WHERE account_id=? AND idempotency_key=?').get(acc18, 'a5b-1a').c;
+      check('5b-1a: placeholder released (SMTP had not succeeded)', leftA === 0, `left=${leftA}`);
+    } finally {
+      db.exec('ALTER TABLE settings_bak RENAME TO settings');
+      // 改名会重写 sqlite_master 里的建表 SQL（IF NOT EXISTS 被去掉），
+      // 不按 SQL 文本比对，改核列名与行数。
+      const backCols = db.prepare('PRAGMA table_info(settings)').all().map((c) => c.name).join(',');
+      const backRows = db.prepare('SELECT COUNT(*) c FROM settings').get().c;
+      check('5b-1a: settings table restored', backCols === 'key,value' && backRows === settingsRowCount,
+        `cols=${backCols} rows=${backRows} expected=${settingsRowCount}`);
+    }
+
+    // 5b-1b：SMTP 成功后抛错（drafts 表挂 BEFORE DELETE 触发器，
+    // 发信成功后的草稿 DELETE 触发 RAISE(ABORT)）→ 500 JSON、不崩溃、
+    // 占位已回填完成（不再重发），假 SMTP 只收到 1 份 DATA。
+    r = await api('POST', '/api/drafts', { accountId: acc18, to: 'x@163.com', subject: 't1b', text: 'hi' });
+    const d1b = r.json?.draft;
+    check('5b-1b: draft created for the test', typeof d1b?.id === 'number', `draft=${JSON.stringify(d1b)}`);
+    db.exec(`CREATE TRIGGER verify_break_draft_delete BEFORE DELETE ON drafts BEGIN SELECT RAISE(ABORT, 'test-trigger'); END;`);
+    try {
+      const beforeB = smtpDataCount;
+      r = await api('POST', '/api/messages/send', { accountId: acc18, to: 'x@163.com', subject: 't1b', text: 'hi', draftId: d1b.id, idempotencyKey: 'a5b-1b' });
+      check('5b-1b: SMTP succeeded then draft DELETE throws -> 500 JSON, not a crash',
+        r.status === 500 && r.json?.ok === false, `status=${r.status} body=${JSON.stringify(r.json)?.slice(0, 120)}`);
+      const aliveB = await api('GET', '/api/health');
+      check('5b-1b: server still alive after the error', aliveB.status === 200 && aliveB.json?.ok === true);
+      const rowB = db.prepare('SELECT message_id, planned_message_id FROM sent_idempotency WHERE account_id=? AND idempotency_key=?').get(acc18, 'a5b-1b');
+      check('5b-1b: placeholder COMPLETED with the planned Message-ID (SMTP had succeeded)',
+        !!rowB?.message_id && rowB.message_id === rowB.planned_message_id, `row=${JSON.stringify(rowB)}`);
+      check('5b-1b: fake SMTP got exactly 1 DATA', smtpDataCount === beforeB + 1, `count=${smtpDataCount} before=${beforeB}`);
+    } finally {
+      db.exec('DROP TRIGGER IF EXISTS verify_break_draft_delete');
+    }
+    await api('DELETE', `/api/drafts/${d1b.id}`);
+
+    // 5b-2：模拟崩溃后重认领——首发 201 后把占位行拨回“进行中”且过期
+    // （created_at 拨到 11 分钟前），本地已发送文件夹里已有一行同
+    // Message-ID 的信；重发同一 key 应直接返回 duplicate，不再发第二封。
+    r = await api('POST', '/api/messages/send', { accountId: acc18, to: 'x@163.com', subject: 't2', text: 'hi', idempotencyKey: 'a5b-2' });
+    const m2 = r.json?.messageId;
+    check('5b-2: first send 201 with a Message-ID', r.status === 201 && typeof m2 === 'string' && m2.length > 0,
+      `status=${r.status} messageId=${m2}`);
+    db.prepare(`UPDATE sent_idempotency SET message_db_id=NULL, message_id=NULL, created_at=datetime('now','-11 minutes') WHERE account_id=? AND idempotency_key=?`).run(acc18, 'a5b-2');
+    const sentFolder2 = db.prepare(`INSERT INTO folders (account_id, path, name, type) VALUES (?, 'Sent', '已发送', 'sent')`).run(acc18);
+    const sentFolderId2 = Number(sentFolder2.lastInsertRowid);
+    db.prepare(
+      `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date,
+        snippet, body_path, is_read, has_attachments, size, flags_json)
+       VALUES (?,?,?,?,?,?,?,?,?,NULL,1,0,1234,'[]')`,
+    ).run(acc18, sentFolderId2, 1, m2, 't2', 'a5b@163.com', '[]', new Date().toISOString(), 't2');
+    const before2 = smtpDataCount;
+    r = await api('POST', '/api/messages/send', { accountId: acc18, to: 'x@163.com', subject: 't2', text: 'hi', idempotencyKey: 'a5b-2' });
+    check('5b-2: re-claim after simulated crash returns duplicate without resending',
+      r.status === 200 && r.json?.duplicate === true && r.json?.messageId === m2 && smtpDataCount === before2,
+      `status=${r.status} body=${JSON.stringify(r.json)?.slice(0, 120)} dataCount=${smtpDataCount} before=${before2}`);
+
+    // 5b-2b：重认领时本地和服务器都查不到已发出的信（IMAP 不通）——
+    // 仍会重发，但必须复用同一个 planned Message-ID（不是全新生成），
+    // 收件方才能凭 ID 去重。
+    r = await api('POST', '/api/messages/send', { accountId: acc18, to: 'x@163.com', subject: 't2b', text: 'hi', idempotencyKey: 'a5b-2b' });
+    const m2b = r.json?.messageId;
+    check('5b-2b: first send 201 with a Message-ID', r.status === 201 && typeof m2b === 'string' && m2b.length > 0,
+      `status=${r.status} messageId=${m2b}`);
+    db.prepare(`UPDATE sent_idempotency SET message_db_id=NULL, message_id=NULL, created_at=datetime('now','-11 minutes') WHERE account_id=? AND idempotency_key=?`).run(acc18, 'a5b-2b');
+    const before2b = smtpDataCount;
+    lastRaw18 = '';
+    r = await api('POST', '/api/messages/send', { accountId: acc18, to: 'x@163.com', subject: 't2b', text: 'hi', idempotencyKey: 'a5b-2b' });
+    check('5b-2b: re-claim with nothing found resends with the SAME planned Message-ID',
+      r.status === 201 && r.json?.messageId === m2b && smtpDataCount === before2b + 1 && lastRaw18.includes(`Message-ID: ${m2b}`),
+      `status=${r.status} messageId=${r.json?.messageId} expected=${m2b} dataCount=${smtpDataCount}`);
+
+    // 5b-3：批量删除时单行 SELECT 抛错——messages 表临时改名，每行
+    // SELECT 都抛“no such table”；三行都应进 failed，任务正常结束，
+    // 不静默丢行。
+    db.exec('ALTER TABLE messages RENAME TO messages_bak');
+    try {
+      r = await api('POST', '/api/messages/batch-delete', { ids: [1, 2, 3] });
+      const taskId3 = r.json?.taskId;
+      let st3 = null;
+      for (let i = 0; i < 40; i++) {
+        const s = await api('GET', `/api/messages/delete-status?taskId=${encodeURIComponent(taskId3)}`);
+        st3 = s.json;
+        if (st3 && st3.running === false) break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      check('5b-3: batch-delete with failing SELECTs finishes with every id in failed (none silently dropped)',
+        st3 && st3.running === false && st3.total === 3 && st3.deleted === 0 && (st3.failed || []).length === 3,
+        JSON.stringify(st3)?.slice(0, 300));
+    } finally {
+      db.exec('ALTER TABLE messages_bak RENAME TO messages');
+    }
+    const cnt3 = db.prepare('SELECT COUNT(*) c FROM messages').get().c;
+    check('5b-3: messages table restored after the test', typeof cnt3 === 'number', `count=${cnt3}`);
+
+    // 5b-4：发信带别人的草稿 → 400（发信前校验）。
+    r = await api('POST', '/api/drafts', { accountId: acc18, to: 'x@163.com', subject: 't4', text: 'hi' });
+    const d4 = r.json?.draft;
+    r = await api('POST', '/api/messages/send', { accountId: acc18b, to: 'x@163.com', subject: 't4', text: 'hi', draftId: d4?.id, idempotencyKey: 'a5b-4' });
+    check('5b-4: send with another account\'s draftId -> 400',
+      r.status === 400 && typeof r.json?.error === 'string', `status=${r.status} body=${JSON.stringify(r.json)?.slice(0, 120)}`);
+    await api('DELETE', `/api/drafts/${d4.id}`);
+
+    // 5b-6：应用层不再设安全响应头（OpenResty 为唯一一层）；/api 的
+    // Cache-Control: no-store 保留（D1，不在去重范围）。
+    r = await api('GET', '/api/auth/status');
+    check('5b-6: app sets no X-Content-Type-Options / X-Frame-Options / Referrer-Policy',
+      !r.headers.get('x-content-type-options') && !r.headers.get('x-frame-options') && !r.headers.get('referrer-policy'),
+      `xcto=${r.headers.get('x-content-type-options')} xfo=${r.headers.get('x-frame-options')} rp=${r.headers.get('referrer-policy')}`);
+  } finally {
+    if (fakeSmtp18) {
+      try { for (const s of fakeSmtp18._sockets || []) s.destroy(); } catch { /* ignore */ }
+      await new Promise((resolve) => fakeSmtp18.close(resolve));
+    }
+    try {
+      const { dropTransporter } = await import('../dist/smtpUtil.js');
+      if (acc18) dropTransporter(acc18);
+      if (acc18b) dropTransporter(acc18b);
+    } catch { /* ignore */ }
+  }
 
 } catch (e) {
   console.error('VERIFY ABORTED:', e);

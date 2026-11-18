@@ -303,6 +303,16 @@ function initSchema(db: Db): void {
     db.exec('ALTER TABLE attachments ADD COLUMN part TEXT');
   }
 
+  // ---- Audit #5b: sent_idempotency 预生成 Message-ID ----
+  // 认领时把本次发送的 Message-ID 预先存进 planned_message_id（见
+  // idempotency.ts）：崩溃后重认领时复用同一个 ID，不再每次请求现
+  // 生成一个（否则 SMTP 成功后崩溃 → 重认领 → 以新 ID 再发一封）。
+  // 旧库（占位行已存在但无此列）靠下面迁移补列。
+  const idemCols = db.prepare('PRAGMA table_info(sent_idempotency)').all() as { name: string }[];
+  if (idemCols.length && !idemCols.map((c) => c.name).includes('planned_message_id')) {
+    db.exec('ALTER TABLE sent_idempotency ADD COLUMN planned_message_id TEXT');
+  }
+
   // ---- Audit #5 (17): messages 按 Message-ID 唯一 ----
   // 应用层去重（F1）是唯一防线；补唯一索引做纵深防御。SQLite 的 UNIQUE
   // 允许多个 NULL，message_id 为空的信不受影响。线上已核实无重复

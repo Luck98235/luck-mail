@@ -34,15 +34,12 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.disable('x-powered-by');
-// D2: 基础安全响应头（HSTS 由 OpenResty 层加，这里只加应用层能管的；
-// CSP 不加——Vite 构建产物含内联样式/脚本，收紧的 CSP 未经浏览器
-// 验证有误伤风险，见报告）。
-app.use((_req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  res.setHeader('Referrer-Policy', 'same-origin');
-  next();
-});
+// Audit #5b：应用层安全响应头已删——OpenResty 是唯一一层（反代配了
+// X-Content-Type-Options、X-Frame-Options、CSP frame-ancestors
+// 'self'、Referrer-Policy、HSTS includeSubDomains）。之前两边叠加，
+// 且 Referrer-Policy 冲突（应用层 same-origin、反代层 no-referrer）。
+// /api 的 Content-Type + Cache-Control: no-store 保留（D1，防敏感
+// JSON 被缓存落盘；反代层没设这一项，不冲突）。
 
 // All API responses are JSON; never leak a stack trace to the client.
 // D1: /api 一律 no-store——/api/accounts/:id/password 的明文密码 JSON
@@ -55,16 +52,15 @@ app.use('/api', (_req, res, next) => {
 
 // 健康检查（部署轨第 8 项）：轻量状态，不需登录，供监控/探活。
 // 注意它挂在 requireAuth 之前，否则探活请求会被 401 挡住。
+// Audit #5b：只返回 {ok, db}——之前无会话可访问还返回在线邮箱数，
+// 属于信息披露；与 README 的 {ok:true} 写法一致。
 app.get('/api/health', (_req, res) => {
   try {
     const db = getDb();
     db.prepare('SELECT 1').get();
-    const online = (db.prepare(
-      "SELECT COUNT(*) c FROM accounts WHERE enabled=1 AND status='online'",
-    ).get() as { c: number }).c;
-    res.json({ ok: true, db: 'ok', accountsOnline: online });
+    res.json({ ok: true, db: 'ok' });
   } catch {
-    res.status(500).json({ ok: false, db: 'error', accountsOnline: 0 });
+    res.status(500).json({ ok: false, db: 'error' });
   }
 });
 

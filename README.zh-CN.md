@@ -39,7 +39,7 @@
 | 后端 | Node 22 + Express + TypeScript（strict）+ Socket.io + better-sqlite3 |
 | 邮件 | imapflow（IDLE + 增量同步）+ Nodemailer（发信）+ mailparser（流式解析） |
 | 前端 | Vue 3 + Vite + TypeScript（strict）+ Pinia + Tailwind + socket.io-client |
-| 存储 | SQLite（WAL + FTS5 trigram）；消毒后的 HTML 正文存文件；附件只记元信息，下载时从 IMAP 实时取，不落盘（2026-11-17 10:51 之前已缓存到磁盘的旧文件除外，保留在原处） |
+| 存储 | SQLite（WAL + FTS5 trigram）；消毒后的 HTML 正文存文件；附件只记元信息，下载时从 IMAP 实时取，永不落盘 |
 | 安全 | AES-256-GCM 邮箱密码加密；DOMPurify + JSDOM 消毒；沙盒 iframe（srcdoc）渲染正文 |
 
 **邮件怎么走：** 前端只跟 Node 后端建一个 WebSocket（Socket.io），不直连 IMAP。imapflow 给每个邮箱保持一条 IDLE 长连接；收到新邮件时后端经 WebSocket 推 JSON 给 Vue，更新未读数和列表。删信时先在服务器上做 IMAP 操作（移入已删除，或彻底删除时清掉），再改本地数据库——客户端和服务器始终一致。
@@ -98,7 +98,7 @@ PORT=8080 DATA_DIR=/path/to/data PUBLIC_DIR=backend/public KEY_FILE=/path/to/.ke
 
 - 服务：`luck-mail.service`，`node backend/dist/server.js`，监听 `127.0.0.1:8080`（`Restart=always`）。先构建：`cd backend && npm run build`，再 `cd ../frontend && npm run build`，把 `frontend/dist/` 拷到 `backend/public/`（后端从 `PUBLIC_DIR` 提供前端文件）。
 - 反向代理：把 `/` 和 `/socket.io/`（带 `Upgrade` 头走 WebSocket）反代到 `127.0.0.1:8080`，`proxy_read_timeout 120s`，`client_max_body_size 25m`。给域名签发 Let's Encrypt 证书，HTTP 跳转 HTTPS。证书自动续期见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)。
-- 备份：`.key` + `data/` 一起、每天、存到服务器之外（见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。站内**备份到本地**按钮不用停服务就能下载同一份包。
+- 备份：`.key` + `data/` 一起、每天、存到服务器之外（见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。站内**备份到本地**按钮不用停服务就能下载同一份包。每日自动备份：`scripts/backup-cron.sh`（cron 每天 03:00，只保留最近 7 份，见 [MIGRATION.zh-CN.md](MIGRATION.zh-CN.md)）。
 
 ## 目录结构
 
@@ -122,6 +122,7 @@ frontend/                # Vue 3 + Vite + TypeScript + Pinia
     api.ts               # REST 客户端
     realtime.ts          # Socket.io 客户端
 API_CONTRACT.md          # 前后端 API 合同
+scripts/backup-cron.sh   # 每日自动备份（cron 每天 03:00，只保留最近 7 份）
 LICENSE                  # AGPL-3.0
 ```
 

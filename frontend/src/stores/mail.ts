@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, reactive, computed, watch } from 'vue'
 import { api, ApiError } from '../api'
 import { createRealtime } from '../realtime'
+import { MailNotifier, NOTIFY_KEY } from '../utils/notify'
 import type {
   Account, AggregateKind, Draft, Folder, FolderType,
   MessageDetail, MessageEnvelope, RealtimeEvent, Settings, ViewState
@@ -1080,6 +1081,15 @@ export const useMailStore = defineStore('mail', () => {
     return true
   }
   let realtime: ReturnType<typeof createRealtime> | null = null
+  // 浏览器新邮件通知开关（localStorage 键 luck-mail-notify：'1' 开，其他关；默认关）。
+  // 初始化时从 localStorage 读；设置弹窗的开关经 setNotifyEnabled 改它并落盘。
+  const notifyEnabled = ref<boolean>(false)
+  try { notifyEnabled.value = localStorage.getItem(NOTIFY_KEY) === '1' } catch { /* 读不到就默认关 */ }
+  const notifier = new MailNotifier()
+  function setNotifyEnabled(on: boolean): void {
+    notifyEnabled.value = on
+    try { localStorage.setItem(NOTIFY_KEY, on ? '1' : '0') } catch { /* 存不下就只改内存态 */ }
+  }
   function handleRealtime(msg: RealtimeEvent): void {
     if (!msg || !msg.type) return
     if (msg.type === 'new-mail') {
@@ -1109,7 +1119,23 @@ export const useMailStore = defineStore('mail', () => {
         // 防御性兜底；若后端以后对已发送/已删除也发事件，这里直接生效。
         scheduleSyncReload()
       }
-      if (!m.isRead) bumpUnread(msg.accountId, msg.folderId, 1)
+      if (!m.isRead) {
+        bumpUnread(msg.accountId, msg.folderId, 1)
+        // 浏览器新邮件通知：发件人/主题/id 全取自事件本身，不另发请求；
+        // 弹不弹由 notify 模块按开关、权限、前台状态在 3 秒合并窗口到点时再定。
+        notifier.queue(
+          { id: m.id, sender: m.fromName || m.from, subject: m.subject || '' },
+          {
+            isEnabled: () => notifyEnabled.value,
+            onOpenMessage: (id) => {
+              // 信已在当前列表里直接打开；否则先切到所有收件箱再打开，避免列表与正文对不上。
+              if (mailList.value.some((x) => x.id === id)) { void openMessage(id); return }
+              void setAggregate('all-inbox').then(() => openMessage(id))
+            },
+            onOpenInbox: () => { void setAggregate('all-inbox') }
+          }
+        )
+      }
     } else if (msg.type === 'mail-updated') {
       const row = mailList.value.find((m) => m.id === msg.messageId)
       if (row && msg.changes && typeof msg.changes.isRead === 'boolean' && row.isRead !== msg.changes.isRead) {
@@ -1179,6 +1205,8 @@ export const useMailStore = defineStore('mail', () => {
   }
   function disconnectRealtime(): void {
     if (realtime) { realtime.disconnect(); realtime = null }
+    // 退出时清掉待发通知队列：登出后不再弹通知，点了也不会打不开。
+    notifier.reset()
     // 断开实时连接时也停掉删除状态轮询（F3）：登出后不再每 1.5 秒请求。
     stopDeletePolling()
     deleteStatusFailures = 0
@@ -1246,6 +1274,7 @@ export const useMailStore = defineStore('mail', () => {
     loadMessages, goToPage, nextPage, prevPage, setSearch, openMessage, setRead, deleteMessage, moveToSpam,
     toggleCheck, toggleCheckAll, clearChecked, deleteChecked,
     loadDrafts, upsertDraft, dropDraft, deleteDraft, refreshAll, refreshAccount,
+    notifyEnabled, setNotifyEnabled,
     goMobileBack, enterMobileAccount, setMobileAccount,
     disconnectRealtime, resetSessionState, destroyMobileHistory, init
   }

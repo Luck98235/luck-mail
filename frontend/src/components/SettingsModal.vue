@@ -51,6 +51,16 @@
           <textarea v-model="signature" rows="3" placeholder="发信时自动加在正文末尾" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400 resize-y"></textarea>
         </section>
 
+        <!-- 新邮件通知 -->
+        <section class="border-t border-slate-100 pt-4">
+          <h3 class="font-medium text-slate-700 mb-2">新邮件通知</h3>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input v-model="notifyOn" type="checkbox" class="accent-blue-500 w-4 h-4" :disabled="!notifySupported || notifyPermission === 'denied'" @change="onNotifyToggle">
+            <span>有新邮件时在浏览器弹出通知</span>
+          </label>
+          <p class="text-xs text-slate-400 mt-1.5">{{ notifyStatusText }}</p>
+        </section>
+
         <!-- 备份 -->
         <section class="border-t border-slate-100 pt-4">
           <h3 class="font-medium text-slate-700 mb-2">备份</h3>
@@ -70,9 +80,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
 import { downloadBlob } from '../utils'
+import { getNotifyPermission, isNotifySupported, requestNotifyPermission } from '../utils/notify'
 import { useAuthStore } from '../stores/auth'
 import { useMailStore } from '../stores/mail'
 
@@ -99,6 +110,15 @@ const backupMsg = ref<string>('')
 const backupOk = ref<boolean>(false)
 const busy = ref<boolean>(false)
 const error = ref<string>('')
+// 新邮件通知：开关即改即存（与改密码/改用户名一样，不等底下的“确定”）。
+const notifyOn = ref<boolean>(false)
+const notifySupported = ref<boolean>(true)
+const notifyPermission = ref<NotificationPermission | 'unsupported'>('default')
+const notifyStatusText = computed(() => {
+  if (!notifySupported.value) return '此浏览器不支持通知'
+  if (notifyPermission.value === 'denied') return '已被浏览器屏蔽，请在浏览器设置里重新允许'
+  return notifyOn.value ? '已开启：页面不在前台时，有新邮件会弹出系统通知。' : '已关闭'
+})
 
 watch(() => props.open, (v) => {
   if (!v) return
@@ -116,6 +136,9 @@ watch(() => props.open, (v) => {
   backupOk.value = false
   defaultAccountId.value = mail.settings.defaultAccountId ?? null
   signature.value = mail.settings.signature || ''
+  notifyOn.value = mail.notifyEnabled
+  notifySupported.value = isNotifySupported()
+  notifyPermission.value = getNotifyPermission()
 })
 
 async function changeUsername(): Promise<void> {
@@ -193,6 +216,22 @@ async function save(): Promise<void> {
     error.value = e instanceof ApiError ? e.message : '保存失败，请重试。'
   } finally {
     busy.value = false
+  }
+}
+
+async function onNotifyToggle(): Promise<void> {
+  // 关：直接落盘。
+  if (!notifyOn.value) { mail.setNotifyEnabled(false); return }
+  // 开：必须由这次点击触发，浏览器才允许弹授权框。
+  if (!isNotifySupported()) { notifyOn.value = false; return }
+  const p = await requestNotifyPermission()
+  notifyPermission.value = p
+  if (p === 'granted') {
+    mail.setNotifyEnabled(true)
+  } else {
+    // 拒绝或关掉授权框：开关回落到关。
+    notifyOn.value = false
+    mail.setNotifyEnabled(false)
   }
 }
 

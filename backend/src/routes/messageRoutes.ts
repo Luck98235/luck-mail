@@ -10,9 +10,10 @@ import {
 } from '../db.js';
 import type { MessageRow, AttachmentRow } from '../db.js';
 import { envelopeOf } from '../engine.js';
+import type { SyncEngine } from '../engine.js';
 import { sendMail, buildRawMail } from '../smtpUtil.js';
 import { smtpResponseCode, isTransientSmtpError, isPermanentSmtpError, isAuthError } from '../imapUtil.js';
-import { claimSendKey, completeSendKey, releaseSendKey } from '../idempotency.js';
+import { claimSendKey, completeSendKey, releaseSendKey, newPlannedMessageId } from '../idempotency.js';
 import { decryptSecret } from '../cryptoUtil.js';
 import { emit } from '../hub.js';
 import { log } from '../config.js';
@@ -170,6 +171,31 @@ function listMessages(req: Request, res: Response): void {
     `${messageRowQuery()} ${whereSql} ORDER BY m.date DESC, m.id DESC LIMIT ? OFFSET ?`,
   ).all(...(params as never[]), lim, off) as MessageRow[];
   res.json({ ok: true, messages: rows.map((row) => envelopeOf(row, row.account_email || '')), total });
+}
+
+// Audit #5b：崩溃窗口重认领时，查指定 Message-ID 的信是不是已经在
+// 已发送文件夹里了——先查本地 messages 表（已发送文件夹），本地没有
+// 再查服务器已发送文件夹（engine.findSentByMessageId，F3 做法）。
+// 查到返回 { localId }（本地没有时 localId 为 null，下次同步会取回）；
+// 查不到返回 null。服务器查不到/IMAP 不通时当作没查到（继续发送，
+// 但复用同一个 planned Message-ID，收件方仍可凭 ID 去重）。
+async function findAlreadySent(
+  engine: SyncEngine, accountId: number, messageId: string,
+): Promise<{ localId: number | null } | null> {
+  const db = getDb();
+  const local = db.prepare(
+    `SELECT id FROM messages WHERE account_id=? AND folder_id IN
+       (SELECT id FROM folders WHERE account_id=? AND type='sent')
+     AND message_id=? LIMIT 1`,
+  ).get(accountId, accountId, messageId) as { id: number } | undefined;
+  if (local) return { localId: local.id };
+  try {
+    const onServer = await engine.findSentByMessageId(accountId, messageId);
+    if (onServer) return { localId: null };
+  } catch (e) {
+    log('send re-claim server sent check failed', accountId, (e as Error)?.message || e);
+  }
+  return null;
 }
 
 export function messageRoutes(ctx: Ctx): express.Router {
@@ -416,7 +442,17 @@ export function messageRoutes(ctx: Ctx): express.Router {
     void (async () => {
       const db = getDb();
       for (const id of ids) {
-        const row = db.prepare('SELECT * FROM messages WHERE id=?').get(id) as MessageRow | undefined;
+        // Audit #5b：单行 SELECT 也包进按行 try/catch——之前只有
+        // deleteMessage 在 try 里，某行 SELECT 一抛错（如表损坏/锁），
+        // 剩余 id 不进 failed 列表，任务直接置 finished，前端以为
+        // “删完了”其实一批都没删。出错的行进 failed，批次继续。
+        let row: MessageRow | undefined;
+        try {
+          row = db.prepare('SELECT * FROM messages WHERE id=?').get(id) as MessageRow | undefined;
+        } catch (e) {
+          task.failed.push({ id, error: String((e as Error)?.message || e).slice(0, 200) });
+          continue;
+        }
         if (!row) { task.failed.push({ id, error: '邮件不存在' }); continue; }
         try {
           await engine.deleteMessage(row.account_id, id);
@@ -580,10 +616,18 @@ export function messageRoutes(ctx: Ctx): express.Router {
         try { if (f.path) fs.unlinkSync(f.path); } catch { /* ignore */ }
       }
     };
+    // Audit #5b：外层 catch 要用到这些状态，必须提在 try 外面——
+    // try 块内声明的变量 catch 里看不到。
+    let accountId = NaN;
+    let claimed = false;
+    let idemKey = '';
+    let effectiveMessageId: string | null = null;
+    let smtpSucceeded = false;
+    let sentMessageId: string | null = null;
     try {
       const db = getDb();
       const b = (req.body || {}) as Record<string, unknown>;
-      const accountId = Number(b.accountId);
+      accountId = Number(b.accountId);
       const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(accountId) as
         | import('../db.js').AccountRow
         | undefined;
@@ -615,17 +659,29 @@ export function messageRoutes(ctx: Ctx): express.Router {
         res.status(413).json({ ok: false, error: '附件总大小超过 50MB 上限' });
         return;
       }
+      // Audit #5b：发信带 draftId 时校验草稿归属——草稿的 account_id
+      // 必须与发信账号一致，不一致返回 400（发信前校验，绝不在发完
+      // 后再报）；草稿不存在时忽略、不报错（与旧行为一致）。
+      const draftIdEarly = Number((b as Record<string, unknown>).draftId);
+      if (Number.isFinite(draftIdEarly) && draftIdEarly > 0) {
+        const draftOwner = db.prepare('SELECT account_id FROM drafts WHERE id=?').get(draftIdEarly) as { account_id: number } | undefined;
+        if (draftOwner && draftOwner.account_id !== accountId) {
+          res.status(400).json({ ok: false, error: '草稿不属于该发件账号' });
+          return;
+        }
+      }
       // B12: 发信幂等键——前端每封新邮件生成一个 UUID 随请求传，同一封
       // 重试复用同一 key。占位冲突时：已发过直接返回原结果；进行中返回 409。
       const rawKey = b.idempotencyKey;
-      const idemKey = typeof rawKey === 'string' ? rawKey.trim() : '';
+      idemKey = typeof rawKey === 'string' ? rawKey.trim() : '';
       if (typeof rawKey === 'string' && rawKey.trim() && idemKey.length > 128) {
         res.status(400).json({ ok: false, error: 'idempotencyKey 过长' });
         return;
       }
-      let claimed = false;
       if (idemKey) {
-        const claim = claimSendKey(accountId, idemKey);
+        // Audit #5b：认领时预生成 Message-ID 并存进行（重认领沿用），
+        // 本次发送全程用它，不再每次请求现生成。
+        const claim = claimSendKey(accountId, idemKey, newPlannedMessageId());
         if (claim.status === 'duplicate') {
           res.status(200).json({
             ok: true,
@@ -640,6 +696,24 @@ export function messageRoutes(ctx: Ctx): express.Router {
           return;
         }
         claimed = true;
+        // Audit #5b：过期占位重认领——先查这封是不是已经发出去了
+        // （SMTP 成功后、回填前崩溃的窗口）：先查本地已发送文件夹，
+        // 本地没有再查服务器已发送文件夹；查到就直接返回原结果，不重发。
+        if (claim.reclaimed && claim.plannedMessageId) {
+          const already = await findAlreadySent(engine, accountId, claim.plannedMessageId);
+          if (already) {
+            try { completeSendKey(accountId, idemKey, already.localId, claim.plannedMessageId); } catch { /* ignore */ }
+            res.status(200).json({
+              ok: true,
+              id: already.localId,
+              messageId: claim.plannedMessageId,
+              duplicate: true,
+            });
+            return;
+          }
+        }
+        // 本次发送用的 Message-ID：新认领是刚生成的，重认领沿用旧行的。
+        effectiveMessageId = claim.plannedMessageId;
       }
       const signature = (db.prepare("SELECT value FROM settings WHERE key='signature'").get() as { value: string } | undefined)?.value || '';
       let text = (b.text as string) || '';
@@ -691,8 +765,12 @@ export function messageRoutes(ctx: Ctx): express.Router {
       // 但编译错误不是 SMTP 4xx，不会进重试分支，直接按原路径失败。
       let prebuilt: { raw: Buffer; messageId: string | null } | undefined;
       try {
-        prebuilt = await buildRawMail(account, mailInput);
+        // Audit #5b：用认领时预生成的 Message-ID 编译（重认领沿用旧
+        // 行的值）；没有幂等键时不传，MailComposer 照旧现生成。
+        prebuilt = await buildRawMail(account, mailInput, effectiveMessageId ?? undefined);
         sent = await sendMail(account, password, mailInput, prebuilt);
+        smtpSucceeded = true;
+        sentMessageId = sent.messageId;
       } catch (e) {
         // B15: 4xx（灰名单/限流/对方繁忙）最多重试 1 次（约 5 秒后）；
         // 重试仍失败按 4xx 文案返回。5xx 与其他错误直接失败。
@@ -701,6 +779,8 @@ export function messageRoutes(ctx: Ctx): express.Router {
           await new Promise((r) => setTimeout(r, 5000));
           try {
             sent = await sendMail(account, password, mailInput, prebuilt);
+            smtpSucceeded = true;
+            sentMessageId = sent.messageId;
           } catch (e2) {
             if (claimed) releaseSendKey(accountId, idemKey);
             res.status(502).json({ ok: false, error: `发信失败：对方服务器临时拒绝（${smtpResponseCode(e2) ?? '4xx'}），请稍后重试` });
@@ -814,6 +894,23 @@ export function messageRoutes(ctx: Ctx): express.Router {
         ...(sent.rejected.length ? { rejected: sent.rejected } : {}),
         ...(warnings.length ? { warning: warnings.join('；') } : {}),
       });
+    } catch (e) {
+      // Audit #5b：发信路由此前只有 try/finally、没有 catch——try 内
+      // 未被 5 处局部 catch 覆盖的异常（如草稿 DELETE、settings 查询
+      // 等 DB I/O 错误）会逃逸成未处理 rejection，Node 默认崩溃进程，
+      // systemd 重启后幂等占位仍卡“进行中”直至 10 分钟过期。
+      // 这里兜底：记日志、返回 500 JSON、不让异常逃逸；占位按 SMTP
+      // 是否已成功处理——已成功则回填完成（不再重发），未成功则释放
+      // 占位让重试能继续。
+      log('send unexpected error', accountId, (e as Error)?.message || e);
+      if (claimed) {
+        if (smtpSucceeded) {
+          try { completeSendKey(accountId, idemKey, null, sentMessageId); } catch { /* ignore */ }
+        } else {
+          releaseSendKey(accountId, idemKey);
+        }
+      }
+      if (!res.headersSent) res.status(500).json({ ok: false, error: '服务器内部错误，请重试' });
     } finally {
       cleanupUploads();
     }

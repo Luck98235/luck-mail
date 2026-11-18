@@ -64,7 +64,27 @@ sudo tar -czf luck-mail-backup-$(date +%Y%m%d).tar.gz -C /opt/luck-mail .key dat
 scp luck-mail-backup-*.tar.gz root@<new-server>:/tmp/
 ```
 
-The whole data directory is small (7.8 MB as of 2026-11-18 — reference value — with 27 mailboxes and 228 messages: DB 1.7 MB + WAL 4.1 MB + bodies 1.6 MB + attachments 556 KB), so a daily tarball is cheap. Keep backups **off** the same server.
+The whole data directory is small (6.0 MB as of 2026-11-18 — reference value — with 27 mailboxes and 227 messages: DB 1.7 MB + WAL 4.1 MB + bodies 280 KB + attachments 4.0 KB, an empty directory), so a daily tarball is cheap. Keep backups **off** the same server.
+
+### Automatic daily backup
+
+The repository ships `scripts/backup-cron.sh`, which takes a consistent
+database snapshot (`db.backup()` — no need to stop the service), packs the
+snapshot + `.key` + `bodies/` + `attachments/` into a tarball, and keeps the
+newest **7** copies under `/opt/luck-mail/backups/auto/`. Install it once:
+
+```bash
+sudo cp scripts/backup-cron.sh /opt/luck-mail/backup-cron.sh
+sudo chmod 700 /opt/luck-mail/backup-cron.sh
+# crontab -e, add:
+0 3 * * * /opt/luck-mail/backup-cron.sh >> /opt/luck-mail/backups/backup-cron.log 2>&1
+```
+
+An automatic backup has the same layout as a manual one (`.key` +
+`luck-mail.db` + `bodies/` + `attachments/`), so restore it exactly like a
+manual backup (see step 3 in Migration steps): stop the service, extract the
+tarball to a staging directory, copy the files into place (`.key` back to mode
+`0600`), start the service.
 
 ## Migration steps (on the new server)
 

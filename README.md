@@ -40,7 +40,7 @@ Single Node process + SQLite. No PostgreSQL, Redis, S3 or Elasticsearch.
 | Backend | Node 22 + Express + TypeScript (strict) + Socket.io + better-sqlite3 |
 | Mail | imapflow (IDLE + incremental sync) + Nodemailer (send) + mailparser (streaming parse) |
 | Frontend | Vue 3 + Vite + TypeScript (strict) + Pinia + Tailwind + socket.io-client |
-| Storage | SQLite (WAL + FTS5 trigram); sanitized HTML bodies as files; attachments are metadata-only — content is streamed live from IMAP on download, not stored on disk (except files cached before 2026-11-17 10:51, which stay where they are) |
+| Storage | SQLite (WAL + FTS5 trigram); sanitized HTML bodies as files; attachments are metadata-only — content is streamed live from IMAP on download, never stored on disk |
 | Security | AES-256-GCM mailbox password encryption; DOMPurify + JSDOM sanitization; sandboxed iframe (srcdoc) for bodies |
 
 **How mail flows:** the frontend talks only to the Node backend over one WebSocket (Socket.io). imapflow keeps an IDLE connection per mailbox; on new mail the backend pushes JSON to Vue, which updates unread counts and the list. Deleting a message performs the IMAP operation on the server first (move to trash, or expunge for permanent delete), then updates the local database — client and server stay in sync.
@@ -99,7 +99,7 @@ Production runs as a systemd service behind a reverse proxy:
 
 - Service: `luck-mail.service` — `node backend/dist/server.js` on `127.0.0.1:8080` (`Restart=always`). Build first: `cd backend && npm run build`, then `cd ../frontend && npm run build` and copy `frontend/dist/` to `backend/public/` (the backend serves the frontend from `PUBLIC_DIR`).
 - Reverse proxy: proxy `/` and `/socket.io/` (with the `Upgrade` header for WebSocket) to `127.0.0.1:8080`, `proxy_read_timeout 120s`, `client_max_body_size 25m`. Issue a Let's Encrypt certificate and redirect HTTP to HTTPS. Certificate auto-renewal: see [MIGRATION.md](MIGRATION.md).
-- Backups: back up `.key` + `data/` together, daily, off the server (see [MIGRATION.md](MIGRATION.md)). The in-app **Backup to local** button downloads the same tarball without stopping the service.
+- Backups: back up `.key` + `data/` together, daily, off the server (see [MIGRATION.md](MIGRATION.md)). The in-app **Backup to local** button downloads the same tarball without stopping the service. Automatic daily backup: `scripts/backup-cron.sh` (cron 03:00, keeps the newest 7 copies — see [MIGRATION.md](MIGRATION.md)).
 
 ## Project structure
 
@@ -123,6 +123,7 @@ frontend/                # Vue 3 + Vite + TypeScript + Pinia
     api.ts               # REST client
     realtime.ts          # Socket.io client
 API_CONTRACT.md          # backend/frontend API contract
+scripts/backup-cron.sh   # daily automatic backup (cron 03:00, keeps 7 copies)
 LICENSE                  # AGPL-3.0
 ```
 
