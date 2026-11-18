@@ -1082,7 +1082,7 @@ try {
 
   // Audit #8 HIGH-1 / MED-1 / LOW-1（友好性）：认证失败停连 + 网易只靠轮询重试 + 限流识别。
   {
-    const { SyncEngine } = await import('../dist/engine.js');
+    const { SyncEngine, flagsSyncIntervalMs } = await import('../dist/engine.js');
     const { isThrottleError } = await import('../dist/imapUtil.js');
     check('audit8 LOW-1: isThrottleError matches 421/451/too-many-connections, not auth errors',
       isThrottleError(new Error('451 too much fail authentication'))
@@ -1143,6 +1143,27 @@ try {
     const h2State = engineH2.states.get(h1Id);
     check('audit9 H2: _pollAllFolders marks authFailed on auth error and makes no further login attempts',
       h2Calls === 1 && h2State?.authFailed === true, `withClientCalls=${h2Calls} authFailed=${h2State?.authFailed}`);
+    // Audit #9 L6：全量 flags 同步间隔按文件夹大小分档（纯函数断言）。
+    const MIN = 60 * 1000;
+    check('audit9 L6: flagsSyncIntervalMs tiers (<500→15m, 500–2000→30m, >2000→60m cap)',
+      flagsSyncIntervalMs(0) === 15 * MIN && flagsSyncIntervalMs(499) === 15 * MIN
+      && flagsSyncIntervalMs(500) === 30 * MIN && flagsSyncIntervalMs(2000) === 30 * MIN
+      && flagsSyncIntervalMs(2001) === 60 * MIN && flagsSyncIntervalMs(100000) === 60 * MIN
+      && flagsSyncIntervalMs(NaN) === 15 * MIN,
+      `0=${flagsSyncIntervalMs(0)} 499=${flagsSyncIntervalMs(499)} 500=${flagsSyncIntervalMs(500)} 2000=${flagsSyncIntervalMs(2000)} 2001=${flagsSyncIntervalMs(2001)}`);
+    // 同款档位走 _syncFlagsFull 的节流：上次跑完 20 分钟的文件夹，5000 封
+    // 档（60 分钟）应跳过不 FETCH，100 封档（15 分钟）应跑。
+    const engineL6 = new SyncEngine(key);
+    const fakeFolderL6 = { id: 987001 };
+    let l6Fetches = 0;
+    const fakeClientL6 = { fetch: async function* () { l6Fetches++; } };
+    engineL6.lastFullFlagSync.set(987001, Date.now() - 20 * MIN);
+    await engineL6._syncFlagsFull(fakeClientL6, h1Id, fakeFolderL6, 5000);
+    check('audit9 L6: _syncFlagsFull skips FETCH inside the 60m tier (20m since last run, 5000 msgs)',
+      l6Fetches === 0, `fetches=${l6Fetches}`);
+    await engineL6._syncFlagsFull(fakeClientL6, h1Id, fakeFolderL6, 100);
+    check('audit9 L6: _syncFlagsFull runs FETCH past the 15m tier (20m since last run, 100 msgs)',
+      l6Fetches === 1, `fetches=${l6Fetches}`);
   }
 
   // 9: 同步删除对账时正文孤儿文件一并删。

@@ -29,11 +29,28 @@ const RECONNECT_MAX_MS = 5 * 60 * 1000;
 // syncs ALL folders (same _pollAllFolders as the NetEase poll); INBOX
 // real-time still comes from the IDLE `exists` events.
 const PERIODIC_SYNC_MS = 5 * 60 * 1000;
-// Full flag comparison (CONDSTORE fallback) runs at most this often per
-// folder — it is a whole-folder FETCH, so it must not run on every IDLE
-// event. Audit #8 LOW-3：原来 5 分钟，与轮询间隔相同、等于每轮都跑；
+// Full flag comparison (CONDSTORE fallback) base interval per folder —
+// it is a whole-folder FETCH, so it must not run on every IDLE event.
+// Audit #8 LOW-3：原来 5 分钟，与轮询间隔相同、等于每轮都跑；
 // 放宽到 15 分钟，已读状态同步仍及时，整文件夹 FETCH 次数降为 1/3。
+// Audit #9 L6：15 分钟只是 <500 封的基准档；大文件夹按
+// flagsSyncIntervalMs 动态拉长（30/60 分钟），上限 60 分钟、永不跳过。
 const FLAG_SYNC_INTERVAL_MS = 15 * 60 * 1000;
+
+// Audit #9 L6：全量 flags 同步间隔按文件夹大小分档——每 15 分钟对每个
+// 文件夹全量 FETCH 1:* flags，万封大文件夹就是持续固定开销。档位只
+// 拉长、永不跳过：UID 不变只能说明没新信，不能说明已读状态没变（别处
+// 客户端标已读不改变 UID），大文件夹也必须在上限间隔内至少跑一次全量
+// 对账，保证跨客户端已读状态最终一致。
+//   <500 封     15 分钟（与原来一致）
+//   500–2000 封 30 分钟
+//   >2000 封    60 分钟（上限）
+export function flagsSyncIntervalMs(messageCount: number): number {
+  const n = Number.isFinite(messageCount) ? Math.max(0, Math.floor(messageCount)) : 0;
+  if (n > 2000) return 60 * 60 * 1000;
+  if (n >= 500) return 30 * 60 * 1000;
+  return FLAG_SYNC_INTERVAL_MS;
+}
 // Fetch only the first bytes of the TEXT part for the list snippet; the full
 // source is fetched (and parsed) only when a message is opened.
 const SNIPPET_BYTES = 4096;
@@ -840,7 +857,9 @@ export class SyncEngine {
         // 现在同样走一次 _syncFlagsFull（下一轮 modseq 已写回，自愈）。
         // B6(b): 不再只做收件箱——全部文件夹都跑（每文件夹 5 分钟节流，
         // 见 _syncFlagsFull），否则非收件箱的已读状态永远同步不回来。
-        await this._syncFlagsFull(client, accountId, folder);
+        // serverUids.size 即服务端文件夹内信数（本轮 UID 清单实测值）；
+        // UID 搜索失败时 size 为 0，按 15 分钟档跑（保守）。
+        await this._syncFlagsFull(client, accountId, folder, serverUids.size);
       }
       // Deletions: compare server UID set with local UIDs.
       if (serverUids.size || mailbox.exists === 0) {
@@ -873,16 +892,18 @@ export class SyncEngine {
   // Full flag comparison (CONDSTORE fallback for servers without MODSEQ,
   // i.e. 163/QQ): fetch FLAGS for every message in the folder and apply the
   // server read state, so flag changes made in another client sync back.
-  // Runs for ALL folders (B6b), throttled to once per FLAG_SYNC_INTERVAL_MS
-  // per folder.
+  // Runs for ALL folders (B6b), throttled per folder by
+  // flagsSyncIntervalMs(messageCount) — 15 min below 500 messages, 30 min
+  // up to 2000, 60 min above (audit #9 L6). Uncounted folders (no count
+  // passed) run at the 15-minute base tier.
   // Local rows whose read state changed very recently are skipped: 163 flag
   // read-back can lag behind a local mark-read, and overwriting them would
   // flip a just-read message back to unread (guard lives in the UPDATE's
   // `updated_at < datetime('now', '-5 minutes')` condition).
-  private async _syncFlagsFull(client: ImapFlow, accountId: number, folder: FolderRow): Promise<void> {
+  private async _syncFlagsFull(client: ImapFlow, accountId: number, folder: FolderRow, messageCount?: number): Promise<void> {
     const now = Date.now();
     const last = this.lastFullFlagSync.get(folder.id) || 0;
-    if (now - last < FLAG_SYNC_INTERVAL_MS) return;
+    if (now - last < flagsSyncIntervalMs(messageCount ?? 0)) return;
     this.lastFullFlagSync.set(folder.id, now);
     const db = getDb();
     const serverRead = new Map<number, boolean>();
