@@ -215,7 +215,7 @@ async function send(): Promise<void> {
     emit('sent')
     close()
     // 发信后切到所有已发送（与旧版一致），再用 201 返回的 id 直接打开
-    // 刚发的信；失败时回落到通用规则（setAggregate 已按无选中自动打开第一封）。
+    // 刚发的信；拿不到 id 时只出列表（不自动打开，由用户自己点开）。
     await mail.setAggregate('all-sent')
     if (sent?.id) await mail.openMessage(sent.id)
   } catch (e) {

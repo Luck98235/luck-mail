@@ -141,8 +141,6 @@ export const useMailStore = defineStore('mail', () => {
         if (batchDeleting.value) {
           batchDeleting.value = false
           deleteRemaining.value = 0
-          // 收尾前记下发起删除的视图：用户若已切走，别在新视图自动打开首封（审计 #4 LOW）。
-          const deleteViewAtStart = deleteView.value
           deleteView.value = null
           saveDeleteView()
           await loadMessages()
@@ -157,7 +155,6 @@ export const useMailStore = defineStore('mail', () => {
               selectedId.value = null
               selectedMessage.value = null
             }
-            await autoOpenFirstAfterDelete(deleteViewAtStart ?? undefined)
             showToast(permanent ? `已彻底删除 ${deletedCount} 封` : `已移到已删除 ${deletedCount} 封`)
           }
         }
@@ -498,7 +495,7 @@ export const useMailStore = defineStore('mail', () => {
   let loadSeq = 0
   // 分页加载：每页 50 条，后端按 offset/limit 只返回当页，不一次全拉。
   // 切视图/搜索时回到第 1 页；点上一页/下一页时按页拉取并替换列表。
-  async function loadMessages({ page: p, autoOpenFirst, keepChecked = false, background = false }: { page?: number; autoOpenFirst?: boolean; keepChecked?: boolean; background?: boolean } = {}): Promise<void> {
+  async function loadMessages({ page: p, keepChecked = false, background = false }: { page?: number; keepChecked?: boolean; background?: boolean } = {}): Promise<void> {
     const seq = ++loadSeq
     if (p !== undefined) page.value = Math.max(1, p)
     // 刷新（refreshAll/refreshAccount/同步/重连对账）不清空批量选择；
@@ -576,18 +573,8 @@ export const useMailStore = defineStore('mail', () => {
         selectedId.value = null
         selectedMessage.value = null
       }
-      // 自动打开：仅搜索触发的那一次加载（setSearch 传 autoOpenFirst），
-      // 或无选中时的桌面端默认选中；翻页/刷新/同步不自动打开；
-      // 手机端一律不自动打开，等用户点；草稿不自动打开
-      if (mailList.value.length && window.innerWidth >= 1024) {
-        if (autoOpenFirst) {
-          const first = mailList.value.find((m) => !m.isDraft)
-          if (first && first.id !== selectedId.value) await openMessage(first.id)
-        } else if (!selectedId.value) {
-          const first = mailList.value.find((m) => !m.isDraft)
-          if (first) await openMessage(first.id)
-        }
-      }
+      // 不自动打开（2026-11-18 用户定夺：全部手动点开）——加载列表只出列表，
+      // 搜索/切文件夹/翻页/刷新一律不自动打开第一封，由用户自己点开。
     } catch {
       if (seq !== loadSeq) return // 旧请求失败了也不覆盖新请求的列表、不弹错
       if (background) {
@@ -617,10 +604,16 @@ export const useMailStore = defineStore('mail', () => {
   async function nextPage(): Promise<void> { await goToPage(page.value + 1) }
   async function prevPage(): Promise<void> { await goToPage(page.value - 1) }
 
-  function setSearch(q: string): void {
+  async function setSearch(q: string): Promise<void> {
     searchQuery.value = q
     page.value = 1
-    void loadMessages({ autoOpenFirst: true })
+    await loadMessages()
+    // 搜完（或清搜索）若正在读的信不在当前结果里，清掉选中，避免阅读窗
+    // 留着不属于当前列表的旧信；在结果里就保持打开，由用户自己决定。
+    if (selectedId.value !== null && !mailList.value.some((m) => m.id === selectedId.value)) {
+      selectedId.value = null
+      selectedMessage.value = null
+    }
   }
 
   // ---- 读信 ----
@@ -666,22 +659,12 @@ export const useMailStore = defineStore('mail', () => {
     } catch { showToast('标记失败，请重试') }
   }
 
-  // 删信/移垃圾后：若阅读窗已空（删的正是正在读的那封）且列表非空，
-  // 桌面端自动打开当前页第一封，避免阅读窗一直空白；手机端不自动打开。
-  // expectedView：删信开始时的视图——完成时若用户已切到别的视图，
-  // 别在新视图自动打开首封（审计 #4 LOW）。
-  async function autoOpenFirstAfterDelete(expectedView?: { kind: string; accountId: number | null; folderId: number | null }): Promise<void> {
-    if (window.innerWidth < 1024) return
-    if (selectedId.value !== null) return
-    if (expectedView && (view.value.kind !== expectedView.kind || view.value.accountId !== expectedView.accountId || view.value.folderId !== expectedView.folderId)) return
-    const first = mailList.value.find((m) => !m.isDraft)
-    if (first) await openMessage(first.id)
-  }
+  // 2026-11-18 用户定夺：全部手动点开——删信/移垃圾后不再自动打开下一封，
+  // 阅读窗回到空状态（删掉的正是正在读的那封时，selectedId/selectedMessage 已在各删信路径里清掉）。
 
   async function deleteMessage(id: number | string): Promise<void> {
     // 批量删除进行中：阅读窗的删除按钮已禁用（F4），这里再守一道入口。
     if (isDeletingHere.value) return
-    const viewAtStart = { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId }
     try {
       await api.deleteMessage(id)
       // 状态同步：mailList 与 unreadCounts 一起即时更新，不重新拉全量。
@@ -696,7 +679,6 @@ export const useMailStore = defineStore('mail', () => {
       mailList.value = mailList.value.filter((m) => m.id !== id)
       if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
       await backIfPageEmpty()
-      await autoOpenFirstAfterDelete(viewAtStart)
       showToast(isTrashView.value ? '已彻底删除' : '已移到已删除')
     } catch (e) {
       // F1：失败先对账再提示——先重拉列表，行已不在说明服务端其实删成了
@@ -706,7 +688,6 @@ export const useMailStore = defineStore('mail', () => {
       await loadMessages({ keepChecked: true })
       if (!mailList.value.some((m) => m.id === id)) {
         if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
-        await autoOpenFirstAfterDelete(viewAtStart)
         showToast(isTrashView.value ? '已彻底删除' : '已移到已删除')
       } else {
         showToast(e instanceof ApiError ? e.message : '删除失败，请重试')
@@ -736,9 +717,6 @@ export const useMailStore = defineStore('mail', () => {
   async function deleteChecked(): Promise<void> {
     const ids = [...checkedIds.value]
     if (!ids.length || batchDeleting.value) return
-    // 删信开始时的视图：结算时若用户已切走，别按旧视图的数扣新视图的 total、
-    // 别在新视图自动打开首封（审计 #4 LOW）。
-    const viewAtStart = { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId }
     const permanent = isTrashView.value
     const label = permanent ? '彻底删除' : '移到已删除'
     if (!await requestConfirm(`确定${label}选中的 ${ids.length} 封邮件吗？`, true)) return
@@ -823,7 +801,6 @@ export const useMailStore = defineStore('mail', () => {
       }
       // 有服务端任务时这里不清“删除中”：等 syncDeleteStatus 确认
       // running===false 再清（旧 finally 在这里提前清，提示会闪一下就没了）。
-      await autoOpenFirstAfterDelete(viewAtStart)
       const totalFailed = failedCount + failedDraftCount
       showToast(totalFailed > 0 ? `已删除 ${deletedCount} 封，${totalFailed} 封失败` : (permanent ? `已彻底删除 ${deletedCount} 封` : `已移到已删除 ${deletedCount} 封`))
     } catch {
@@ -847,7 +824,6 @@ export const useMailStore = defineStore('mail', () => {
     if (isDeletingHere.value) return
     const msg = mailList.value.find((m) => m.id === id) || selectedMessage.value
     if (!msg) return
-    const viewAtStart = { kind: view.value.kind, accountId: view.value.accountId, folderId: view.value.folderId }
     const folders = await loadFolders(msg.accountId)
     const spam = folders.find((f) => f.type === 'spam')
     if (!spam) { showToast('该邮箱没有垃圾邮件文件夹'); return }
@@ -860,7 +836,6 @@ export const useMailStore = defineStore('mail', () => {
       total.value = Math.max(0, total.value - 1)
       if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
       await backIfPageEmpty()
-      await autoOpenFirstAfterDelete(viewAtStart)
       showToast('已标记为垃圾邮件')
     } catch (e) {
       // F1：与 deleteMessage 同理——先重拉对账，行已不在说明服务端其实移成了。
@@ -868,7 +843,6 @@ export const useMailStore = defineStore('mail', () => {
       await loadMessages({ keepChecked: true })
       if (!mailList.value.some((m) => m.id === id)) {
         if (selectedId.value === id) { selectedId.value = null; selectedMessage.value = null }
-        await autoOpenFirstAfterDelete(viewAtStart)
         showToast('已标记为垃圾邮件')
       } else {
         showToast(e instanceof ApiError ? e.message : '标记失败，请重试')

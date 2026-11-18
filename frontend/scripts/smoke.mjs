@@ -85,6 +85,13 @@ async function main() {
     el.dispatchEvent(new window.Event('input', { bubbles: true }))
   }
   const click = (el) => el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }))
+  // 不自动打开（2026-11-18 定夺：全部手动点开）——冒烟里凡是原来靠自动打开
+  // 进阅读窗的步骤，改成先按主题点列表行再断言；等行出现再点，避免
+  // 列表还没拉回来时按旧正文误判（比如阅读窗里还留着上一封的标题）。
+  const clickRowBySubject = async (subject) => {
+    const row = await waitFor(() => qa('#desktop-layout .group.relative.cursor-pointer').find((el) => el.textContent.includes(subject)) || null, 10000, `列表出现主题为 ${subject} 的行`)
+    click(row)
+  }
 
   // 挂载应用（产物以经典脚本 eval）
   window.eval(bundle)
@@ -118,7 +125,9 @@ async function main() {
   ))
   check('聚合分类 5 项齐全', ['所有收件箱', '所有未读', '所有草稿', '所有已发送', '所有已删除'].every((s) => text().includes(s)))
   check('邮箱平铺无分组：两个账号在列，无“分组”入口', text().includes('zm235@163.com') && text().includes('luck534@163.com') && !text().includes('分组'))
-  check('阅读窗自动打开第一封', text().includes('欢迎使用 Luck-Mail'))
+  check('不自动打开：列表加载后阅读窗为空状态', text().includes('在此查看列表中选中的邮件'))
+  // 不自动打开（2026-11-18 定夺：全部手动点开）——点第一封才进阅读窗
+  await clickRowBySubject('欢迎使用 Luck-Mail')
   // 阅读窗详情是异步取的，等 iframe 的 srcdoc 里出现正文再断言
   const frame = await waitFor(() => {
     const f = q('iframe[title="邮件正文"]')
@@ -140,8 +149,8 @@ async function main() {
   check('懒加载：初始化不预取文件夹（无 /folders 请求），点邮箱后才按需加载', !mock.log.some((e) => /\/folders/.test(e.path)))
 
   // 5. Socket.io：new-mail → unreadCounts 更新 → 角标 (1)->(2)，新邮件进列表
-  // 注意：必须在点邮箱行之前断言——桌面端点邮箱后会自动打开第一封（即这封新邮件），
-  // 打开即标已读，角标会变回 (1)，那是正确行为。
+  // 注意：不自动打开（2026-11-18 定夺）——点邮箱行只切视图不出信，新邮件
+  // 保持未读、角标一直是 (2)，直到用户自己点开它才标已读。
   await waitFor(() => mock.connections >= 1, 10000, 'Socket.io 连接建立')
   check('Socket.io 客户端连上 mock 服务端', mock.connections >= 1, `connections=${mock.connections}`)
   await waitFor(() => {
@@ -172,8 +181,10 @@ async function main() {
   check('点所有未读：调 view=all-unread（不带 accountId，全部邮箱合并）', true)
 
   // 7. 读信 → 删除（删后 mailList 与角标即时更新，不重新拉全量）
-  // 此时在“所有未读”视图，桌面端已自动打开第一封未读（'未读测试邮件'，id 2）；删它。
-  await waitFor(() => q('h1')?.textContent?.includes('未读测试邮件'), 10000, '自动打开第一封未读')
+  // 此时在“所有未读”视图（两封未读：Socket.io 新邮件 + 未读测试邮件），
+  // 手动点开“未读测试邮件”（id 2）再删它。
+  await clickRowBySubject('未读测试邮件')
+  await waitFor(() => q('h1')?.textContent?.includes('未读测试邮件'), 10000, '手动打开第一封未读')
   click(q('[title="删除"]'))
   // S3：单封删除先弹确认框，点“确定”后才发 DELETE
   await waitFor(() => text().includes('确定删除这封邮件吗'), 10000, '删除确认框')
@@ -183,14 +194,18 @@ async function main() {
   const delEntry = mock.log.find((e) => e.method === 'DELETE')
   check('删除调 DELETE /api/messages/:id', !!delEntry, delEntry?.path || '')
   await sleep(500)
-  check('删信后列表为空态（本地 mailList 即时更新，未重新拉全量）', text().includes('这里没有邮件'))
+  // 删掉 id 2 后未读列表里还剩 Socket.io 新邮件（id 99）；2026-11-18 定夺
+  // “全部手动点开”：删信后不再自动打开下一封，阅读窗回到空状态。
+  check('删信后列表即时更新（删掉的行没了，未删的还在，未重新拉全量）', !text().includes('未读测试邮件') && text().includes('Socket.io 新邮件'))
+  check('删信后阅读窗回到空状态（不再自动打开下一封）', text().includes('在此查看列表中选中的邮件。'))
 
   // 7b. 删除失败路径（F1/F13）：服务端 500 时行必须仍在、toast 为失败，
-  // 而不是列表被清空或误报成功。先回所有收件箱（自动打开第一封 Socket.io 新邮件），
+  // 而不是列表被清空或误报成功。先回所有收件箱，手动点开 Socket.io 新邮件，
   // 再打开 mock 的删除失败开关删它。
   const inboxAgg = qa('#desktop-layout [class*="cursor-pointer"]').find((el) => el.textContent.trim().startsWith('所有收件箱'))
   click(inboxAgg)
-  await waitFor(() => q('h1')?.textContent?.includes('Socket.io 新邮件'), 10000, '回到收件箱并自动打开第一封')
+  await clickRowBySubject('Socket.io 新邮件')
+  await waitFor(() => q('h1')?.textContent?.includes('Socket.io 新邮件'), 10000, '手动打开 Socket.io 新邮件')
   mock.setDeleteFail(true)
   click(q('[title="删除"]'))
   await waitFor(() => text().includes('确定删除这封邮件吗'), 10000, '删除确认框（失败路径）')
