@@ -9,11 +9,12 @@ import type { AccountRow } from '../db.js';
 import { encryptSecret, decryptSecret } from '../cryptoUtil.js';
 import { allPresets, resolvePreset } from '../presets.js';
 import type { Preset } from '../presets.js';
-import { testConnectivity, accountToImap } from '../imapUtil.js';
+import { testConnectivity, accountToImap, isPrivateOrLoopbackHost } from '../imapUtil.js';
 import type { ImapAccount } from '../imapUtil.js';
 import { dropTransporter } from '../smtpUtil.js';
 import { emit } from '../hub.js';
-import { ATTACHMENTS_DIR, BODIES_DIR, log } from '../config.js';
+import { ATTACHMENTS_DIR, BODIES_DIR, log, MAX_ACCOUNTS, ALLOW_PRIVATE_MAIL_HOSTS } from '../config.js';
+import { rateLimit } from '../rateLimit.js';
 import type { SyncEngine } from '../engine.js';
 
 export interface Ctx {
@@ -99,6 +100,14 @@ function validateServerFields(b: ServerFields): string | null {
       return `${f} 不能为空`;
     }
   }
+  // Audit #10 M-2：回环/私有/链路本地/组播字面 IP 直接拒掉（已认证 SSRF）。
+  // 错误文案统一为“连接失败”，不泄露地址细节。ALLOW_PRIVATE_MAIL_HOSTS=1
+  // 时放行（仅 verify-all 本地测试用，见 config.ts；生产绝不设）。
+  for (const f of ['imapHost', 'smtpHost'] as const) {
+    if (!ALLOW_PRIVATE_MAIL_HOSTS && typeof b[f] === 'string' && isPrivateOrLoopbackHost(b[f] as string)) {
+      return '连接失败（服务器地址不合法）';
+    }
+  }
   for (const f of ['imapPort', 'smtpPort'] as const) {
     if (b[f] !== undefined && (!Number.isInteger(Number(b[f])) || Number(b[f]) < 1 || Number(b[f]) > 65535)) {
       return `${f} 端口无效`;
@@ -150,7 +159,10 @@ export function accountRoutes(ctx: Ctx): express.Router {
 
   // 取单个邮箱的当前密码（明文）：仅供“邮箱设置”弹窗打开时回填密码框，
   // 让用户点小眼睛查看。须登录；平时不随账号列表下发。
-  r.get('/accounts/:id/password', (req: Request, res: Response) => {
+  // Audit #10 M-5：由 GET 改为 POST——敏感操作走 GET 会进浏览器历史/
+  // 服务器访问日志（URL 含账号 id，虽无密码本身，但取密码的操作
+  // 不应是可导航的 GET）；与前端约定同步改（前端改调 POST）。
+  r.post('/accounts/:id/password', (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     const row = db.prepare('SELECT password_enc FROM accounts WHERE id=?').get(id) as { password_enc: string } | undefined;
@@ -166,7 +178,9 @@ export function accountRoutes(ctx: Ctx): express.Router {
   // IMAP 端口 / 发送服务器（SMTP）/ SMTP 端口 / 备注，按当前排序导出。授权码为明文，
   // 文件请妥善保存。须登录。
   // S1: 只接受 POST（同 /api/backup/download，防跨站顶层导航 CSRF 下载）。
-  r.post('/accounts/export', asyncHandler(async (_req: Request, res: Response) => {
+  // Audit #10 L-7：导出限流——每 IP 每分钟最多 5 次（导出含全部账号
+  // 明文密码，防被盗会话反复拉取）。
+  r.post('/accounts/export', rateLimit(60_000, 5, '导出过于频繁，请稍后再试'), asyncHandler(async (_req: Request, res: Response) => {
     const db = getDb();
     const rows = db.prepare('SELECT * FROM accounts ORDER BY sort_order, id').all() as AccountRow[];
     const wb = new ExcelJS.Workbook();
@@ -254,10 +268,19 @@ export function accountRoutes(ctx: Ctx): express.Router {
   // 不并发——同一 IP 并发登录多家服务商会被当成撞服务器。服务器地址/端口留空
   // 时按域名自动取预设，取不到则失败。须登录；文件限 5MB、数据行限
   // 200 行（Audit #9 M10：超限的行不处理、进 failed 带明确原因）。
+  // Audit #10 H-3：总预算 240 秒——旧版 200 行 × 15 秒最长 50 分钟，
+  // 请求必被反代/Node 掐断且结果丢失。每行按剩余预算递减 testConnectivity
+  // 的超时；预算耗尽立即停并返回 truncated:true；监听 req close，
+  // 客户端断开即停后续行；failed 数组封顶 50 条（超限的失败原因不再
+  // 无限膨胀响应体，failedTruncated:true 标注）。
+  // Audit #10 D5：账号总数上限 50 个——达到上限后剩余行进 failed
+  // （原因“邮箱数量已达上限”），不再入库。
   // exceljs 只留给导出
   // （只写不读），导入不再解析 xlsx。
+  const IMPORT_TOTAL_BUDGET_MS = 240 * 1000;
+  const MAX_FAILED_ROWS = 50;
   const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
-  r.post('/accounts/import', importUpload.single('file'), asyncHandler(async (req: Request, res: Response) => {
+  r.post('/accounts/import', rateLimit(60_000, 5, '导入过于频繁，请稍后再试'), importUpload.single('file'), asyncHandler(async (req: Request, res: Response) => {
     const db = getDb();
     const f = (req as Request & { file?: Express.Multer.File }).file;
     if (!f || !f.buffer) return res.status(400).json({ ok: false, error: '请选择要导入的 CSV 文件' });
@@ -270,6 +293,11 @@ export function accountRoutes(ctx: Ctx): express.Router {
     const added: string[] = [];
     const skipped: string[] = [];
     const failed: { row: number; email: string; reason: string }[] = [];
+    let failedTruncated = false;
+    const pushFailed = (row: number, email: string, reason: string): void => {
+      if (failed.length >= MAX_FAILED_ROWS) { failedTruncated = true; return; }
+      failed.push({ row, email, reason });
+    };
     const seenInFile = new Set<string>();
     // Audit #8 LOW-5（数据库）：导入前一次查出全部已有邮箱进 Set，
     // 不再每行一次 SELECT 判重。
@@ -277,12 +305,21 @@ export function accountRoutes(ctx: Ctx): express.Router {
       (db.prepare('SELECT email FROM accounts').all() as { email: string }[])
         .map((x) => x.email.toLowerCase()),
     );
+    const existingCount = (db.prepare('SELECT COUNT(*) c FROM accounts').get() as { c: number }).c;
+    // Audit #10 H-3：总预算 240 秒 + 客户端断开即停。
+    const importStartedAt = Date.now();
+    let clientGone = false;
+    req.on('close', () => { clientGone = true; });
+    let truncated = false;
     // 列顺序与导入模板一致：0 序号（忽略），1 邮箱名，2 授权码，3 IMAP 服务器，
     // 4 IMAP 端口，5 SMTP 服务器，6 SMTP 端口，7 备注。第 1 行是表头。
     // 逐行顺序处理（for + await，不并发）；循环体内用 continue 跳行。
     // 空行不计入行数上限。
     let dataRows = 0;
     for (let idx = 0; idx < rows.length; idx++) {
+      if (clientGone) { truncated = true; break; }
+      const remainingMs = IMPORT_TOTAL_BUDGET_MS - (Date.now() - importStartedAt);
+      if (remainingMs <= 0) { truncated = true; break; }
       const cols = rows[idx];
       const rnum = idx + 1;
       if (rnum === 1) continue;
@@ -295,13 +332,15 @@ export function accountRoutes(ctx: Ctx): express.Router {
       const displayName = String(cols[7] ?? '').trim();
       if (!email) continue;
       // Audit #9 M10：超限的行不处理、进 failed（带明确原因），不静默丢弃。
+      // Audit #10 H-3：超 200 行立即停（旧版继续逐行进 failed，5MB 文件
+      // 可达数万行、响应 JSON 膨胀到 MB 级）。
       dataRows += 1;
       if (dataRows > MAX_IMPORT_ROWS) {
-        failed.push({ row: rnum, email, reason: `行数超限（单次导入最多 ${MAX_IMPORT_ROWS} 行），本行未处理` });
-        continue;
+        truncated = true;
+        break;
       }
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        failed.push({ row: rnum, email, reason: '邮箱地址格式不正确' });
+        pushFailed(rnum, email, '邮箱地址格式不正确');
         continue;
       }
       if (seenInFile.has(email) || existingEmails.has(email)) {
@@ -310,7 +349,7 @@ export function accountRoutes(ctx: Ctx): express.Router {
       }
       seenInFile.add(email);
       if (!password) {
-        failed.push({ row: rnum, email, reason: '授权码为空' });
+        pushFailed(rnum, email, '授权码为空');
         continue;
       }
       const preset = resolvePreset(email);
@@ -321,11 +360,17 @@ export function accountRoutes(ctx: Ctx): express.Router {
       const smtpP = Number(smtpPortRaw);
       const smtpPort = Number.isInteger(smtpP) && smtpP > 0 && smtpP <= 65535 ? smtpP : (preset?.smtpPort ?? 0);
       if (!imapH || !imapPort || !smtpH || !smtpPort) {
-        failed.push({ row: rnum, email, reason: '服务器地址或端口不完整，且该域名无自动预设' });
+        pushFailed(rnum, email, '服务器地址或端口不完整，且该域名无自动预设');
+        continue;
+      }
+      // Audit #10 D5：账号总数上限 50 个——达到上限后剩余行进 failed。
+      if (existingCount + added.length >= MAX_ACCOUNTS) {
+        pushFailed(rnum, email, `邮箱数量已达上限（${MAX_ACCOUNTS} 个），本行未添加`);
         continue;
       }
       // 先测连通再入库：密码/授权码错（认证失败）与连不上服务器都进 failed，
       // 不 INSERT、不 startAccount、不发 account 事件。
+      // Audit #10 H-3：每行按剩余总预算递减超时（单行最多 15 秒）。
       const account: ImapAccount = {
         email,
         imapHost: imapH,
@@ -335,9 +380,9 @@ export function accountRoutes(ctx: Ctx): express.Router {
         smtpPort,
         smtpSecure: preset?.smtpSecure || 'SSL',
       };
-      const test = await testConnectivity(account, password);
+      const test = await testConnectivity(account, password, undefined, Math.min(15 * 1000, remainingMs));
       if (!test.imapOk || !test.smtpOk) {
-        failed.push({ row: rnum, email, reason: test.error || '连接测试失败' });
+        pushFailed(rnum, email, test.error || '连接测试失败');
         continue;
       }
       const sortOrder = (db.prepare('SELECT COALESCE(MAX(sort_order),-1)+1 v FROM accounts').get() as { v: number }).v;
@@ -353,7 +398,12 @@ export function accountRoutes(ctx: Ctx): express.Router {
       emit('account', { action: 'added', account: publicAccount(newRow) });
       added.push(email);
     }
-    res.json({ ok: true, added: added.length, skipped: skipped.length, failed, addedEmails: added, skippedEmails: skipped });
+    res.json({
+      ok: true, added: added.length, skipped: skipped.length, failed,
+      addedEmails: added, skippedEmails: skipped,
+      ...(truncated ? { truncated: true } : {}),
+      ...(failedTruncated ? { failedTruncated: true } : {}),
+    });
   }));
 
   r.post('/accounts', asyncHandler(async (req: Request, res: Response) => {
@@ -371,6 +421,12 @@ export function accountRoutes(ctx: Ctx): express.Router {
     if (err) return res.status(400).json({ ok: false, error: err });
     if (db.prepare('SELECT id FROM accounts WHERE email=?').get(email)) {
       return res.status(409).json({ ok: false, error: '该邮箱已添加过' });
+    }
+    // Audit #10 D5：账号总数上限 50 个（架构定稿 2026-11-17）——
+    // 旧版 POST /api/accounts 与 CSV 导入均无总数校验。
+    const accountCount = (db.prepare('SELECT COUNT(*) c FROM accounts').get() as { c: number }).c;
+    if (accountCount >= MAX_ACCOUNTS) {
+      return res.status(400).json({ ok: false, error: `邮箱数量已达上限（${MAX_ACCOUNTS} 个）` });
     }
     const preset = resolvePreset(email);
     if (!preset) return res.status(400).json({ ok: false, error: '邮箱地址格式不正确' });
@@ -494,7 +550,9 @@ export function accountRoutes(ctx: Ctx): express.Router {
     return res.json({ ok: true });
   });
 
-  r.post('/accounts/:id/test', asyncHandler(async (req: Request, res: Response) => {
+  // Audit #10 L-7：测试接口限流——每 IP 每分钟最多 60 次（10 秒缓存
+  // 已挡同一账号的重复测试，这里防跨账号连点刷登录）。
+  r.post('/accounts/:id/test', rateLimit(60_000, 60, '测试过于频繁，请稍后再试'), asyncHandler(async (req: Request, res: Response) => {
     const db = getDb();
     const id = Number(req.params.id);
     const row = db.prepare('SELECT * FROM accounts WHERE id=?').get(id) as AccountRow | undefined;

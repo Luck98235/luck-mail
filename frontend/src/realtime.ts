@@ -43,6 +43,22 @@ export function createRealtime(
   for (const t of EVENT_TYPES) {
     socket.on(t, (payload: unknown) => {
       const p = (payload ?? {}) as Record<string, unknown>
+      // 载荷归一化（审计 #10 安全 L7）：socket 载荷只做类型断言、无运行时校验；
+      // id 若是数字字符串，去重比较（x.id === m.id）会失效、同一封信可出现两次。
+      // 数字字符串归一化为 number，非数字原样保留。
+      const asNum = (v: unknown): unknown => {
+        if (typeof v === 'string' && /^\d+$/.test(v)) return Number(v)
+        return v
+      }
+      if (t === 'new-mail' && p.message && typeof p.message === 'object') {
+        const m = p.message as Record<string, unknown>
+        m.id = asNum(m.id)
+        m.accountId = asNum(m.accountId)
+        m.folderId = asNum(m.folderId)
+      }
+      if ((t === 'mail-updated' || t === 'mail-deleted') && p.messageId != null) p.messageId = asNum(p.messageId)
+      if (p.accountId != null) p.accountId = asNum(p.accountId)
+      if (p.folderId != null) p.folderId = asNum(p.folderId)
       onEvent({ type: t, ...p } as RealtimeEvent)
     })
   }

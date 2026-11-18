@@ -40,7 +40,9 @@ export function createMockServer() {
   const messages = [
     { id: 1, accountId: 1, accountEmail: 'zm235@163.com', folderId: 11, folderPath: 'INBOX', uid: 101, subject: '欢迎使用 Luck-Mail', from: 'admin@16636.net', fromName: '', to: ['zm235@163.com'], date: new Date().toISOString(), snippet: '这是一封 mock 邮件，用于冒烟测试。', isRead: true, hasAttachments: false, size: 120 },
     { id: 2, accountId: 2, accountEmail: 'luck534@163.com', folderId: 21, folderPath: 'INBOX', uid: 201, subject: '未读测试邮件', from: 'admin@16636.net', fromName: '', to: ['luck534@163.com'], date: new Date().toISOString(), snippet: '这封是未读的。', isRead: false, hasAttachments: false, size: 130 },
-    { id: 3, accountId: 1, accountEmail: 'zm235@163.com', folderId: 13, folderPath: '已发送', uid: 102, subject: '已发送的邮件', from: 'zm235@163.com', fromName: '', to: ['zm235@163.com'], date: new Date().toISOString(), snippet: '已发送。', isRead: true, hasAttachments: false, size: 90 }
+    { id: 3, accountId: 1, accountEmail: 'zm235@163.com', folderId: 13, folderPath: '已发送', uid: 102, subject: '已发送的邮件', from: 'zm235@163.com', fromName: '', to: ['zm235@163.com'], date: new Date().toISOString(), snippet: '已发送。', isRead: true, hasAttachments: false, size: 90 },
+    // IMAP 草稿（2026-11-19 回归：草稿视图须把它与服务端草稿合并显示）
+    { id: 4, accountId: 1, accountEmail: 'zm235@163.com', folderId: 12, folderPath: '草稿箱', uid: 103, subject: 'IMAP 草稿测试', from: 'zm235@163.com', fromName: '', to: ['zm235@163.com'], date: new Date().toISOString(), snippet: '邮箱同步来的草稿。', isRead: true, hasAttachments: false, size: 80 }
   ]
 
   // 服务端草稿内存态（仅供冒烟测试；真实后端存数据库）
@@ -81,6 +83,10 @@ export function createMockServer() {
     const acctMatch = url.pathname.match(/^\/api\/accounts\/(\d+)\/(folders|test|refresh)$/)
     if (acctMatch && req.method === 'GET') return send(200, { ok: true, folders: foldersState[Number(acctMatch[1])] || [] })
     if (acctMatch) return send(200, { ok: true, imapOk: true, smtpOk: true })
+    // 取邮箱明文密码只接受 POST（审计 #10 后端约定；GET 一律 405）。
+    const pwMatch = url.pathname.match(/^\/api\/accounts\/(\d+)\/password$/)
+    if (pwMatch && req.method === 'POST') return send(200, { ok: true, password: 'mock-password' })
+    if (pwMatch) return send(405, { ok: false, error: 'Method Not Allowed' })
     if (url.pathname === '/api/refresh-all' && req.method === 'POST') return send(200, { ok: true })
     const presetMatch = url.pathname.match(/^\/api\/presets\/(.+)$/)
     if (presetMatch && req.method === 'GET') {
@@ -138,7 +144,9 @@ export function createMockServer() {
       const m = messages.find((x) => x.id === Number(msgMatch[1]))
       if (!m) return send(404, { ok: false, error: '邮件不存在' })
       m.isRead = true // 契约：打开即标已读
-      return send(200, { ok: true, message: { ...m, cc: [], bodyText: m.snippet, bodyHtml: `<p>${m.snippet}</p>`, attachments: [] } })
+      // bodyHtml 透传（消毒回归测试用）：测试可往 messages 里推一封带恶意
+      // bodyHtml 的信，验证前端第二遍消毒；平时仍按 snippet 生成。
+      return send(200, { ok: true, message: { ...m, cc: [], bodyText: m.snippet, bodyHtml: m.bodyHtml || `<p>${m.snippet}</p>`, attachments: m.attachments || [] } })
     }
     if (msgMatch && req.method === 'POST') {
       const m = messages.find((x) => x.id === Number(msgMatch[1]))
@@ -200,6 +208,15 @@ export function createMockServer() {
     get connections() { return connections },
     get loggedIn() { return loggedIn },
     emitNewMail(payload) { ioRef.emit('new-mail', payload) },
+    emitMailDeleted(payload) { ioRef.emit('mail-deleted', payload) },
+    // 冒烟测试：模拟服务端文件夹未读数变化（保持账号=文件夹之和的服务端等式，
+    // 与真实后端 publicAccount 的 SUM(folders.unread_count) 一致）。
+    setFolderUnread(accountId, folderId, unread) {
+      const f = (foldersState[accountId] || []).find((x) => x.id === folderId)
+      if (f) f.unreadCount = unread
+      const acct = accountsState.find((a) => a.id === accountId)
+      if (acct) acct.unreadCount = (foldersState[accountId] || []).reduce((s, x) => s + (x.unreadCount || 0), 0)
+    },
     start(port = 0) {
       return new Promise((resolve) => server.listen(port, () => resolve(server.address().port)))
     },

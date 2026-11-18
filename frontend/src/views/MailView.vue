@@ -1,13 +1,13 @@
 <template>
   <div class="app-viewport flex flex-col bg-white text-slate-800 text-sm overflow-hidden">
-    <!-- 桌面端 >1024px：完整 3 栏 -->
+    <!-- 桌面端 ≥1024px：完整 3 栏 -->
     <div id="desktop-layout" class="hidden lg:flex flex-1 min-h-0">
       <MailSidebar @compose="openCompose()" @manage="manageOpen = true" @settings="settingsOpen = true" @logout="logout" />
       <MessageList variant="desktop" />
       <ReadingPane @reply="reply" @forward="forward" />
     </div>
 
-    <!-- 手机/平板 <=1024px：QQ 邮箱 APP 式布局 -->
+    <!-- 手机/平板 <1024px：QQ 邮箱 APP 式布局 -->
     <div class="lg:hidden flex-1 min-h-0">
       <MobileShell
         @compose="openCompose()"
@@ -95,21 +95,32 @@ function quoteOf(m: MessageDetail): string {
   return `\n\n--- 原始邮件 ---\n发件人：${m.fromName || m.from}\n主题：${m.subject}\n${m.bodyText || ''}`
 }
 
+// 回复 threading（审计 #10 H1）：原信 Message-ID 作 In-Reply-To，
+// 原 References 链 + 原 Message-ID 作 References；后端在发信时据此写头。
+function replyReferences(m: MessageDetail): string[] {
+  const refs = typeof m.references === 'string' ? [m.references] : (m.references || [])
+  return m.messageId ? [...refs, m.messageId] : refs
+}
+
 function reply(m: MessageDetail): void {
   openCompose({
     to: m.from,
     subject: m.subject?.startsWith('回复：') ? m.subject : `回复：${m.subject}`,
     body: quoteOf(m),
-    accountId: m.accountId
+    accountId: m.accountId,
+    ...(m.messageId ? { inReplyTo: m.messageId } : {}),
+    ...(replyReferences(m).length ? { references: replyReferences(m) } : {})
   })
 }
 
 function forward(m: MessageDetail): void {
+  // 转发不带 In-Reply-To，只带 References（原链 + 原 Message-ID）。
   openCompose({
     to: '',
     subject: m.subject?.startsWith('转发：') ? m.subject : `转发：${m.subject}`,
     body: quoteOf(m),
-    accountId: m.accountId
+    accountId: m.accountId,
+    ...(replyReferences(m).length ? { references: replyReferences(m) } : {})
   })
 }
 

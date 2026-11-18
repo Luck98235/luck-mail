@@ -6,9 +6,22 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getDb } from '../db.js';
-import { ATTACHMENTS_DIR, BODIES_DIR, KEY_FILE } from '../config.js';
+import { ATTACHMENTS_DIR, BODIES_DIR, KEY_FILE, log } from '../config.js';
+import { rateLimit } from '../rateLimit.js';
 
 const execFileAsync = promisify(execFile);
+
+// Audit #9 M3 同款：async 路由处理器包一层，抛错记日志、走统一 500
+// JSON（Audit #10 L-19：/backup/download 原来是裸 async 路由，
+// mkdtempSync 在 try 之外、抛错即未处理 rejection）。
+function asyncHandler(fn: (req: Request, res: Response) => Promise<unknown>): (req: Request, res: Response) => void {
+  return (req, res) => {
+    fn(req, res).catch((e: unknown) => {
+      log('misc route failed', req.method, req.path, (e as Error)?.message || e);
+      if (!res.headersSent) res.status(500).json({ ok: false, error: '服务器内部错误' });
+    });
+  };
+}
 
 export function miscRoutes(): express.Router {
   const r = express.Router();
@@ -87,7 +100,15 @@ export function miscRoutes(): express.Router {
   // S1: 只接受 POST——Cookie 已是 SameSite=Strict（顶层导航 GET 也不带
   // Cookie），POST-only 是第二层纵深防御：即使将来 Cookie 策略放宽，
   // 跨站顶层导航也触发不了这条含主密钥的备份下载。
-  r.post('/backup/download', async (_req: Request, res: Response) => {
+  // Audit #10 L-7：备份限流——每 IP 每分钟最多 2 次（备份包内含主密钥
+  // 与全部账号明文密码，防被盗会话反复拉取）。
+  // Audit #10 L-19：包进 asyncHandler（旧版裸 async 路由，mkdtempSync
+  // 在 try 之外、抛错即未处理 rejection）。
+  // Audit #10 M-18：备份打包与正文写入竞态——旧版 cpSync 直接拷
+  // bodies/，正赶上某封信的正文文件正在写入时包里就是半截文件。
+  // 现在跳过 1 分钟内有 mtime 的正文文件（正在写入的信下次备份再进包；
+  // 正文文件可随时从 IMAP 重取，不影响恢复）；tar 加 120 秒超时。
+  r.post('/backup/download', rateLimit(60_000, 2, '备份过于频繁，请稍后再试'), asyncHandler(async (_req: Request, res: Response) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'luck-mail-backup-'));
     try {
       const keyDest = path.join(tmp, '.key');
@@ -98,14 +119,29 @@ export function miscRoutes(): express.Router {
       const dataDir = path.join(tmp, 'data');
       fs.mkdirSync(dataDir, { recursive: true });
       await getDb().backup(path.join(dataDir, 'luck-mail.db'));
-      if (fs.existsSync(BODIES_DIR)) fs.cpSync(BODIES_DIR, path.join(dataDir, 'bodies'), { recursive: true });
+      // M-18：正文文件逐个拷、跳过 1 分钟内刚写过的（可能正在写入中）；
+      // 附件目录是静态文件（下载时才写？附件默认不落盘），直接整拷。
+      if (fs.existsSync(BODIES_DIR)) {
+        const bodiesDest = path.join(dataDir, 'bodies');
+        fs.mkdirSync(bodiesDest, { recursive: true });
+        const cutoff = Date.now() - 60 * 1000;
+        for (const name of fs.readdirSync(BODIES_DIR)) {
+          const src = path.join(BODIES_DIR, name);
+          try {
+            const st = fs.statSync(src);
+            if (!st.isFile()) continue;
+            if (st.mtimeMs > cutoff) continue; // 1 分钟内有写入：跳过，下次备份再进包
+            fs.copyFileSync(src, path.join(bodiesDest, name));
+          } catch { /* 单个文件失败不中断整包 */ }
+        }
+      }
       if (fs.existsSync(ATTACHMENTS_DIR)) fs.cpSync(ATTACHMENTS_DIR, path.join(dataDir, 'attachments'), { recursive: true });
       const d = new Date();
       const pad = (n: number): string => String(n).padStart(2, '0');
       const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
       const filename = `luck-mail-backup-${stamp}.tar.gz`;
       const tarPath = path.join(tmp, filename);
-      await execFileAsync('tar', ['-czf', tarPath, '-C', tmp, '.key', 'data']);
+      await execFileAsync('tar', ['-czf', tarPath, '-C', tmp, '.key', 'data'], { timeout: 120_000 });
       res.download(tarPath, filename, () => {
         fs.rmSync(tmp, { recursive: true, force: true });
       });
@@ -113,7 +149,7 @@ export function miscRoutes(): express.Router {
       fs.rmSync(tmp, { recursive: true, force: true });
       if (!res.headersSent) res.status(500).json({ ok: false, error: '备份失败，请重试。' });
     }
-  });
+  }));
 
   return r;
 }

@@ -7,8 +7,10 @@
   <!-- FontAwesome 图标（CDN） -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <script>
-    /* 主题早恢复：避免首次渲染闪回蓝色（localStorage 键 luck-mail-theme） */
-    try { var __t = localStorage.getItem('luck-mail-theme'); if (__t) { document.body.setAttribute('data-theme', __t); } } catch (e) {}
+    /* 主题早恢复：避免首次渲染闪回蓝色（localStorage 键 luck-mail-theme）。
+       只接受 6 个合法主题值（审计 #10 安全 L4）：非法值会导致 --c-* 未定义、
+       首屏一闪颜色异常；与 stores/theme.ts 的白名单一致。 */
+    try { var __t = localStorage.getItem('luck-mail-theme'); if (__t && ['blue', 'green', 'mono', 'purple', 'orange', 'teal'].indexOf(__t) >= 0) { document.body.setAttribute('data-theme', __t); } } catch (e) {}
   </script>
 </head>
 <body class="bg-white text-slate-800" data-theme="blue">

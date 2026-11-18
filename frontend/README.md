@@ -75,7 +75,7 @@ npm run test:api-contract
 | 聚合/单邮箱视图 | 见下节“聚合/单邮箱视图” |
 | 邮箱可展开文件夹 | 点邮箱行 = 展开 + 切单邮箱收件箱；点 `>` 只展开/折叠；点文件夹切该文件夹；只列服务器真实文件夹 |
 | 邮件列表 | `GET /api/messages` 分页（limit/offset）+ `q` 搜索（FTS5，300ms 防抖）；虚拟滚动（只在 MailList）；点邮件打开正文即标已读 |
-| 写信 | 发送（有附件走 multipart，无附件走 JSON）进已发送；回复/转发预填；存草稿见“已知缺口” |
+| 写信 | 发送（有附件走 multipart，无附件走 JSON）进已发送；回复/转发预填（带 threading 头）；存草稿走服务端 `/api/drafts`（自动保存） |
 | 删除/标未读/标垃圾邮件 | 删除（已删除里再删 = 彻底删除）、`POST read`、`POST move` 到垃圾邮件文件夹 |
 | 全部刷新 | `POST /api/refresh-all`，按钮转圈 + 重拉列表 |
 | 登录/创建账号 | `GET /api/auth/status` 决定显示登录还是创建账号；401/429（锁定）友好提示；白卡片样式（用户名+密码小眼睛+30天免登录+蓝色按钮） |
@@ -83,15 +83,15 @@ npm run test:api-contract
 | 邮箱管理 | 弹窗表格：邮箱/备注名 inline 改/拖拽+上下移排序/操作（邮箱设置、临时停用、删除）；+ 添加邮箱；数量显示；确定/取消（暂存，确定才写回） |
 | 设置 | 改密码（`POST /api/auth/change-password`）、默认账号、签名（`GET/PUT /api/settings`） |
 | 配色切换 | 6 色，`body[data-theme]` + CSS 变量，滚动条跟随，localStorage 记住 |
-| 响应式 | 桌面 >1024px 完整 3 栏；平板/手机 QQ 式布局（见下节） |
+| 响应式 | 桌面 ≥1024px 完整 3 栏；平板/手机 QQ 式布局（见下节） |
 | 实时推送 | Socket.io 单连接，事件驱动 `unreadCounts`（见下节） |
 | 附件显示 | 附件旁显示大小（B/KB/MB） |
 
 ## 规模与技术栈（用户 2026-11-17 00:42 定稿）
 
 - 规模：最多 50 个邮箱，单 Node 进程 + SQLite 即最优解；**前端不用 Web Worker**（消息量小，主线程够）。
-- TypeScript 严格类型已落地：全部源码为 `.ts` / `<script setup lang="ts">`，`tsconfig.json` 开 `strict`，`npm run typecheck`（vue-tsc --noEmit）零错误；共享类型在 `src/types.ts`，与契约形状一一对应。
-- 虚拟滚动只在 MailList：`src/components/MessageList.vue` 按固定行高（桌面 104px / QQ 式 100px）只渲染可视窗口 + 上下 5 行 overscan；账号树最多 50 个，直接 `v-for`，不用虚拟滚动。
+- TypeScript 严格类型已落地：全部源码为 `.ts` / `<script setup lang="ts">`，`tsconfig.json` 开 `strict`，`npm run typecheck`（vue-tsc --noEmit）仅 `AddAccountModal.vue:124` 一处既存类型报错（presetsCache 类型）；共享类型在 `src/types.ts`，与契约形状一一对应。
+- 虚拟滚动只在 MailList：`src/components/MessageList.vue` 按固定行高（桌面 76px / QQ 式 84px）只渲染可视窗口 + 上下 5 行 overscan；账号树最多 50 个，直接 `v-for`，不用虚拟滚动。
 - 懒加载已实现：`useMailStore.init()` 只调 `GET /api/accounts`（一级账号名）+ `GET /api/settings`，不预加载任何账号的文件夹；点邮箱行 / 折叠箭头时才调 `GET /api/accounts/:id/folders`（`loadFolders`，带缓存）。
 - 读信渲染用沙盒 iframe（srcdoc）：`ReadingPane.vue` 不再用 `v-html` 直插主应用；正文放 `<iframe sandbox="allow-same-origin allow-popups" :srcdoc="...">`（不给 `allow-scripts`，脚本不执行；`allow-same-origin` 仅用于量高度自适应，`allow-popups` 让链接新窗口打开；链接统一 `target="_blank"`）。邮件内 CSS 覆盖不到主应用的浅蓝色 UI。
 
@@ -101,7 +101,7 @@ npm run test:api-contract
 
 - `accounts`：多邮箱基本信息与连接状态（`GET /api/accounts`）。
 - `activeAccountId` / `activeFolder`：当前点的左栏邮箱与文件夹（与 `view` 同步；聚合视图时为 null）。
-- `mailList`：缓存当前列表邮件（分页追加、搜索重拉都只改它，避免频繁请求 Node）。
+- `mailList`：缓存当前列表邮件（每页替换、搜索重拉都只改它，避免频繁请求 Node）。
 - `unreadCounts`：响应式 `Map`（键 `total` / `account:<id>` / `folder:<accountId>:<folderId>`），左栏红色角标直接绑定它。
 - 状态同步：删信、标已读/未读、收新邮件时，`unreadCounts` 与 `mailList`、左栏角标一起即时更新（`bumpUnread` 就地增减 + `mailList` 就地插/删/改），不整页刷新、不重新拉全量。`loadFolders` 只更新该账号的文件夹级计数（取 max 兜底），不冲掉事件刚加上的增量；账号级计数以 `loadAccounts` 的全量快照为准。
 
@@ -117,7 +117,7 @@ npm run test:api-contract
 - 布局学 QQ、配色用本项目浅色主题（不用 QQ 的深色）：`src/components/MobileShell.vue`，`body[data-theme]` 变量全程生效，与桌面端同一套 6 色。
 - 手机 <768px 单栏三级：账号总览（账号头：头像+用户名+主账号+默认邮箱；搜索；常用文件夹：所有收件箱/所有未读/所有草稿/所有已发送/所有已删除；我的邮箱平铺；底部设置/改密码/配色/退出）→ 邮箱内（顶部返回 + 账号切换下拉 + 写信；页签：当前文件夹 / 未读邮件 / 管理；侧滑文件夹菜单：该邮箱真实文件夹 + 管理/刷新入口；QQ 式邮件列表：头像圆+发件人/主题/摘要两行+日期+>）→ 阅读窗（返回 + 同款操作栏 + 沙盒 iframe 正文）。
 - 平板 768–1024px：左栏固定为账号总览（300px），右栏为列表/阅读窗。
-- 桌面 >1024px 保持现有 3 栏不变。
+- 桌面 ≥1024px 保持现有 3 栏不变。
 
 ## 实时推送（用户 2026-11-17 00:34 定）
 
@@ -134,23 +134,23 @@ npm run test:api-contract
 
 ```bash
 npm run build              # ✓ 成功，dist/index.html + assets（JS 251KB / CSS 35KB，gzip 84KB / 7.4KB）
-npm run typecheck          # ✓ vue-tsc --noEmit（TS strict；仅 AddAccountModal.vue:112 一个既存类型报错）
+npm run typecheck          # ✓ vue-tsc --noEmit（TS strict；仅 AddAccountModal.vue:124 一处既存类型报错）
 npm run test:api-contract  # ✓ 18/18（对 mock 后端逐项核对契约返回形状）
-npm run smoke              # ✓ 31/31（jsdom 挂载 dist + mock 后端 + Socket.io）
+npm run smoke              # ✓ 33/33（jsdom 挂载 dist + mock 后端 + Socket.io）
 ```
 
-冒烟 31 项逐条（与 `scripts/smoke.mjs` 的断言名一致）：登录页渲染：用户名/密码框、登录按钮、30天内免登录 ✓；主题：localStorage luck-mail-theme=green 生效 ✓；登录失败（401）友好提示 ✓；主界面 3 栏结构：左栏/列表/阅读窗 ✓；聚合分类 5 项齐全 ✓；邮箱平铺无分组：两个账号在列，无“分组”入口 ✓；阅读窗自动打开第一封 ✓；读信渲染：沙盒 iframe（srcdoc），正文在 iframe 内、不直接 v-html 插主应用 ✓；请求：GET /api/auth/status ✓；请求：POST /api/auth/login（JSON 用户名+密码）✓；请求：GET /api/accounts ✓；请求：聚合视图 GET /api/messages?view=all-inbox（不带 accountId）✓；懒加载：初始化不预取文件夹（无 /folders 请求），点邮箱后才按需加载 ✓；Socket.io 客户端连上 mock 服务端 ✓；收到 new-mail 后左栏角标即时 (1)->(2)（Pinia unreadCounts 响应式更新）✓；收到 new-mail 后新邮件进 mailList（无需刷新）✓；点邮箱行：调 view=folder&accountId=2&folderId=21（只看该邮箱收件箱）✓；懒加载：点邮箱行时才调 GET /api/accounts/2/folders ✓；点所有未读：调 view=all-unread（不带 accountId，全部邮箱合并）✓；单封删除先弹确认框 ✓；删除调 DELETE /api/messages/:id ✓；删信后列表为空态（本地 mailList 即时更新，未重新拉全量）✓；删除失败时 toast 为“删除失败，请重试”（后端原话透传）✓；删除失败时行仍在列表（服务端未删成，对账后不闪空）✓；写信发送调 POST /api/messages/send ✓；发信带 idempotencyKey（UUID，同一封重试复用）✓；发信成功提示“发送成功”✓；发信后切到所有已发送、首封（刚发的信）自动打开 ✓；移动端 QQ 布局：账号总览（常用文件夹/我的邮箱）在 DOM ✓；移动端 QQ 布局：侧滑文件夹抽屉在 DOM ✓；移动端 QQ 布局：页签（未读邮件/管理）在 DOM ✓。
+冒烟 33 项逐条（与 `scripts/smoke.mjs` 的断言名一致）：登录页渲染：用户名/密码框、登录按钮、30天内免登录 ✓；主题：localStorage luck-mail-theme=green 生效 ✓；登录失败（401）友好提示 ✓；主界面 3 栏结构：左栏/列表/阅读窗 ✓；聚合分类 5 项齐全 ✓；邮箱平铺无分组：两个账号在列，无“分组”入口 ✓；阅读窗不自动打开第一封（列表加载后为空状态，手动点开才进阅读窗）✓；读信渲染：沙盒 iframe（srcdoc），正文在 iframe 内、不直接 v-html 插主应用 ✓；请求：GET /api/auth/status ✓；请求：POST /api/auth/login（JSON 用户名+密码）✓；请求：GET /api/accounts ✓；请求：聚合视图 GET /api/messages?view=all-inbox（不带 accountId）✓；懒加载：初始化不预取文件夹（无 /folders 请求），点邮箱后才按需加载 ✓；Socket.io 客户端连上 mock 服务端 ✓；收到 new-mail 后左栏角标即时 (1)->(2)（Pinia unreadCounts 响应式更新）✓；收到 new-mail 后新邮件进 mailList（无需刷新）✓；点邮箱行：调 view=folder&accountId=2&folderId=21（只看该邮箱收件箱）✓；懒加载：点邮箱行时才调 GET /api/accounts/2/folders ✓；点所有未读：调 view=all-unread（不带 accountId，全部邮箱合并）✓；单封删除先弹确认框 ✓；删除调 DELETE /api/messages/:id ✓；删信后列表为空态（本地 mailList 即时更新，未重新拉全量）✓；删除失败时 toast 为“删除失败，请重试”（后端原话透传）✓；删除失败时行仍在列表（服务端未删成，对账后不闪空）✓；写信发送调 POST /api/messages/send ✓；发信带 idempotencyKey（UUID，同一封重试复用）✓；发信成功提示“发送成功”✓；发信后切到所有已发送、首封（刚发的信）自动打开 ✓；移动端 QQ 布局：账号总览（常用文件夹/我的邮箱）在 DOM ✓；移动端 QQ 布局：侧滑文件夹抽屉在 DOM ✓；移动端 QQ 布局：页签（未读邮件/管理）在 DOM ✓。
 
 ## 历史记录：2026-11-17 的 mock 验证（当时尚未接真实后端联调）
 
 - 2026-11-17 时以上验证全部对本地 mock（`scripts/mock-server.mjs`，按契约形状返回 + Socket.io 推 `new-mail`），**当时没有接真实 Node 后端、没有真实 IMAP 账号**。之后已接真实后端并部署到 `mm.ynzb.cn` 上线；本节只保留当时的验证背景，不再代表现状。联调时以后端真实返回为准，重点核对：登录 Cookie（`lm_session`）、`view=folder` 的 folderId、Socket.io 握手（Cookie 校验）、附件下载流。
 - 已知缺口（非 bug，是契约/实现现状）：
-  - 存草稿是本地的：契约没有“存草稿到服务器”接口，`存草稿` 先写浏览器 localStorage（`luck-mail-local-drafts`），在草稿视图置顶显示、带“本地草稿”标记；后端补了存草稿接口后改成走服务器。
+  - 存草稿已改存服务器：`存草稿` 走 `/api/drafts`（POST 建、PUT 更新，输入停约 1 秒自动保存；发信成功后服务端按 draftId 自动删草稿）；浏览器 localStorage 键 `luck-mail-local-drafts` 只剩一次性迁移（旧本机草稿在 init 时逐条 POST 到服务端，成功后清空旧键）。
   - 虚拟滚动只在 mock 的 3 封邮件上跑过渲染正确性，未用大数据量（50~200 封）实测滚动/窗口切换性能。
   - iframe 自适应高度（`resizeFrame` 量 `scrollHeight`）在 jsdom 里无法验证，需在真浏览器里看长邮件。
-  - “30天内免登录”复选框只是界面偏好（记 localStorage），实际会话时长由服务端 `lm_session` Cookie 决定。
+  - “30天内免登录”复选框：勾选值随登录请求发给后端（`rememberMe`），后端据此建 30 天或 1 天会话；localStorage 只记复选框偏好供下次回填（`luck-mail-remember`）。
   - FontAwesome 仍走 CDN；离线环境图标会缺失（布局不受影响）。如需完全离线，把 FontAwesome 换成本地字体文件即可。
-  - 未做真机手机/平板验证，只有 jsdom DOM 冒烟 + CSS 断点（<768 / 768–1024 / >1024）；联调后请在真机上过一遍 QQ 式三级流程。
+  - 未做真机手机/平板验证，只有 jsdom DOM 冒烟 + CSS 断点（<768 / 768–<1024 / ≥1024）；联调后请在真机上过一遍 QQ 式三级流程。
 
 ## 红线遵守情况
 

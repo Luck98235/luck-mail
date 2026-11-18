@@ -66,17 +66,19 @@
         <div v-if="(mail.selectedMessage.attachments || []).length" class="mb-6 flex flex-wrap gap-2">
           <a
             v-for="att in mail.selectedMessage.attachments" :key="att.id"
-            :href="`/api/messages/${mail.selectedMessage.id}/attachments/${att.id}`"
-            :download="att.filename" target="_blank" rel="noopener noreferrer"
-            title="点击下载：从邮箱服务器实时取，不经过本项目服务器缓存"
-            class="inline-flex items-center gap-1.5 text-xs border rounded-md px-2.5 py-1.5 bg-blue-50 text-blue-600 border-blue-100 hover:bg-blue-100"
+            href="#"
+            :title="`点击下载：从邮箱服务器实时取，不经过本项目服务器缓存；${att.filename}`"
+            class="inline-flex items-center gap-1.5 text-xs border rounded-md px-2.5 py-1.5 bg-blue-50 text-blue-600 border-blue-100 hover:bg-blue-100 cursor-pointer"
+            @click.prevent="downloadAttachment(att)"
           >
             <i class="fa-solid fa-paperclip"></i>{{ att.filename }}<span v-if="att.size != null">（{{ formatSize(att.size) }}）</span>
           </a>
         </div>
         <!-- 正文用沙盒 iframe（srcdoc）渲染：洗净后的 HTML 不直接插进主应用，
              邮件内 CSS/脚本伤不到主应用的浅蓝色 UI。sandbox 不给 allow-scripts，
-             只给 allow-same-origin（用于量高度自适应）与 allow-popups（链接新窗口打开）。 -->
+             只给 allow-same-origin（用于量高度自适应）与 allow-popups（链接新窗口打开）。
+             第二遍消毒（审计 #10 H1-安全）：后端入库时已消过一遍，前端进 iframe 前
+             再用同配置消一遍（src/utils/sanitize.ts），任一处回归都还有另一层挡着。 -->
         <iframe
           ref="frameRef"
           :srcdoc="srcdocHtml"
@@ -97,8 +99,9 @@ import { useMailStore } from '../stores/mail'
 import { useThemeStore } from '../stores/theme'
 import { api } from '../api'
 import { attachSwipeBack } from '../utils/swipeBack'
+import { sanitizeBodyHtml } from '../utils/sanitize'
 import { fmtFullTime, initialOf, formatSize, copyText } from '../utils'
-import type { MessageDetail } from '../types'
+import type { MessageDetail, Attachment } from '../types'
 
 defineProps<{ showBack?: boolean }>()
 const emit = defineEmits<{
@@ -153,12 +156,38 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
 }
 
-// 链接统一新窗口打开（srcdoc 里 <base target="_blank"> 已兜底；这里再补没写 target 的 <a>）
-function forceBlankTarget(html: string): string {
-  return html.replace(/<a\s([^>]*?)>/gi, (match: string, attrs: string) => {
-    if (/target\s*=/.test(attrs)) return match
-    return `<a ${attrs} target="_blank" rel="noopener noreferrer">`
-  })
+// 附件下载（审计 #10 正确性 L5）：以前是普通 <a> 直链导航，part 为 NULL 时
+// 后端回 404，用户会在新标签页看到原始错误页、无应用内反馈。
+// 现在点下载先轻量探测：只读响应头就取消 body（不下完整附件），失败时
+// 在应用内 toast 说明原因；成功才触发下载。
+// 不用 HEAD：后端 GET 处理器收到 HEAD 也会照常跑 IMAP 取附件再丢弃，
+// 反而比 GET + 立即 cancel 更费事。
+async function downloadAttachment(att: Attachment): Promise<void> {
+  const m = mail.selectedMessage
+  if (!m) return
+  const url = `/api/messages/${m.id}/attachments/${att.id}`
+  try {
+    const res = await fetch(url, { credentials: 'include' })
+    if (!res.ok) {
+      mail.showToast(res.status === 404 ? '附件不存在或已失效' : `附件下载失败（HTTP ${res.status}）`)
+      try { await res.body?.cancel() } catch { /* 忽略 */ }
+      return
+    }
+    // 只探了响应头就取消 body：真正下载走下面临时 <a> 再取一次，
+    // 避免这次探测把整个附件下下来。
+    try { await res.body?.cancel() } catch { /* 忽略 */ }
+  } catch {
+    mail.showToast('附件下载失败，请检查网络后重试')
+    return
+  }
+  const a = document.createElement('a')
+  a.href = url
+  a.download = att.filename
+  a.target = '_blank'
+  a.rel = 'noopener noreferrer'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
 }
 
 const srcdocHtml = computed<string>(() => {
@@ -172,10 +201,13 @@ const srcdocHtml = computed<string>(() => {
   const c300 = (cs.getPropertyValue('--c-300') || '#93c5fd').trim()
   const c400 = (cs.getPropertyValue('--c-400') || '#60a5fa').trim()
   // 正在看译文时：译文纯文本按段落显示（转义后换行成 <p>），不走原文 HTML。
+  // 原文 HTML 进 iframe 前过第二遍消毒（与后端同配置，见 utils/sanitize.ts）；
+  // 链接统一规范化在消毒钩子里做（target=_blank + rel=noopener），
+  // srcdoc 里的 <base target="_blank"> 是最后一道兜底。
   const body = showingTranslation.value && translatedText.value !== null
     ? translatedText.value.split(/\n\s*\n/).map((p) => `<p style="margin:0 0 1em">${escapeHtml(p.trim()).replace(/\n/g, '<br>')}</p>`).join('')
     : m.bodyHtml
-      ? forceBlankTarget(m.bodyHtml)
+      ? sanitizeBodyHtml(m.bodyHtml)
       : `<div style="white-space:pre-wrap">${escapeHtml(m.bodyText || '')}</div>`
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><base target="_blank">`
     + `<style>body{margin:0;padding:2px;font:14px/1.7 ui-sans-serif,system-ui,sans-serif;color:#334155;background:#fff;word-wrap:break-word}img{max-width:100%;height:auto}a{color:#2563eb}`

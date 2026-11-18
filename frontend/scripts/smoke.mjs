@@ -180,6 +180,44 @@ async function main() {
   }), 10000, '聚合未读请求')
   check('点所有未读：调 view=all-unread（不带 accountId，全部邮箱合并）', true)
 
+  // 6a. 草稿视图合并 IMAP 草稿（2026-11-19 修复）：以前只读服务端草稿，
+  // 邮箱同步来的草稿在界面上完全看不见。点“所有草稿”，应调
+  // view=all-drafts 取 IMAP 草稿，列表里出现 mock 的 IMAP 草稿。
+  const draftsAgg = qa('#desktop-layout [class*="cursor-pointer"]').find((el) => el.textContent.trim().startsWith('所有草稿'))
+  click(draftsAgg)
+  await waitFor(() => text().includes('IMAP 草稿测试'), 10000, '草稿视图出现 IMAP 草稿')
+  check('草稿视图：IMAP 同步来的草稿出现在列表里（与服务端草稿合并）', text().includes('IMAP 草稿测试'))
+  check('草稿视图：调 GET /api/messages?view=all-drafts 取 IMAP 草稿', mock.log.some((e) => {
+    const u = new URL(e.path, origin)
+    return e.method === 'GET' && u.pathname === '/api/messages' && u.searchParams.get('view') === 'all-drafts'
+  }))
+
+  // 7a. 文件夹角标对账：此时 luck534 的账号与收件夹角标都是 (2)（1 封旧未读 +
+  // Socket.io 新邮件）。切到“所有已发送”，模拟服务端那边的未读数已降为 1
+  //（比如别处删了一封未读信，前端没看到过程），再由服务端推一条 mail-deleted
+  //（事件只有 messageId、行也不在当前列表里，本地没法直接扣减）；
+  // 前端必须防抖重载 /folders 对账，文件夹角标 (2)->(1)、账号角标随文件夹
+  // 之和一起 (2)->(1)。旧逻辑（max 只升不降、无重载触发）会永远停在 (2)。
+  const sentAgg = qa('#desktop-layout [class*="cursor-pointer"]').find((el) => el.textContent.trim().startsWith('所有已发送'))
+  click(sentAgg)
+  await waitFor(() => mock.log.some((e) => {
+    const u = new URL(e.path, origin)
+    return e.method === 'GET' && u.pathname === '/api/messages' && u.searchParams.get('view') === 'all-sent'
+  }), 10000, '切到所有已发送')
+  mock.setFolderUnread(2, 21, 1)
+  mock.emitMailDeleted({ messageId: 999 })
+  await waitFor(() => {
+    const row = qa('#account-list .acct-row').find((el) => el.textContent.includes('luck534@163.com'))
+    return row && row.textContent.includes('(1)')
+  }, 10000, '删信对账后账号角标 (2)->(1)')
+  const folderBox = qa('#account-list .acct-folders')[1]
+  check('删信对账：mail-deleted（行不在列表）触发文件夹重载，账号角标 (2)->(1)', true)
+  check('删信对账：文件夹收件夹角标 (2)->(1)', !!folderBox && folderBox.textContent.includes('收件箱') && folderBox.textContent.includes('(1)'), folderBox?.textContent || '')
+  check('删信对账：重载了 GET /api/accounts/2/folders（防抖合并，展开时 1 次 + 对账 1 次）', mock.log.filter((e) => e.method === 'GET' && /^\/api\/accounts\/2\/folders/.test(e.path)).length >= 2, `folders 请求数=${mock.log.filter((e) => e.method === 'GET' && /^\/api\/accounts\/2\/folders/.test(e.path)).length}`)
+  // 回到“所有未读”，继续原有的删除流程（下面第 7 步假定在这个视图）。
+  click(unreadAgg)
+  await waitFor(() => text().includes('未读测试邮件'), 10000, '回到所有未读')
+
   // 7. 读信 → 删除（删后 mailList 与角标即时更新，不重新拉全量）
   // 此时在“所有未读”视图（两封未读：Socket.io 新邮件 + 未读测试邮件），
   // 手动点开“未读测试邮件”（id 2）再删它。

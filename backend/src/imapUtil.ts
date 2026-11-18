@@ -1,7 +1,7 @@
 import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
-import { log } from './config.js';
+import { log, ALLOW_PRIVATE_MAIL_HOSTS } from './config.js';
 import type { AccountRow } from './db.js';
 
 // ---------------------------------------------------------------------------
@@ -46,6 +46,49 @@ export function accountToImap(a: AccountRow): ImapAccount {
   };
 }
 
+// Audit #10 M-2：拒绝回环/私有/链路本地/组播字面 IP——已认证的 SSRF：
+// 邮箱服务器地址原来只验非空与端口范围，可指向 127.0.0.1、内网段或
+// 169.254.169.254（云元数据）。主机名仍按原样解析（DNS 解析后是否
+// 内网由上游网络隔离处理——服务端只应连互联网邮件服务商；常见内网
+// 主机名如 localhost 也一并拒绝）。
+// 字面 IPv4/IPv6 的判定：10/8、172.16/12、192.168/16、127/8、169.254/16、
+// 0.0.0.0/8、100.64/10（CGNAT）、192.0.0.0/24、192.0.2.0/24、198.51.100.0/24、
+// 203.0.113.0/24（文档段）、224.0.0.0/4（组播）、240.0.0.0/4（保留）、
+// ::1、fe80::/10、fc00::/7、ff00::/8、::（未指定）。
+export function isPrivateOrLoopbackHost(host: string): boolean {
+  const h = String(host || '').trim().toLowerCase();
+  if (!h) return false;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
+  // IPv6 字面（可能带方括号）。
+  const v6 = h.replace(/^\[(.*)\]$/, '$1');
+  if (v6.includes(':')) {
+    if (v6 === '::1' || v6 === '::') return true;
+    const head = v6.split(':')[0];
+    const first = parseInt(head, 16);
+    if (Number.isNaN(first)) return false;
+    if ((first & 0xffc0) === 0xfe80) return true; // fe80::/10 链路本地
+    if ((first & 0xfe00) === 0xfc00) return true; // fc00::/7 唯一本地
+    if ((first & 0xff00) === 0xff00) return true; // ff00::/8 组播
+    return false;
+  }
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false; // 不是字面 IPv4（主机名）→ 不拦截
+  const [a, b] = [Number(m[1]), Number(m[2])];
+  if (a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 0) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 192 && b === 0 && (Number(m[3]) === 0 || Number(m[3]) === 2)) return true;
+  if (a === 198 && b === 51 && Number(m[3]) === 100) return true;
+  if (a === 203 && b === 0 && Number(m[3]) === 113) return true;
+  if (a >= 224 && a <= 239) return true; // 组播
+  if (a >= 240) return true; // 保留段
+  return false;
+}
+
 export function makeImapClient(
   account: ImapAccount,
   password: string,
@@ -82,7 +125,15 @@ async function testImap(
     // connect() runs startSession(): CAPABILITY, ID, LOGIN, ID again.
     return { ok: true, serverInfo: client.serverInfo || null };
   } finally {
-    try { await client.logout(); } catch { /* already closed */ }
+    // Audit #10 M-12：logout 加 5 秒超时——旧版 finally 里裸 await
+    // logout()，超时 race 触发后底层连接仍可能在 logout 里挂住
+    // （imapflow 默认无 logout 超时），最坏再等 socketTimeout。
+    try {
+      await Promise.race([
+        client.logout(),
+        new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+      ]);
+    } catch { /* already closed */ }
   }
 }
 
@@ -156,12 +207,24 @@ export interface ConnectivityResult {
 // 消底层的建连尝试（imapflow/nodemailer 不提供取消），超时后底层 socket
 // 仍受各自的 connectionTimeout/socketTimeout 约束、最长 30 秒内自行收敛，
 // 不影响已返回的结果。超时按连接失败返回，文案说明是超时及卡在哪一步。
+// timeoutMs：单次调用的封顶（默认 15 秒）；CSV 导入按剩余总预算递减传入
+// （audit #10 H-3），预算耗尽时整批提前结束。
 const CONNECTIVITY_TEST_TIMEOUT_MS = 15 * 1000;
 export async function testConnectivity(
   account: ImapAccount,
   password: string,
   logger?: unknown,
+  timeoutMs: number = CONNECTIVITY_TEST_TIMEOUT_MS,
 ): Promise<ConnectivityResult> {
+  // Audit #10 M-2：回环/私有/链路本地/组播地址在建连之前就拒掉——
+  // 不触网、不泄露底层 socket 错误细节，错误文案统一为“连接失败”。
+  // ALLOW_PRIVATE_MAIL_HOSTS=1 时放行（仅 verify-all 本地测试用，
+  // 见 config.ts；生产绝不设）。
+  if (!ALLOW_PRIVATE_MAIL_HOSTS
+    && (isPrivateOrLoopbackHost(account.imapHost) || isPrivateOrLoopbackHost(account.smtpHost))) {
+    return { imapOk: false, smtpOk: false, error: '连接失败（服务器地址不合法）' };
+  }
+  const budgetSec = Math.max(1, Math.round(timeoutMs / 1000));
   let phase: 'imap' | 'smtp' = 'imap';
   const run = (async (): Promise<ConnectivityResult> => {
     const result: ConnectivityResult = { imapOk: false, smtpOk: false, error: null };
@@ -189,8 +252,8 @@ export async function testConnectivity(
         const where = phase === 'imap'
           ? `IMAP 连接失败（${account.imapHost}:${account.imapPort}）`
           : `SMTP 连接失败（${account.smtpHost}:${account.smtpPort}）`;
-        resolve({ imapOk: false, smtpOk: false, error: `${where}：连接超时（15 秒内服务器无响应）` });
-      }, CONNECTIVITY_TEST_TIMEOUT_MS);
+        resolve({ imapOk: false, smtpOk: false, error: `${where}：连接超时（${budgetSec} 秒内服务器无响应）` });
+      }, timeoutMs);
       timer.unref?.();
     });
     return await Promise.race([run, timeout]);

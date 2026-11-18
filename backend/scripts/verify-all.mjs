@@ -73,6 +73,10 @@ function check(name, ok, detail = '') {
 let cookie = '';
 async function api(method, p, body, extraHeaders = {}) {
   const headers = { ...extraHeaders };
+  // Audit #10 M-5：默认带同源 Origin——严格 CSRF 要求已认证写请求带
+  // Origin；Node fetch 本身不带，须由调用方补上。显式传 Origin（含空
+  // 串）时不覆盖——空串用于测“缺失 Origin → 403”。
+  if (!('Origin' in headers) && !('origin' in headers)) headers.Origin = BASE;
   if (cookie) headers.Cookie = cookie;
   let payload;
   if (body !== undefined) {
@@ -113,6 +117,9 @@ function startServer() {
   const srv = spawn('node', ['dist/server.js'], {
     cwd: BACKEND,
     env: { ...process.env, PORT: String(PORT), DATA_DIR, PUBLIC_DIR,
+      // Audit #10 M-2：测试进程才放行私有/回环地址——假 IMAP/SMTP 跑在
+      // 127.0.0.1；生产绝不设此变量（默认拒绝）。
+      ALLOW_PRIVATE_MAIL_HOSTS: '1',
       ...(tlsFakeOk ? { NODE_EXTRA_CA_CERTS: tlsCertPath } : {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -148,10 +155,24 @@ try {
   console.log('== auth ==');
   let r = await api('GET', '/api/auth/status');
   check('status: setupRequired=true before setup', r.json?.setupRequired === true && r.json?.loggedIn === false);
-  r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'short', confirm: 'short' });
-  check('setup rejects short password (400)', r.status === 400);
+  // Audit #10 H-1：首次启动生成的一次性引导 token——users 表为空时写
+  // DATA_DIR/.setup-token（0600），setup 必须带它。
+  const setupTokenPath = path.join(DATA_DIR, '.setup-token');
+  const setupTokenExists = fs.existsSync(setupTokenPath);
+  const setupTokenMode = setupTokenExists ? (fs.statSync(setupTokenPath).mode & 0o777).toString(8) : '';
+  const setupToken = setupTokenExists ? fs.readFileSync(setupTokenPath, 'utf8').trim() : '';
+  check('audit10 H-1: setup token file exists (0600) while no user',
+    setupTokenExists && setupTokenMode === '600' && setupToken.length >= 32,
+    `exists=${setupTokenExists} mode=${setupTokenMode} len=${setupToken.length}`);
   r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'testpass123', confirm: 'testpass123' });
+  check('audit10 H-1: setup without token -> 403', r.status === 403, `status=${r.status}`);
+  r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'testpass123', confirm: 'testpass123', setupToken: 'wrong-token' });
+  check('audit10 H-1: setup with wrong token -> 403', r.status === 403, `status=${r.status}`);
+  r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'short', confirm: 'short', setupToken });
+  check('setup rejects short password (400)', r.status === 400);
+  r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'testpass123', confirm: 'testpass123', setupToken });
   check('setup creates single user (201)', r.status === 201 && r.json?.ok === true);
+  check('audit10 H-1: setup token file deleted after first user', !fs.existsSync(setupTokenPath));
   r = await api('GET', '/api/auth/status');
   check('D6: setup creates a session (logged in immediately, no second login needed)', r.json?.loggedIn === true && r.json?.username === 'tester', JSON.stringify(r.json));
   r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'testpass123', confirm: 'testpass123' });
@@ -170,6 +191,55 @@ try {
   check('login ok + sets lm_session cookie', r.status === 200 && cookie.startsWith('lm_session='));
   r = await api('GET', '/api/auth/status');
   check('status: loggedIn + username', r.json?.loggedIn === true && r.json?.username === 'tester');
+  // 刷新掉登录回归（2026-11-19 真实故障）：生产 COOKIE_SECURE=1 时会话
+  // Cookie 名是 __Host-lm_session；/api/auth/status 曾写死读 lm_session，
+  // 线上每次刷新都判未登录、跳回登录页（本地 COOKIE_SECURE=0 时名字
+  // 就是 lm_session，所以本地跑测从没发现）。起第二个子进程用生产配置
+  // 跑一遍登录 + status，确认名字与状态一致。
+  {
+    const securePort = await new Promise((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once('error', reject);
+      probe.listen(0, '127.0.0.1', () => { const p = probe.address().port; probe.close(() => resolve(p)); });
+    });
+    const secureTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'luck-mail-verify-secure-'));
+    const secureData = path.join(secureTmp, 'data');
+    const secureBase = `http://127.0.0.1:${securePort}`;
+    const secureSrv = spawn('node', ['dist/server.js'], {
+      cwd: BACKEND,
+      env: { ...process.env, PORT: String(securePort), DATA_DIR: secureData, PUBLIC_DIR,
+        COOKIE_SECURE: '1', ALLOW_PRIVATE_MAIL_HOSTS: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let secureLog = '';
+    secureSrv.stdout.on('data', (d) => { secureLog += d.toString(); });
+    secureSrv.stderr.on('data', (d) => { secureLog += d.toString(); });
+    try {
+      let up = false;
+      for (let i = 0; i < 60 && !up; i++) {
+        try { const rr = await fetch(secureBase + '/api/auth/status'); if (rr.ok) up = true; }
+        catch { /* not up yet */ }
+        if (!up) await new Promise((r2) => setTimeout(r2, 250));
+      }
+      check('secure-cookie probe: server starts with COOKIE_SECURE=1', up, secureLog.slice(-200));
+      if (up) {
+        const tokenFile = path.join(secureData, '.setup-token');
+        const sToken = fs.existsSync(tokenFile) ? fs.readFileSync(tokenFile, 'utf8').trim() : '';
+        const sSetup = await fetch(secureBase + '/api/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'secure', password: 'testpass123', confirm: 'testpass123', setupToken: sToken }) });
+        check('secure-cookie probe: setup ok', sSetup.status === 201, `status=${sSetup.status}`);
+        const sLogin = await fetch(secureBase + '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: secureBase }, body: JSON.stringify({ username: 'secure', password: 'testpass123', rememberMe: true }) });
+        const sSetCookie = sLogin.headers.get('set-cookie') || '';
+        const sName = (sSetCookie.match(/^\s*([^=;\s]+)=/) || [])[1] || '';
+        check('secure-cookie probe: login sets __Host-lm_session', sLogin.status === 200 && sName === '__Host-lm_session', `status=${sLogin.status} name=${sName}`);
+        const sCookieVal = (sSetCookie.match(/^\s*[^=;\s]+=([^;]*)/) || [])[1] || '';
+        const sStatus = await fetch(secureBase + '/api/auth/status', { headers: { Cookie: `${sName}=${sCookieVal}` } });
+        const sJson = await sStatus.json().catch(() => null);
+        check('secure-cookie probe: /status sees the secure session (refresh keeps login)', sJson?.loggedIn === true && sJson?.username === 'secure', JSON.stringify(sJson));
+      }
+    } finally {
+      try { secureSrv.kill('SIGKILL'); } catch { /* ignore */ }
+    }
+  }
 
   // ---------- 2. presets / accounts ----------
   console.log('== presets & accounts ==');
@@ -260,6 +330,15 @@ try {
   check('2-char Chinese term hits via LIKE fallback', r.json?.messages?.some((m) => m.id === m2), `total=${r.json?.total}`);
   r = await api('GET', `/api/messages?view=all-inbox&limit=50`);
   check('all-inbox lists seeded messages', r.json?.total === 2);
+  // Audit #10 前端约定：详情响应带原信 Message-ID 与 References（供回复/
+  // 转发透传 threading）。种子行先写一对值再验。
+  db.prepare('UPDATE messages SET message_id=?, "references"=? WHERE id=?')
+    .run('<seed-m1@luck-mail.test>', '<seed-ref-0@luck-mail.test>', m1);
+  r = await api('GET', `/api/messages/${m1}`);
+  check('audit10 threading: detail returns messageId + references of the original mail',
+    r.json?.message?.messageId === '<seed-m1@luck-mail.test>'
+    && r.json?.message?.references === '<seed-ref-0@luck-mail.test>',
+    `messageId=${r.json?.message?.messageId} references=${r.json?.message?.references}`);
   r = await api('GET', `/api/messages/${m1}`);
   check('detail returns body from disk files',
     r.json?.message?.bodyText?.includes('第一封中文测试邮件正文') && r.json?.message?.bodyHtml?.includes('第一封中文测试邮件正文'));
@@ -275,12 +354,13 @@ try {
   r = await api('GET', `/api/messages/${m1}/attachments/${Number(attLarge.lastInsertRowid)}`);
   check('uncached attachment without IMAP part -> 404 JSON (no crash)', r.status === 404 && r.json?.ok === false);
 
-  // Audit #8 LOW-7：标已读 IMAP 不通时本地兜底——假账号连不上 163，
-  // 仍返回 200 且本地 is_read 置 1，不再 502。
+  // Audit #10 H-2：标已读去掉断网本地回退——IMAP 不通直接 502（与删信/
+  // 移动一致），本地 is_read 不变。旧断言（审计 #8 LOW-7，期望 200 +
+  // is_read=1）按新语义改写。
   r = await api('POST', `/api/messages/${m2}/read`, { read: true });
   const m2Read = db.prepare('SELECT is_read FROM messages WHERE id=?').get(m2).is_read;
-  check('audit8 LOW-7: mark-read falls back to local update when IMAP is unreachable (200 + is_read=1)',
-    r.status === 200 && m2Read === 1, `status=${r.status} is_read=${m2Read}`);
+  check('audit10 H-2: mark-read returns 502 and does NOT change local is_read when IMAP is unreachable',
+    r.status === 502 && m2Read === 0, `status=${r.status} is_read=${m2Read}`);
 
   // ---------- 7. account test endpoint (fake creds, clear step error) ----------
   console.log('== account test endpoint ==');
@@ -381,6 +461,26 @@ try {
     check('refresh-all pushes a sync event to the client', !!evt && evt.state === 'done', JSON.stringify(evt));
     socket.on('ping', () => {});
     socket.emit('ping');
+    // 多点登录（用户 2026-11-19 决定）：再登一次不再吊销本次会话——
+    // 旧 socket 不被断开，旧 Cookie 继续有效，两端可同时在线。
+    const disconnected = new Promise((resolve) => {
+      socket.on('disconnect', () => resolve(true));
+      setTimeout(() => resolve(false), 3000);
+    });
+    const cookieBefore = cookie;
+    const loginAgain = await api('POST', '/api/auth/login', { username: 'tester', password: 'testpass123' });
+    check('multi-login: re-login succeeds without revokedOtherSessions',
+      loginAgain.status === 200 && loginAgain.json?.revokedOtherSessions === undefined,
+      `status=${loginAgain.status} revoked=${loginAgain.json?.revokedOtherSessions}`);
+    const gotDisconnect = await disconnected;
+    check('multi-login: re-login does not disconnect the old session socket',
+      gotDisconnect === false && socket.connected === true,
+      `disconnected=${gotDisconnect} connected=${socket.connected}`);
+    const savedCookie = cookie;
+    cookie = cookieBefore;
+    r = await api('GET', '/api/accounts');
+    check('multi-login: old session cookie still works after re-login (200)', r.status === 200, `status=${r.status}`);
+    cookie = savedCookie;
     socket.disconnect();
   }
   const badSocket = ioClient(BASE, {
@@ -630,6 +730,21 @@ try {
       if (s.json && s.json.running === false) break;
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
+    // Audit #10 M-19（审计 #9 H1）：批量删除同一请求内 id 重复只执行一次
+    // ——旧版第二轮走彻底删除分支永久删信。任务 total 应为去重后的 1。
+    const dDup = mkDel(9004);
+    r = await api('POST', '/api/messages/batch-delete', { ids: [dDup, dDup] });
+    const dupTask = r.json?.taskId;
+    let stDup = null;
+    for (let i = 0; i < 40; i++) {
+      const s = await api('GET', `/api/messages/delete-status?taskId=${encodeURIComponent(dupTask)}`);
+      stDup = s.json;
+      if (stDup && stDup.running === false) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    check('audit10 M-19 (audit9 H1): batch-delete with duplicate ids runs once (total=1, deleted+failed=1)',
+      stDup && stDup.running === false && stDup.total === 1 && (stDup.deleted + (stDup.failed || []).length) === 1,
+      JSON.stringify(stDup)?.slice(0, 200));
   }
 
   // ---------- 14. audit #4 backend fixes (F1/F2/F3/F4/F6 + delete sweep) ----------
@@ -1275,7 +1390,8 @@ try {
   async function apiMultipart(p, fileName, content, mime = 'text/csv') {
     const fd = new FormData();
     fd.append('file', new Blob([content], { type: mime }), fileName);
-    const res = await fetch(BASE + p, { method: 'POST', headers: { Cookie: cookie }, body: fd });
+    // Audit #10 M-5：直接 fetch 须自带同源 Origin（严格 CSRF）。
+    const res = await fetch(BASE + p, { method: 'POST', headers: { Cookie: cookie, Origin: BASE }, body: fd });
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch { /* non-JSON */ }
@@ -1491,6 +1607,32 @@ try {
     r.status === 200 && r.json?.duplicate === true, `status=${r.status} body=${JSON.stringify(r.json)}`);
   r = await api('DELETE', '/api/messages/424243?idempotencyKey=del-single-1');
   check('L1: same key for a different message -> 409', r.status === 409, `status=${r.status}`);
+  // Audit #10 M-6：delete_idempotency 加状态列——进行中重认领返回 409，
+  // 不再谎报成功；进行中行超 10 分钟过期可重认领。
+  vdb.prepare("INSERT INTO delete_idempotency (idempotency_key, message_db_id, status, created_at) VALUES (?,?, 'in_progress', datetime('now'))")
+    .run('del-inprog-1', 424242);
+  r = await api('DELETE', '/api/messages/424242?idempotencyKey=del-inprog-1');
+  check('audit10 M-6: single delete with an in-progress claim -> 409 DELETE_IN_FLIGHT',
+    r.status === 409 && /正在删除中/.test(r.json?.error || ''), `status=${r.status} body=${JSON.stringify(r.json)}`);
+  vdb.prepare("INSERT INTO delete_idempotency (idempotency_key, message_db_id, status, created_at) VALUES (?,?, 'in_progress', datetime('now','-11 minutes'))")
+    .run('del-stale-1', 424242);
+  r = await api('DELETE', '/api/messages/424242?idempotencyKey=del-stale-1');
+  check('audit10 M-6: stale in-progress claim (>10min) can be re-claimed (not 409)',
+    r.status !== 409, `status=${r.status} body=${JSON.stringify(r.json)}`);
+  vdb.prepare("INSERT INTO delete_idempotency (idempotency_key, task_id, status, created_at) VALUES (?,?, 'in_progress', datetime('now'))")
+    .run('del-batch-inprog-1', '11111111-1111-1111-1111-111111111111');
+  r = await api('POST', '/api/messages/batch-delete', { ids: [m1], idempotencyKey: 'del-batch-inprog-1' });
+  // 批量任务进行中重提交应返回同一 taskId（可轮询，审计 #7 L1 契约），
+  // 而不是 409——409 只适用于单删（无任务可轮询）。
+  check('audit10 M-6: batch-delete with an in-progress claim returns the SAME taskId (duplicate, pollable)',
+    r.status === 200 && r.json?.taskId === '11111111-1111-1111-1111-111111111111' && r.json?.duplicate === true,
+    `status=${r.status} body=${JSON.stringify(r.json)}`);
+  // key 正被单删占用（进行中行、无 task_id）时批量提交报 409。
+  vdb.prepare("INSERT INTO delete_idempotency (idempotency_key, message_db_id, status, created_at) VALUES (?,?, 'in_progress', datetime('now'))")
+    .run('del-batch-occupied-1', 424242);
+  r = await api('POST', '/api/messages/batch-delete', { ids: [m1], idempotencyKey: 'del-batch-occupied-1' });
+  check('audit10 M-6: batch-delete with a key held by a running single delete -> 409',
+    r.status === 409, `status=${r.status} body=${JSON.stringify(r.json)}`);
   r = await api('DELETE', '/api/messages/424242?idempotencyKey=' + 'x'.repeat(129));
   check('L1: over-long idempotencyKey -> 400', r.status === 400, `status=${r.status}`);
   // Audit #7 MED-1：并发同 key 单删——先占位后删除。两路并发 DELETE 带
@@ -1863,7 +2005,7 @@ try {
       const t0 = Date.now();
       const form = new FormData();
       form.append('file', new Blob([csv], { type: 'text/csv' }), 'import.csv');
-      const impRes = await fetch(BASE + '/api/accounts/import', { method: 'POST', headers: { Cookie: cookie }, body: form });
+      const impRes = await fetch(BASE + '/api/accounts/import', { method: 'POST', headers: { Cookie: cookie, Origin: BASE }, body: form });
       const impDt = Date.now() - t0;
       const imp = await impRes.json();
       console.log(`  import took ${impDt}ms for 3 rows (sequential connectivity tests)`);
@@ -1925,13 +2067,273 @@ try {
       + '1,realbadimport@163.com,FAKE_AUTH_CODE_123,imap.163.com,993,smtp.163.com,465,\r\n';
     const form = new FormData();
     form.append('file', new Blob([csv], { type: 'text/csv' }), 'import.csv');
-    const impRes = await fetch(BASE + '/api/accounts/import', { method: 'POST', headers: { Cookie: cookie }, body: form });
+    const impRes = await fetch(BASE + '/api/accounts/import', { method: 'POST', headers: { Cookie: cookie, Origin: BASE }, body: form });
     const imp = await impRes.json();
     const bad = (imp?.failed || []).find((f) => f.email === 'realbadimport@163.com');
     check('import18b-fallback: real-163 bad row goes to failed with a clear auth reason, no account created',
       impRes.status === 200 && !!bad && /认证被拒|用户名或密码/.test(bad.reason)
       && !db.prepare('SELECT id FROM accounts WHERE email=?').get('realbadimport@163.com'),
       `status=${impRes.status} failed=${JSON.stringify(imp?.failed)?.slice(0, 160)}`);
+  }
+
+  // ---------- 19. audit #10 fixes ----------
+  console.log('== audit #10 fixes ==');
+  // M-5 严格 CSRF：已认证写请求跨站 Origin → 403；缺失 Origin → 403；
+  // 同源 Origin → 正常 200。
+  r = await api('PUT', '/api/settings', { signature: '-- Tester' }, { Origin: 'https://evil.example' });
+  check('audit10 M-5: authenticated write with cross-origin Origin -> 403',
+    r.status === 403, `status=${r.status}`);
+  r = await api('PUT', '/api/settings', { signature: '-- Tester' }, { Origin: '' });
+  check('audit10 M-5: authenticated write without Origin -> 403',
+    r.status === 403, `status=${r.status}`);
+  r = await api('PUT', '/api/settings', { signature: '-- Tester' });
+  check('audit10 M-5: authenticated write with same-origin Origin -> 200',
+    r.status === 200 && r.json?.settings?.signature === '-- Tester', `status=${r.status}`);
+  // M-2：回环/私有字面 IP 拒绝——函数级断言（本测试进程未设
+  // ALLOW_PRIVATE_MAIL_HOSTS，拒绝路径如实触发）+ testConnectivity
+  // 直接调用（不触网、文案统一）。
+  {
+    const { isPrivateOrLoopbackHost, testConnectivity } = await import('../dist/imapUtil.js');
+    check('audit10 M-2: isPrivateOrLoopbackHost rejects loopback/private/link-local/metadata',
+      isPrivateOrLoopbackHost('127.0.0.1') && isPrivateOrLoopbackHost('10.0.0.5')
+      && isPrivateOrLoopbackHost('192.168.1.1') && isPrivateOrLoopbackHost('169.254.169.254')
+      && isPrivateOrLoopbackHost('::1') && isPrivateOrLoopbackHost('172.16.0.1'));
+    check('audit10 M-2: isPrivateOrLoopbackHost allows public hosts',
+      !isPrivateOrLoopbackHost('imap.163.com') && !isPrivateOrLoopbackHost('8.8.8.8')
+      && !isPrivateOrLoopbackHost('1.1.1.1'));
+    const priv = await testConnectivity(
+      { email: 'x@y.z', password: 'p', imapHost: '127.0.0.1', imapPort: 993, imapSecure: 'SSL', smtpHost: '127.0.0.1', smtpPort: 465, smtpSecure: 'SSL' },
+      'p',
+    );
+    check('audit10 M-2: testConnectivity rejects loopback literal IP with the unified message',
+      priv.imapOk === false && priv.error === '连接失败（服务器地址不合法）', JSON.stringify(priv));
+  }
+  // M-5 约定：取邮箱明文密码由 GET 改为 POST（同路径、只改方法）。
+  r = await api('GET', `/api/accounts/${accountId}/password`);
+  check('audit10 M-5: GET /api/accounts/:id/password is gone (404)', r.status === 404, `status=${r.status}`);
+  r = await api('POST', `/api/accounts/${accountId}/password`);
+  check('audit10 M-5: POST /api/accounts/:id/password returns the plaintext password',
+    r.status === 200 && r.json?.password === 'FAKE_AUTH_CODE_123', `status=${r.status} password=${r.json?.password}`);
+  // Audit #10 L-11：M5 补的两个新索引存在，且账号级视图走索引。
+  {
+    const idxList10 = (table) => db.prepare(`PRAGMA index_list(${table})`).all().map((x) => x.name);
+    const msgIdx10 = idxList10('messages');
+    check('audit10 L-11: idx_messages_folder_date + idx_messages_account_date exist',
+      msgIdx10.includes('idx_messages_folder_date') && msgIdx10.includes('idx_messages_account_date'), msgIdx10.join(','));
+    const plan10 = (sql) => db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all().map((x) => x.detail).join(' | ');
+    const pAcc = plan10('SELECT id FROM messages WHERE account_id=1 ORDER BY date DESC, id DESC LIMIT 50');
+    check('audit10 L-11: account view uses idx_messages_account_date (no SCAN messages)',
+      pAcc.includes('SEARCH messages USING COVERING INDEX idx_messages_account_date') && !pAcc.includes('SCAN messages'),
+      pAcc);
+  }
+  // M-9/M-14/M-13/M-8：关键重构在位（源码级回归标记，与本文件既有
+  // “SyncEngine has _pollAllFolders”同款做法）。
+  {
+    const msgRoutesSrc = fs.readFileSync(path.join(BACKEND, 'src/routes/messageRoutes.ts'), 'utf8');
+    const engineSrc = fs.readFileSync(path.join(BACKEND, 'src/engine.ts'), 'utf8');
+    const dbSrc = fs.readFileSync(path.join(BACKEND, 'src/db.ts'), 'utf8');
+    check('audit10 M-9: translate deadline is wired into AbortSignal',
+      msgRoutesSrc.includes('AbortSignal.any'));
+    check('audit10 M-14: batch delete shares one withClient session (deleteMessagesBatch)',
+      engineSrc.includes('deleteMessagesBatch'));
+    check('audit10 M-13: full-envelope fetch is paged (ENVELOPE_PAGE_SIZE)',
+      engineSrc.includes('ENVELOPE_PAGE_SIZE'));
+    check('audit10 M-8: search fetches a 2001-row superset per branch before intersecting',
+      dbSrc.includes('LIMIT 2001'));
+  }
+  // M-7：所有发信出口都带 idempotencyKey——404 与 400 也带。
+  r = await api('POST', '/api/messages/send', { accountId: 999999, to: ['a@b.c'], subject: 'x', text: 'y', idempotencyKey: 'send-key-404' });
+  check('audit10 M-7: send 404 still returns the idempotencyKey',
+    r.status === 404 && r.json?.idempotencyKey === 'send-key-404', `status=${r.status} body=${JSON.stringify(r.json)?.slice(0, 160)}`);
+  r = await api('POST', '/api/messages/send', { accountId, to: [], subject: 'x', text: 'y', idempotencyKey: 'send-key-400' });
+  check('audit10 M-7: send 400 still returns the idempotencyKey',
+    r.status === 400 && r.json?.idempotencyKey === 'send-key-400', `status=${r.status} body=${JSON.stringify(r.json)?.slice(0, 160)}`);
+  // H-3：CSV 导入超 200 行立即停并标 truncated，failed 封顶 50 条。
+  {
+    const rows = ['序号,邮箱名,授权码,接收服务器（IMAP）,IMAP端口,发送服务器（SMTP）,SMTP端口,备注'];
+    for (let i = 1; i <= 205; i++) rows.push(`${i},h3user${i}@example.com,FAKE,127.0.0.1,9,127.0.0.1,9,`);
+    const t0 = Date.now();
+    const imp3 = await apiMultipart('/api/accounts/import', 'import.csv', rows.join('\r\n'));
+    const imp3Dt = Date.now() - t0;
+    check('audit10 H-3: import of 205 rows stops after 200 (truncated:true, added=0, failed capped at 50 + failedTruncated)',
+      imp3.status === 200 && imp3.json?.truncated === true && imp3.json?.added === 0
+      && (imp3.json?.failed || []).length === 50 && imp3.json?.failedTruncated === true,
+      `status=${imp3.status} dt=${imp3Dt}ms added=${imp3.json?.added} failed=${(imp3.json?.failed || []).length} truncated=${imp3.json?.truncated} failedTruncated=${imp3.json?.failedTruncated}`);
+    check('audit10 H-3: no account was created by the oversized import',
+      !db.prepare('SELECT id FROM accounts WHERE email LIKE ?').get('h3user%@example.com'));
+  }
+  // D5：账号总数上限 50——POST /api/accounts 与 CSV 导入都校验。
+  {
+    const beforeCount = (db.prepare('SELECT COUNT(*) c FROM accounts').get()).c;
+    const need = 50 - beforeCount;
+    for (let i = 0; i < need; i++) {
+      db.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run(`cap${i}@163.com`, `Cap${i}`, encryptSecret('FAKE', key),
+        'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+    }
+    const atCap = (db.prepare('SELECT COUNT(*) c FROM accounts').get()).c;
+    r = await api('POST', '/api/accounts', { email: 'cap51@163.com', password: 'x' });
+    check('audit10 D5: POST /api/accounts at 50 accounts -> 400 (limit)',
+      atCap === 50 && r.status === 400 && /已达上限/.test(r.json?.error || ''),
+      `count=${atCap} status=${r.status} error=${r.json?.error}`);
+    const capCsv = await apiMultipart('/api/accounts/import', 'import.csv',
+      '序号,邮箱名,授权码,接收服务器（IMAP）,IMAP端口,发送服务器（SMTP）,SMTP端口,备注\r\n1,capimport@163.com,FAKE,imap.163.com,993,smtp.163.com,465,');
+    const capFailed = (capCsv.json?.failed || []).find((f) => f.email === 'capimport@163.com');
+    check('audit10 D5: CSV import at 50 accounts fails the row with the limit reason (added=0)',
+      capCsv.json?.added === 0 && !!capFailed && /已达上限/.test(capFailed.reason || ''),
+      `added=${capCsv.json?.added} failed=${JSON.stringify(capCsv.json?.failed)?.slice(0, 160)}`);
+    db.prepare("DELETE FROM accounts WHERE email LIKE 'cap%@163.com'").run();
+    const afterCount = (db.prepare('SELECT COUNT(*) c FROM accounts').get()).c;
+    check('audit10 D5: seeded cap accounts cleaned up', afterCount === beforeCount, `before=${beforeCount} after=${afterCount}`);
+  }
+
+  // ---------- 20. OquMail 已发送未读 bug ----------
+  console.log('== oqumail sent unread ==');
+  {
+    const { SyncEngine } = await import('../dist/engine.js');
+    const oquAcc = vdb.prepare(
+      `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+        smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+    ).run('oqu@163.com', 'OQ', encryptSecret('FAKE', key),
+      'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+    const oquAccId = Number(oquAcc.lastInsertRowid);
+    const mkFolder = (type, folderPath, name) => Number(vdb.prepare(
+      'INSERT INTO folders (account_id, path, name, type) VALUES (?,?,?,?)',
+    ).run(oquAccId, folderPath, name, type).lastInsertRowid);
+    const sentFId = mkFolder('sent', 'Sent', '已发送');
+    const draftsFId = mkFolder('drafts', 'Drafts', '草稿箱');
+    const inboxFId = mkFolder('inbox', 'INBOX', '收件箱');
+    const folderRow = (id) => vdb.prepare('SELECT * FROM folders WHERE id=?').get(id);
+    const mkFakeMsg = (uid, messageId, subject) => ({
+      uid,
+      flags: [], // OquMail: 已发送里的邮件没有 \Seen
+      envelope: {
+        messageId, subject,
+        from: [{ address: 'oqu@163.com', name: '' }],
+        to: [{ address: 'a@163.com' }],
+        date: new Date(),
+      },
+      bodyStructure: null,
+      size: 100,
+      internalDate: new Date(),
+    });
+    const mkSyncClient = (msgs) => ({
+      mailboxOpen: async () => ({ uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: msgs.length }),
+      search: async () => msgs.map((m) => m.uid),
+      fetch: async function* () { for (const m of msgs) yield m; },
+    });
+    const engineOq = new SyncEngine(key);
+    // (1) sent/drafts 文件夹无 \Seen 入库 → is_read=1；inbox 对照组仍为 0。
+    await engineOq._syncFolder(mkSyncClient([mkFakeMsg(11, '<oq-sent@x>', 'sent no seen')]), oquAccId, folderRow(sentFId));
+    await engineOq._syncFolder(mkSyncClient([mkFakeMsg(12, '<oq-draft@x>', 'draft no seen')]), oquAccId, folderRow(draftsFId));
+    await engineOq._syncFolder(mkSyncClient([mkFakeMsg(13, '<oq-inbox@x>', 'inbox no seen')]), oquAccId, folderRow(inboxFId));
+    const sentRead = vdb.prepare('SELECT is_read FROM messages WHERE message_id=?').get('<oq-sent@x>')?.is_read;
+    const draftRead = vdb.prepare('SELECT is_read FROM messages WHERE message_id=?').get('<oq-draft@x>')?.is_read;
+    const inboxRead = vdb.prepare('SELECT is_read FROM messages WHERE message_id=?').get('<oq-inbox@x>')?.is_read;
+    check('oqumail: sent folder sync without \\Seen stores is_read=1',
+      sentRead === 1, `is_read=${sentRead}`);
+    check('oqumail: drafts folder sync without \\Seen stores is_read=1',
+      draftRead === 1, `is_read=${draftRead}`);
+    check('oqumail: inbox folder sync without \\Seen still stores is_read=0 (control)',
+      inboxRead === 0, `is_read=${inboxRead}`);
+    // (2) flags 全量对账不把 sent 行翻回未读（连 fetch 都不跑）；inbox
+    // 对照组仍会被翻回未读（机制本身没坏）。
+    let sentFetches = 0;
+    const flagsClientSent = {
+      fetch: async function* () { sentFetches++; yield { uid: 11, flags: [] }; },
+    };
+    await engineOq._syncFlagsFull(flagsClientSent, oquAccId, folderRow(sentFId));
+    const sentStillRead = vdb.prepare('SELECT is_read FROM messages WHERE message_id=?').get('<oq-sent@x>')?.is_read;
+    check('oqumail: _syncFlagsFull skips sent folders (no fetch, stays read)',
+      sentFetches === 0 && sentStillRead === 1, `fetches=${sentFetches} is_read=${sentStillRead}`);
+    const inboxReadId = Number(vdb.prepare(
+      `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date,
+        snippet, body_path, is_read, has_attachments, size, flags_json, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,NULL,1,0,123,'[]',datetime('now','-10 minutes'))`,
+    ).run(oquAccId, inboxFId, 14, '<oq-inbox-read@x>', 'inbox read', 'b@163.com', '[]', new Date().toISOString(), 'x').lastInsertRowid);
+    void inboxReadId;
+    engineOq.lastFullFlagSync.set(inboxFId, Date.now() - 20 * 60 * 1000);
+    let inboxFetches = 0;
+    const flagsClientInbox = {
+      fetch: async function* () { inboxFetches++; yield { uid: 14, flags: [] }; },
+    };
+    await engineOq._syncFlagsFull(flagsClientInbox, oquAccId, folderRow(inboxFId));
+    const inboxFlipped = vdb.prepare('SELECT is_read FROM messages WHERE message_id=?').get('<oq-inbox-read@x>')?.is_read;
+    check('oqumail: _syncFlagsFull still flips inbox rows back to unread (control)',
+      inboxFetches === 1 && inboxFlipped === 0, `fetches=${inboxFetches} is_read=${inboxFlipped}`);
+    // (3) 合并路径：已发送里先到的无 \Seen 副本（旧数据）被去重合并时，
+    // surviving 的行翻成已读。
+    const staleSentId = Number(vdb.prepare(
+      `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date,
+        snippet, body_path, is_read, has_attachments, size, flags_json)
+       VALUES (?,?,?,?,?,?,?,?,?,NULL,0,0,123,'[]')`,
+    ).run(oquAccId, sentFId, 21, '<oq-merge@x>', 'merge stale', 'oqu@163.com', '[]', new Date().toISOString(), 'x').lastInsertRowid);
+    void staleSentId;
+    // 假客户端的 search 须返回全部本地 UID（11、21）+ 新 UID 22——
+    // 否则增量分支的删除对账会把 uid 11/21 当“服务器已删”删掉，
+    // 测的就不是合并而是删除了。
+    await engineOq._syncFolder(
+      {
+        mailboxOpen: async () => ({ uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: 3 }),
+        search: async () => [11, 21, 22],
+        fetch: async function* () { yield mkFakeMsg(22, '<oq-merge@x>', 'merge stale'); },
+      },
+      oquAccId, folderRow(sentFId));
+    const mergedRead = vdb.prepare('SELECT is_read FROM messages WHERE message_id=?').get('<oq-merge@x>')?.is_read;
+    const mergedCount = vdb.prepare('SELECT COUNT(*) c FROM messages WHERE message_id=?').get('<oq-merge@x>').c;
+    check('oqumail: dedup merge keeps the surviving sent row read (still 1 row, is_read=1)',
+      mergedCount === 1 && mergedRead === 1, `count=${mergedCount} is_read=${mergedRead}`);
+  }
+  // (4) 存量回填：两个子进程共享一个临时 DATA_DIR——子进程 1 建库并预置
+  // 未读 sent 行（对照组：未读 inbox 行）；子进程 2 全新 openDb（迁移
+  // 跑一遍）后读回。迁移的 log() 会写 stdout，用 BACKFILL_RESULT: 行提取。
+  {
+    const backfillDir = fs.mkdtempSync(path.join(os.tmpdir(), 'luck-mail-backfill-'));
+    const backfillData = path.join(backfillDir, 'data');
+    const dbJs = JSON.stringify(path.join(BACKEND, 'dist/db.js'));
+    const cfgJs = JSON.stringify(path.join(BACKEND, 'dist/config.js'));
+    const seedScript = `
+      const { initStorage } = await import(${cfgJs});
+      initStorage();
+      const { openDb, getDb, closeDb, refreshFolderCounts } = await import(${dbJs});
+      openDb();
+      const db = getDb();
+      const acc = db.prepare("INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure, smtp_host, smtp_port, smtp_secure, enabled, status) VALUES ('bf@163.com','BF','x','imap.163.com',993,'SSL','smtp.163.com',465,'SSL',0,'offline')").run();
+      const accId = Number(acc.lastInsertRowid);
+      const sent = db.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, 'Sent', '已发送', 'sent')").run(accId);
+      const inbox = db.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, 'INBOX', '收件箱', 'inbox')").run(accId);
+      db.prepare("INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date, snippet, is_read, has_attachments, size, flags_json) VALUES (?,?,?,?,?,?,?,?,?,0,0,100,'[]')").run(accId, Number(sent.lastInsertRowid), 1, '<bf-sent@x>', 'sent unread', 'bf@163.com', '[]', new Date().toISOString(), 's');
+      db.prepare("INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date, snippet, is_read, has_attachments, size, flags_json) VALUES (?,?,?,?,?,?,?,?,?,0,0,100,'[]')").run(accId, Number(inbox.lastInsertRowid), 2, '<bf-inbox@x>', 'inbox unread', 'bf@163.com', '[]', new Date().toISOString(), 's');
+      // 种子先给 inbox 文件夹算一次计数（unread=1），sent 文件夹故意不算——
+      // 迁移后 sent 的 total/unread 能证明迁移确实重算了它，inbox 的 1 能
+      // 证明迁移没动它。
+      refreshFolderCounts(Number(inbox.lastInsertRowid));
+      closeDb();
+    `;
+    const checkScript = `
+      const { initStorage } = await import(${cfgJs});
+      initStorage();
+      const { openDb, getDb, closeDb } = await import(${dbJs});
+      openDb();
+      const db = getDb();
+      const sent = db.prepare("SELECT is_read FROM messages WHERE message_id='<bf-sent@x>'").get();
+      const inbox = db.prepare("SELECT is_read FROM messages WHERE message_id='<bf-inbox@x>'").get();
+      const sentFolder = db.prepare("SELECT unread_count, total_count FROM folders WHERE type='sent'").get();
+      const inboxFolder = db.prepare("SELECT unread_count, total_count FROM folders WHERE type='inbox'").get();
+      console.log('BACKFILL_RESULT:' + JSON.stringify({ sentRead: sent?.is_read, inboxRead: inbox?.is_read, sentUnread: sentFolder?.unread_count, sentTotal: sentFolder?.total_count, inboxUnread: inboxFolder?.unread_count }));
+      closeDb();
+    `;
+    const childEnv = { ...process.env, DATA_DIR: backfillData };
+    execFileSync(process.execPath, ['--input-type=module', '-e', seedScript], { env: childEnv, stdio: 'pipe' });
+    const out = execFileSync(process.execPath, ['--input-type=module', '-e', checkScript], { env: childEnv, encoding: 'utf8' });
+    const line = out.split('\n').find((l) => l.startsWith('BACKFILL_RESULT:'));
+    const bf = line ? JSON.parse(line.slice('BACKFILL_RESULT:'.length)) : null;
+    check('oqumail backfill: pre-seeded unread sent row is read after a fresh openDb (inbox untouched, counts recomputed)',
+      !!bf && bf.sentRead === 1 && bf.inboxRead === 0 && bf.sentUnread === 0 && bf.sentTotal === 1 && bf.inboxUnread === 1,
+      JSON.stringify(bf));
+    fs.rmSync(backfillDir, { recursive: true, force: true });
   }
 
 } catch (e) {

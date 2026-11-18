@@ -138,6 +138,11 @@ export function matchAttachmentParts(
 export interface ParsedMessage {
   envelope: {
     messageId: string | null;
+    // Audit #10 threading：原信 References 头（mailparser 的
+    // parsed.references 可能是 string | string[]），正文拉取时解析后
+    // 存 messages.references，GET /api/messages/:id 返回给前端做
+    // 回复/转发 threading 用。
+    references: string | null;
     subject: string;
     fromAddr: string;
     fromName: string;

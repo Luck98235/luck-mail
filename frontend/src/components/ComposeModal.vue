@@ -56,6 +56,10 @@ export interface ComposeInitial {
   body?: string
   accountId?: number | null
   draftId?: number | string | null
+  /** 回复 threading：原信 Message-ID，作 In-Reply-To（转发不传） */
+  inReplyTo?: string
+  /** 回复/转发 threading：References 链 */
+  references?: string | string[]
 }
 
 const props = defineProps({
@@ -76,6 +80,11 @@ const isEdit = ref<boolean>(false)
 const files = ref<File[]>([])
 const busy = ref<boolean>(false)
 const error = ref<string>('')
+// 回复/转发 threading（审计 #10 H1）：原信 Message-ID 与 References 链，
+// 由 MailView 的 reply()/forward() 经 initial 传进来；打开弹窗时记下，
+// 发信时两条路径都带上（回复带 In-Reply-To + References，转发只带 References）。
+const inReplyTo = ref<string>('')
+const references = ref<string | string[] | undefined>(undefined)
 // 发信幂等键（F9）：每打开一次写信弹窗生成一个，同一封邮件重试发送复用
 // 同一个 key（后端去重），新开一封则重新生成。
 const idempotencyKey = ref<string>('')
@@ -147,6 +156,8 @@ watch(() => props.open, (v) => {
   body.value = init.body || ''
   draftId.value = init.draftId ?? null
   isEdit.value = init.draftId != null
+  inReplyTo.value = init.inReplyTo || ''
+  references.value = init.references
   files.value = []
   error.value = ''
   busy.value = false
@@ -184,7 +195,7 @@ async function send(): Promise<void> {
     // 先把当前内容落盘成草稿（发信失败时草稿保留在服务端，可重开续发）；
     // 发信成功后服务端按 draftId 自动删草稿，前端再清本地状态。
     await autosaveDraft()
-    let sent: { id?: number; warning?: string } | null = null
+    let sent: { id?: number; warning?: string; rejected?: string[] } | null = null
     if (files.value.length) {
       const fd = new FormData()
       fd.append('accountId', String(accountId.value))
@@ -194,6 +205,10 @@ async function send(): Promise<void> {
       fd.append('text', buildText())
       fd.append('idempotencyKey', idempotencyKey.value)
       if (draftId.value != null) fd.append('draftId', String(draftId.value))
+      // 回复 threading：multipart 字段只能是字符串，References 链拼成一个空格分隔串
+      //（后端按单个字符串收，再拼进 References 头，效果与数组一致）。
+      if (inReplyTo.value) fd.append('inReplyTo', inReplyTo.value)
+      if (references.value) fd.append('references', Array.isArray(references.value) ? references.value.join(' ') : references.value)
       for (const f of files.value) fd.append('attachments', f)
       sent = await api.sendMessage(fd)
     } else {
@@ -204,12 +219,16 @@ async function send(): Promise<void> {
         subject: subject.value.trim() || '（无主题）',
         text: buildText(),
         idempotencyKey: idempotencyKey.value,
-        ...(draftId.value != null ? { draftId: draftId.value } : {})
+        ...(draftId.value != null ? { draftId: draftId.value } : {}),
+        ...(inReplyTo.value ? { inReplyTo: inReplyTo.value } : {}),
+        ...(references.value ? { references: references.value } : {})
       })
     }
     if (draftId.value != null) { mail.dropDraft(draftId.value); draftId.value = null }
     // 发信成功提示 4 秒；warning 表示已发出、但未存入已发送文件夹。
-    mail.showToast(sent?.warning ? '已发送，但未存入已发送文件夹' : '发送成功', 4000)
+    // 部分拒收（审计 #10 M2）先判：rejected 非空时报被拒收名单，别报“发送成功”误导用户。
+    if (sent?.rejected?.length) mail.showToast(`已发送，但以下收件人被拒收：${sent.rejected.join('、')}`, 4000)
+    else mail.showToast(sent?.warning ? '已发送，但未存入已发送文件夹' : '发送成功', 4000)
     // 随后切视图触发的 loadMessages 若失败，别让失败 toast 盖掉“发送成功”。
     mail.suppressLoadFailToast(4000)
     emit('sent')
@@ -219,7 +238,12 @@ async function send(): Promise<void> {
     await mail.setAggregate('all-sent')
     if (sent?.id) await mail.openMessage(sent.id)
   } catch (e) {
-    error.value = e instanceof ApiError ? e.message : '发送失败，请重试。'
+    // SMTP 451 灰名单兜底（审计 #10 正确性 L4）：后端文案优先——后端返回的
+    // 451 文案本身就带“请 5 分钟后再发”时原样显示；只有后端文案里没给
+    // 指引（只提到 451/灰名单）时，前端才映射为固定文案。
+    const msg = e instanceof ApiError ? e.message : ''
+    if (e instanceof ApiError && /451|灰名单/.test(msg) && !msg.includes('5 分钟')) error.value = '请 5 分钟后再发'
+    else error.value = e instanceof ApiError ? e.message : '发送失败，请重试。'
   } finally {
     busy.value = false
   }

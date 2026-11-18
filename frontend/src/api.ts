@@ -24,6 +24,9 @@ interface RequestOptions {
   // 超时报错文案：不传用默认“请求超时，请重试”；发信超时要提示
   // “可能已发出”，由调用方传（见 sendMessage/sendMessageJson）。
   timeoutMessage?: string
+  // 外部取消信号（审计 #10 安全 L2）：loadMessages 新请求发起前 abort
+  // 上一个同类请求；接上后，外部 abort 与超时共用同一个 AbortController。
+  signal?: AbortSignal
 }
 
 // 401 跳登录去重：多个请求同时 401 时只跳一次（以前并发 replace('/login')
@@ -42,10 +45,16 @@ async function handleUnauthorized(): Promise<void> {
   } catch { /* 跳转失败也不影响本次请求的报错 */ }
 }
 
-async function request<T>(path: string, { method = 'GET', body, isForm = false, timeoutMs = 30000, timeoutMessage }: RequestOptions = {}): Promise<T> {
+async function request<T>(path: string, { method = 'GET', body, isForm = false, timeoutMs = 30000, timeoutMessage, signal: externalSignal }: RequestOptions = {}): Promise<T> {
   // 超时：挂起的请求不再无限等，超时按“请重试”报错。
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
+  // 外部取消信号（审计 #10 安全 L2）：外部 abort 时同样掐断本次请求。
+  const onExternalAbort = (): void => controller.abort()
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort()
+    else externalSignal.addEventListener('abort', onExternalAbort, { once: true })
+  }
   const opts: RequestInit = { method, credentials: 'include', headers: {}, signal: controller.signal }
   if (body !== undefined) {
     if (isForm) opts.body = body as FormData // FormData：让浏览器自己设 Content-Type（含 boundary）
@@ -68,15 +77,17 @@ async function request<T>(path: string, { method = 'GET', body, isForm = false, 
     throw e
   } finally {
     clearTimeout(timer)
+    if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort)
   }
 }
 
-// 三个文件下载共用：30 秒超时 + 统一的报错与文件名解析。
+// 三个文件下载共用：统一的报错与文件名解析；超时默认 30 秒，
+// 备份打包随数据量增长可能超过 30 秒，调用方按体量传更宽的值。
 // method：备份与导出走 POST（防跨站顶层导航 CSRF 触发下载，后端只接受 POST）；
 // 导入模板仍走 GET。
-async function downloadBlobFile(path: string, failLabel: string, defaultFilename: string, method: 'GET' | 'POST' = 'GET'): Promise<{ blob: Blob; filename: string }> {
+async function downloadBlobFile(path: string, failLabel: string, defaultFilename: string, method: 'GET' | 'POST' = 'GET', timeoutMs = 30000): Promise<{ blob: Blob; filename: string }> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 30000)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch(BASE + path, { method, credentials: 'include', signal: controller.signal })
     // 401 也跳登录（审计 #9 L4）：与 request() 一致，会话过期时点导出/备份
@@ -129,8 +140,9 @@ export const api = {
   updateAccount: (id: number, payload: Record<string, unknown>) =>
     request<{ ok: boolean }>(`/api/accounts/${id}`, { method: 'PUT', body: payload }),
   // 取单个邮箱的当前密码（明文）：仅供“邮箱设置”弹窗回填密码框，点小眼睛查看。
+  // 审计 #10 后端约定：敏感操作走 POST，不再用 GET 取明文密码。
   getAccountPassword: (id: number) =>
-    request<{ ok: boolean; password: string }>(`/api/accounts/${id}/password`),
+    request<{ ok: boolean; password: string }>(`/api/accounts/${id}/password`, { method: 'POST' }),
   deleteAccount: (id: number) => request<{ ok: boolean }>(`/api/accounts/${id}`, { method: 'DELETE' }),
   testAccount: (id: number) =>
     request<{ ok: boolean; imapOk: boolean; smtpOk: boolean; error?: string }>(`/api/accounts/${id}/test`, { method: 'POST' }),
@@ -143,17 +155,22 @@ export const api = {
   folders: (accountId: number) => request<{ ok: boolean; folders: Folder[] }>(`/api/accounts/${accountId}/folders`),
 
   // 邮件
-  messages: ({ view, accountId, folderId, q, limit = 50, offset = 0 }: {
-    view?: string; accountId?: number | null; folderId?: number | null; q?: string; limit?: number; offset?: number
+  // 搜索是全局的（审计 #10 M3）：带 q 时不发 view/accountId/folderId，
+  // 后端按设计忽略视图过滤、搜全站邮件；不带 q 时按视图取列表。
+  messages: ({ view, accountId, folderId, q, limit = 50, offset = 0, signal }: {
+    view?: string; accountId?: number | null; folderId?: number | null; q?: string; limit?: number; offset?: number; signal?: AbortSignal
   } = {}) => {
     const p = new URLSearchParams()
-    if (view) p.set('view', view)
-    if (accountId) p.set('accountId', String(accountId))
-    if (folderId) p.set('folderId', String(folderId))
-    if (q) p.set('q', q)
+    if (q) {
+      p.set('q', q)
+    } else {
+      if (view) p.set('view', view)
+      if (accountId) p.set('accountId', String(accountId))
+      if (folderId) p.set('folderId', String(folderId))
+    }
     p.set('limit', String(limit))
     p.set('offset', String(offset))
-    return request<MessagesResponse>(`/api/messages?${p.toString()}`)
+    return request<MessagesResponse>(`/api/messages?${p.toString()}`, signal ? { signal } : undefined)
   },
   message: (id: number | string) => request<{ ok: boolean; message: MessageDetail }>(`/api/messages/${id}`),
   setRead: (id: number | string, read: boolean) =>
@@ -212,7 +229,8 @@ export const api = {
   // 备份到本地：下载 tar.gz（.key + data/），文件名从 Content-Disposition 取。
   // 文件下载走 blob，不走 request()（那是 JSON 的）。
   // POST：后端只接受 POST（防跨站顶层导航 CSRF 触发下载，审计 #5 安全轨 S1）。
-  downloadBackup: () => downloadBlobFile('/api/backup/download', '备份', 'luck-mail-backup.tar.gz', 'POST'),
+  // 超时 120 秒（审计 #10 安全 L6）：备份打包耗时随数据量增长，30 秒不够。
+  downloadBackup: () => downloadBlobFile('/api/backup/download', '备份', 'luck-mail-backup.tar.gz', 'POST', 120000),
   // 导出全部邮箱为 Excel（.xlsx）：文件名从 Content-Disposition 取。
   // POST：与备份同理，后端只接受 POST。
   exportAccounts: () => downloadBlobFile('/api/accounts/export', '导出', 'luck-mail-accounts.xlsx', 'POST'),

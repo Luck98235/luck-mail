@@ -3,7 +3,7 @@
        三级：home（账号总览：账号头 + 搜索 + 常用文件夹 + 我的邮箱）
              → account（邮箱内：顶部切换账号 + 收件箱/未读/管理页签 + 侧滑文件夹菜单 + 列表）
              → read（阅读窗）
-       平板 768–1024px：左栏固定为账号总览，右栏为列表/阅读窗；手机 <768px：单栏逐级钻取。 -->
+       平板 768–<1024px：左栏固定为账号总览，右栏为列表/阅读窗；手机 <768px：单栏逐级钻取。 -->
   <div ref="shellRef" class="mobile-shell" :data-mview="mail.mview">
     <!-- ===== 账号总览 ===== -->
     <div class="m-home flex-col bg-white overflow-y-auto">
@@ -229,7 +229,9 @@ const folderTabIcon = computed(() => {
 })
 
 function aggColor(kind: string): string {
-  return { 'all-inbox': '#f59e0b', 'all-unread': '#3b82f6', 'all-drafts': '#64748b', 'all-sent': '#22c55e', 'all-trash': '#ef4444' }[kind] || '#3b82f6'
+  // 聚合圆标色走 CSS 变量（审计 #10 布局 L2）：未读跟主题主色，其余为语义色；
+  // 以前这里写死色值，切主题时 5 个圆标不变。
+  return { 'all-inbox': 'var(--agg-inbox)', 'all-unread': 'var(--agg-unread)', 'all-drafts': 'var(--agg-drafts)', 'all-sent': 'var(--agg-sent)', 'all-trash': 'var(--agg-trash)' }[kind] || 'var(--agg-unread)'
 }
 
 async function searchFromHome(): Promise<void> {

@@ -64,6 +64,12 @@ async function main() {
   r = await j('/api/settings', { method: 'PUT', body: JSON.stringify({ signature: 's', defaultAccountId: 1 }) })
   check('PUT /api/settings → 200', r.status === 200 && r.data.ok === true)
 
+  r = await j('/api/accounts/2/password', { method: 'POST' })
+  check('POST /api/accounts/:id/password → 200 {ok, password}（审计 #10：明文密码只走 POST）', r.status === 200 && r.data.ok === true && typeof r.data.password === 'string')
+
+  r = await j('/api/accounts/2/password')
+  check('GET /api/accounts/:id/password → 405（GET 不再接受）', r.status === 405)
+
   r = await j('/api/accounts/2/refresh', { method: 'POST' })
   check('POST /api/accounts/:id/refresh → 200', r.status === 200 && r.data.ok === true)
 

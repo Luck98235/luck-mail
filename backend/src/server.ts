@@ -3,16 +3,17 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import cookieParser from 'cookie-parser';
 import { Server as SocketIOServer } from 'socket.io';
 import { fileURLToPath } from 'node:url';
 import {
-  PORT, DATA_DIR, PUBLIC_DIR, initStorage, log, SESSION_COOKIE,
+  PORT, DATA_DIR, PUBLIC_DIR, initStorage, log, SESSION_COOKIE, SETUP_TOKEN_FILE,
 } from './config.js';
 import { openDb, closeDb, pruneExpiredRows, getDb } from './db.js';
 import { lookupSession, requireAuth } from './auth.js';
 import { SyncEngine } from './engine.js';
-import { attachIo } from './hub.js';
+import { attachIo, trackSocket } from './hub.js';
 import { authRoutes } from './routes/authRoutes.js';
 import { accountRoutes } from './routes/accountRoutes.js';
 import type { Ctx } from './routes/accountRoutes.js';
@@ -24,14 +25,33 @@ const masterKey = initStorage();
 openDb();
 // 启动时一次性清理：已过期会话 + 180 天以上的删除墓碑（S2/D5/L6）。
 pruneExpiredRows();
+// Audit #10 H-1：首次启动引导 token——users 表为空时生成一次性 token，
+// 写 DATA_DIR/.setup-token（0600）并打到日志；POST /api/auth/setup
+// 必须带该 token；建成首个用户后删除文件。取用方式见 backend/README.md。
+function ensureSetupToken(): void {
+  const db = getDb();
+  const count = (db.prepare('SELECT COUNT(*) c FROM users').get() as { c: number }).c;
+  if (count > 0) {
+    try { fs.rmSync(SETUP_TOKEN_FILE, { force: true }); } catch { /* ignore */ }
+    return;
+  }
+  if (fs.existsSync(SETUP_TOKEN_FILE)) return; // 重启后 setup 前仍有效
+  const token = crypto.randomBytes(24).toString('hex');
+  fs.writeFileSync(SETUP_TOKEN_FILE, token + '\n', { mode: 0o600 });
+  try { fs.chmodSync(SETUP_TOKEN_FILE, 0o600); } catch { /* ignore */ }
+  log(`[setup] first-run bootstrap token: ${token} (also in DATA_DIR/.setup-token; deleted after the first user is created)`);
+}
+ensureSetupToken();
 // Audit #8 LOW-5：清掉上次运行崩溃时残留的 multer 上传临时文件
 // （luck-mail-upload-*，发信附件落盘在 os.tmpdir()）；正常发信的
 // finally 里已删，这里只处理崩溃残留。busboy 流式计数（发信中途超
 // 50MB 立即中断）不在本次范围。
+// Audit #10 M-18：同时清备份打包（luck-mail-backup-*）与正文解析
+// （luck-mail-parse-*.eml）的崩溃残留——旧版只清上传临时文件。
 try {
   for (const f of fs.readdirSync(os.tmpdir())) {
-    if (f.startsWith('luck-mail-upload-')) {
-      try { fs.rmSync(path.join(os.tmpdir(), f), { force: true }); } catch { /* ignore */ }
+    if (f.startsWith('luck-mail-upload-') || f.startsWith('luck-mail-backup-') || f.startsWith('luck-mail-parse-')) {
+      try { fs.rmSync(path.join(os.tmpdir(), f), { recursive: true, force: true }); } catch { /* ignore */ }
     }
   }
 } catch { /* ignore */ }
@@ -76,12 +96,17 @@ app.get('/api/health', (_req, res) => {
   }
 });
 
-// Audit #9 L16：/api 写接口（POST/PUT/DELETE）同源 Origin/Referer 校验——
-// CSRF 防御此前完全依赖 SameSite=Strict Cookie。策略：只校验 Origin/
-// Referer 存在时的情形；缺失时放行（curl、健康检查、非浏览器客户端
-// 不带 Origin，不能误拦）。存在时必须与请求的 Host 一致（只比 Host，
-// 不比协议：反代终结 TLS 后未必透传 X-Forwarded-Proto，按协议比会
-// 误拦正常同源请求；Host 由浏览器按 URL 生成，跨站伪造不了）。
+// Audit #9 L16 / #10 M-5：/api 写接口（POST/PUT/DELETE）同源 Origin/
+// Referer 校验——CSRF 防御此前完全依赖 SameSite=Strict Cookie。
+// 两层：(1) 本中间件对全部 /api 写请求校验 Origin/Referer 存在时的
+// 情形（存在时必须与 Host 一致，只比 Host、不比协议：反代终结 TLS
+// 后未必透传 X-Forwarded-Proto，按协议比会误拦正常同源请求；Host
+// 由浏览器按 URL 生成，跨站伪造不了）；(2) 已认证写请求的缺失
+// Origin/Referer 由 requireAuth 后的严格中间件拦下（见下）。
+// Audit #10 M-5：expectedHosts 只用 Host，不再信任 X-Forwarded-Host
+// ——XFH 是客户端可控的请求头，信任它等于信任攻击者自报的来源；
+// 线上 OpenResty 配置已核查（2026-11-18）：两处 location 都有
+// `proxy_set_header Host $host;`，Host 头可信。
 // 被拦的记告警日志。GET 不校验（读接口无写副作用；GET /messages/:id
 // 的读副作用由另一路在路由层去掉）。
 app.use('/api', (req, res, next) => {
@@ -96,15 +121,10 @@ app.use('/api', (req, res, next) => {
     res.status(403).json({ ok: false, error: '跨站请求被拒绝' });
     return;
   }
-  // 接受的 Host：直连 Host 头，或反代透传的 X-Forwarded-Host（本服务只
-  // 监听 127.0.0.1，只能经本机反代到达，XFH 只可能来自反代）。
-  // 前提（未核查 OpenResty 配置）：反代须透传 Host（`proxy_set_header
-  // Host $host;`）或 X-Forwarded-Host；若两者都没透传，浏览器同源请求
-  // 会因 Host=127.0.0.1:8080 对不上而被 403——verify-all 测不出来
-  // （Node fetch 不带 Origin），须经真实浏览器走反代验证。
-  const expectedHosts = [req.get('host') || '', (req.get('x-forwarded-host') || '').split(',')[0].trim()].filter(Boolean);
-  if (!expectedHosts.includes(srcHost)) {
-    log('[warn] CSRF check: cross-origin write rejected', req.method, req.path, `origin-host=${srcHost} host=${req.get('host')} xfh=${req.get('x-forwarded-host') || ''}`);
+  // 只认 Host 头（见上：XFH 不再信任）。
+  const expectedHost = req.get('host') || '';
+  if (srcHost !== expectedHost) {
+    log('[warn] CSRF check: cross-origin write rejected', req.method, req.path, `origin-host=${srcHost} host=${req.get('host')}`);
     res.status(403).json({ ok: false, error: '跨站请求被拒绝' });
     return;
   }
@@ -115,6 +135,20 @@ app.use('/api', (req, res, next) => {
 // everything else under /api/* requires a valid lm_session cookie.
 app.use('/api/auth', authRoutes());
 app.use('/api', requireAuth);
+// Audit #10 M-5（第二层）：已认证写请求缺失 Origin/Referer 时默认拒绝
+// ——旧版缺失即放行，curl/脚本可绕过第一层校验直接带 Cookie 写接口。
+// 浏览器 fetch/XHR 的 POST/PUT/DELETE 一律带 Origin，不误拦正常前端；
+// 登录/setup 走 /api/auth，不受本层约束（首次建账号可能用 curl）。
+app.use('/api', (req, res, next) => {
+  if (req.method !== 'POST' && req.method !== 'PUT' && req.method !== 'DELETE') return next();
+  const src = req.headers.origin || req.headers.referer || '';
+  if (!src) {
+    log('[warn] CSRF check: authenticated write without Origin/Referer rejected', req.method, req.path);
+    res.status(403).json({ ok: false, error: '缺少来源校验，请求被拒绝' });
+    return;
+  }
+  next();
+});
 app.use('/api', accountRoutes(ctx));
 app.use('/api', messageRoutes(ctx));
 app.use('/api', miscRoutes());
@@ -129,12 +163,14 @@ if (fs.existsSync(indexHtml)) {
     res.sendFile(indexHtml);
   });
 } else {
+  // Audit #10 L-30：占位页不再泄漏服务器绝对路径（旧版把 PUBLIC_DIR
+  // 的绝对路径直接写进 HTML）。
   app.get('/', (_req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>luck-mail</title>
 <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:10vh auto;padding:0 20px;color:#1e293b}h1{color:#2563eb}.ok{color:#16a34a}</style></head>
 <body><h1>luck-mail 后端已启动</h1><p class="ok">● API 与 Socket.io 正常运行</p>
-<p>前端（Vite dist）尚未放入 <code>${PUBLIC_DIR}</code>，放进去后这里会自动改为前端页面。</p>
+<p>前端（Vite dist）尚未部署，放进去后这里会自动改为前端页面。</p>
 <p>接口：<code>GET /api/auth/status</code> · Socket.io <code>/socket.io/</code></p></body></html>`);
   });
 }
@@ -147,6 +183,13 @@ app.use('/api', (_req, res) => res.status(404).json({ ok: false, error: '接口�
 app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   log('[error]', req.method, req.path, err?.message || err);
   if (res.headersSent) return;
+  // Audit #10 L-21：express.json 1MB 超限走 413 而非通用 500——旧版
+  // entity.too.large 掉进通用 500，客户端分不清是“请求体过大”还是
+  // “服务器内部错误”。
+  if ((err as { type?: string }).type === 'entity.too.large') {
+    res.status(413).json({ ok: false, error: '请求体过大（上限 1MB）' });
+    return;
+  }
   // MulterError（附件上传超限）：返回 413 + 明确文案，不要笼统 500。
   if ((err as { name?: string }).name === 'MulterError') {
     const code = (err as { code?: string }).code;
@@ -167,6 +210,9 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
 async function main(): Promise<void> {
   const server = http.createServer(app);
 
+  // Audit #10 L-28：Socket.io 握手限流计数（每 IP 每分钟 30 次，见 io.use）。
+  const socketHandshakeAttempts = new Map<string, number[]>();
+
   // ---- Socket.io (contract: /socket.io/, handshake checks lm_session) ----
   const io = new SocketIOServer(server, {
     path: '/socket.io/',
@@ -174,6 +220,24 @@ async function main(): Promise<void> {
   });
   io.use((socket, next) => {
     try {
+      // Audit #10 L-2：Socket.io 握手显式校验 Origin——旧版只验 Cookie，
+      // 跨站页面拿到 Cookie 就能建连接收事件（SameSite=Strict 挡顶层
+      // 导航，但 WebSocket 握手不走顶层导航）。Origin 存在时其 host
+      // 必须等于 Host 头；缺失时放行（非浏览器客户端不带 Origin）。
+      const origin = socket.handshake.headers.origin;
+      if (origin) {
+        let originHost = '';
+        try { originHost = new URL(origin).host; } catch { return next(new Error('unauthorized')); }
+        if (originHost !== (socket.handshake.headers.host || '')) return next(new Error('unauthorized'));
+      }
+      // Audit #10 L-28：握手限流——每 IP 每分钟最多 30 次握手，防
+      // 被盗会话/爆破反复握手耗尽连接。计数在内存，重启清零。
+      const ip = socket.handshake.address || 'unknown';
+      const nowMs = Date.now();
+      const attempts = (socketHandshakeAttempts.get(ip) || []).filter((t) => nowMs - t < 60_000);
+      if (attempts.length >= 30) return next(new Error('unauthorized'));
+      attempts.push(nowMs);
+      socketHandshakeAttempts.set(ip, attempts);
       const cookieHeader = socket.handshake.headers.cookie || '';
       const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
       const token = match ? decodeURIComponent(match[1]) : null;
@@ -187,6 +251,9 @@ async function main(): Promise<void> {
   });
   io.on('connection', (socket) => {
     log(`socket.io connected: ${socket.id} user=${(socket.data.user as { username?: string } | undefined)?.username}`);
+    // Audit #10 L-12：按用户跟踪 socket——登录吊销旧会话 / 改密码轮换后
+    // 一并断开该用户已建立的连接（见 hub.ts disconnectUserSockets）。
+    trackSocket(socket);
     socket.on('ping', () => socket.emit('pong'));
     socket.on('disconnect', (reason) => log(`socket.io disconnected: ${socket.id} (${reason})`));
   });
@@ -194,6 +261,13 @@ async function main(): Promise<void> {
 
   // Start the sync engine (enabled accounts connect + IDLE).
   engine.startAll();
+
+  // Audit #10 L-30：过期会话每小时清理一次——旧版只在启动时清理，
+  // 长期运行的进程里过期会话行一直留着。unref，不挡进程退出。
+  const sessionPruneTimer = setInterval(() => {
+    try { pruneExpiredRows(); } catch { /* ignore */ }
+  }, 60 * 60 * 1000);
+  sessionPruneTimer.unref();
 
   // D3: 只监听回环——OpenResty 在本机反代，8080 不需要对外暴露。
   // （之前 server.listen(PORT) 绑 0.0.0.0，靠云防火墙挡着才没暴露。）
@@ -224,9 +298,9 @@ async function main(): Promise<void> {
     } catch {
       finish();
     }
-    // L8: 关机宽限 30 秒——部署重启时太短会直接砍掉进行中的发信
-    // （systemd 默认 TimeoutStopSec 90 秒，30 秒安全）。
-    setTimeout(() => finish(), 30000).unref();
+    // Audit #10 L-29：关机宽限 85 秒——旧版 30 秒兜底可截断进行中的
+    // 大附件下载；systemd TimeoutStopSec 默认 90 秒，85 秒留 5 秒余量。
+    setTimeout(() => finish(), 85000).unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

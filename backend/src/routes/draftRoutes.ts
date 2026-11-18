@@ -38,12 +38,18 @@ function publicDraft(row: DraftRow): Record<string, unknown> {
 export function draftRoutes(): express.Router {
   const r = express.Router();
 
-  r.get('/drafts', (_req: Request, res: Response) => {
+  // Audit #10 L-26：GET /drafts 加分页（limit/offset，上限 200，默认 50）
+  // ——旧版无分页，草稿多时一次全返回；SELECT * 残留已清（显式列）。
+  r.get('/drafts', (req: Request, res: Response) => {
     const db = getDb();
+    const lim = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const off = Math.max(Number(req.query.offset) || 0, 0);
+    const total = (db.prepare('SELECT COUNT(*) c FROM drafts').get() as { c: number }).c;
     const rows = db.prepare(
-      'SELECT * FROM drafts ORDER BY updated_at DESC, id DESC',
-    ).all() as DraftRow[];
-    res.json({ ok: true, drafts: rows.map(publicDraft) });
+      `SELECT id, account_id, to_addrs, subject, text, idempotency_key,
+              created_at, updated_at FROM drafts ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`,
+    ).all(lim, off) as DraftRow[];
+    res.json({ ok: true, drafts: rows.map(publicDraft), total });
   });
 
   r.post('/drafts', (req: Request, res: Response) => {
@@ -63,8 +69,13 @@ export function draftRoutes(): express.Router {
     }
     // Audit #9 L8：先按 key 查已有草稿，有则直接返回（不重复建）；
     // 并发下唯一索引冲突时重读返回同一行。db.ts 另有唯一索引兜底。
+    // Audit #10 L-15：按 key 查时校验 accountId——旧版不同账号用同一
+    // key 会拿到别人的草稿（key 是客户端生成的，跨账号复用并不罕见）。
     const existing = db.prepare('SELECT * FROM drafts WHERE idempotency_key=?').get(key) as DraftRow | undefined;
     if (existing) {
+      if (existing.account_id !== accountId) {
+        return res.status(409).json({ ok: false, error: 'idempotencyKey 已用于另一账号的草稿' });
+      }
       return res.json({ ok: true, draft: publicDraft(existing), duplicate: true });
     }
     let info: { lastInsertRowid: number | bigint };
@@ -82,6 +93,10 @@ export function draftRoutes(): express.Router {
     } catch (e) {
       if (/UNIQUE constraint/i.test(String((e as Error)?.message || e))) {
         const dup = db.prepare('SELECT * FROM drafts WHERE idempotency_key=?').get(key) as DraftRow | undefined;
+        // Audit #10 L-15：唯一索引冲突重读时同样校验 accountId。
+        if (dup && dup.account_id !== accountId) {
+          return res.status(409).json({ ok: false, error: 'idempotencyKey 已用于另一账号的草稿' });
+        }
         if (dup) return res.json({ ok: true, draft: publicDraft(dup), duplicate: true });
       }
       return res.status(500).json({ ok: false, error: '服务器内部错误，请重试' });

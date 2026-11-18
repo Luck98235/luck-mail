@@ -3,7 +3,7 @@
     <div class="bg-white rounded-lg shadow-xl w-[480px] max-w-full flex flex-col overflow-hidden max-h-[92vh]">
       <div class="flex items-center justify-between px-5 py-3 border-b border-blue-100">
         <span class="font-bold text-slate-700">设置</span>
-        <button class="text-slate-400 hover:text-slate-600" aria-label="关闭" @click="close"><i class="fa-solid fa-xmark"></i></button>
+        <button class="text-slate-400 hover:text-slate-600" aria-label="关闭" @click="closeWithConfirm"><i class="fa-solid fa-xmark"></i></button>
       </div>
       <div class="flex-1 min-h-0 p-5 space-y-6 overflow-y-auto text-sm">
         <!-- 用户名 -->
@@ -72,7 +72,7 @@
         <p v-if="error" class="text-xs text-red-500 bg-red-50 border border-red-100 rounded-lg px-3 py-2">{{ error }}</p>
       </div>
       <div class="flex items-center justify-end gap-2 px-5 py-3 border-t border-blue-100 bg-slate-50/50">
-        <button class="px-4 py-2 rounded-md text-sm text-slate-600 hover:bg-slate-100" @click="close">取消</button>
+        <button class="px-4 py-2 rounded-md text-sm text-slate-600 hover:bg-slate-100" @click="closeWithConfirm">取消</button>
         <button class="px-5 py-2 rounded-md text-sm bg-blue-800 hover:bg-blue-900 text-white font-medium disabled:opacity-60" :disabled="busy" @click="save">{{ busy ? '保存中…' : '确定' }}</button>
       </div>
     </div>
@@ -140,6 +140,10 @@ watch(() => props.open, (v) => {
   notifySupported.value = isNotifySupported()
   notifyPermission.value = getNotifyPermission()
 })
+
+// 跨标签同步（审计 #10 安全 L6）：弹窗打开期间另一标签页改了通知开关，
+// 本地 notifyOn 只在打开时同步一次、会滞后；监听 store 的变化实时同步。
+watch(() => mail.notifyEnabled, (v) => { if (props.open) notifyOn.value = v })
 
 async function changeUsername(): Promise<void> {
   nameMsg.value = ''
@@ -236,4 +240,19 @@ async function onNotifyToggle(): Promise<void> {
 }
 
 function close(): void { emit('close') }
+
+// 未保存改动确认（审计 #10 布局 L5）：签名与默认账号只在点“确定”时提交，
+// X/取消直接关会静默丢掉——与邮箱管理弹窗同模式，脏则先确认放弃。
+// 用户名与密码是即点即存，不受影响；保存成功后已与 store 一致，不会误弹。
+const hasUnsavedEdits = computed<boolean>(() =>
+  signature.value !== (mail.settings.signature || '') ||
+  (defaultAccountId.value ?? null) !== (mail.settings.defaultAccountId ?? null)
+)
+async function closeWithConfirm(): Promise<void> {
+  if (hasUnsavedEdits.value) {
+    const ok = await mail.requestConfirm('设置里的改动尚未保存，确定放弃吗？')
+    if (!ok) return
+  }
+  close()
+}
 </script>

@@ -1,5 +1,6 @@
 import { MailParser } from 'mailparser';
 import { pipeline } from 'node:stream/promises';
+import { Transform } from 'node:stream';
 import type { Readable } from 'node:stream';
 import { sanitizeBodyHtml } from './sanitize.js';
 import { makeSnippet, toIsoDate } from './mailUtil.js';
@@ -33,6 +34,11 @@ interface MailParserLike {
 export async function streamToParsed(
   readable: Readable,
   sizeHint = 0,
+  // Audit #10 M-15：硬上限（默认 100MB）——旧版 spool/解析无上限，
+  // 一封超大邮件即可把整台服务器内存/磁盘打满。sizeHint 是服务器
+  // 上报值、不可信（可能为 0 或谎报），这里按实际流入字节计数、
+  // 超限即中断解析（错误向上传，调用方按失败处理、不写库）。
+  maxBytes = 100 * 1024 * 1024,
 ): Promise<ParsedMessage> {
   const parser = new MailParser() as unknown as MailParserLike & NodeJS.WritableStream;
   let headers: Map<string, unknown> | null = null;
@@ -78,11 +84,28 @@ export async function streamToParsed(
     }
   });
 
+  // Audit #10 L-20：endPromise 的双重 rejection——parser 出错时
+  // pipeline() 与 endPromise 各自 reject 一次；旧版 await pipeline
+  // 先抛，endPromise 的那次就成了未处理的 rejection（日志噪音，
+  // 极端下可触发 unhandledRejection 兜底）。先挂一个空 catch 认领。
   const endPromise = new Promise<void>((resolve, reject) => {
     parser.once('end', resolve);
     parser.once('error', reject);
   });
-  await pipeline(readable, parser);
+  endPromise.catch(() => { /* pipeline() 会抛同一份错误，这里只认领 */ });
+  // Audit #10 M-15：按实际流入字节计数，超硬上限即中断。
+  let bytesSeen = 0;
+  const counter = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      bytesSeen += chunk.length;
+      if (bytesSeen > maxBytes) {
+        cb(new Error(`邮件过大（超过 ${Math.round(maxBytes / 1024 / 1024)}MB），已停止解析`));
+      } else {
+        cb(null, chunk);
+      }
+    },
+  });
+  await pipeline(readable, counter, parser);
   await endPromise;
   await Promise.all(pending);
 
@@ -106,10 +129,25 @@ export async function streamToParsed(
     : (dateVal ? toIsoDate(String(dateVal)) : null);
   const subject = String(getHeader('subject') || '');
   const messageId = (getHeader('message-id') as string | undefined) || null;
+  // Audit #10 threading：取 References 头（mailparser 的解析形态不一：
+  // string / string[] / { value } / { text }，按顺序兜底），存
+  // messages.references、供 GET /api/messages/:id 返回。
+  const normalizeReferences = (v: unknown): string | null => {
+    if (!v) return null;
+    if (typeof v === 'string') return v.trim() || null;
+    if (Array.isArray(v)) return v.map(String).join(' ').trim().slice(0, 4000) || null;
+    const obj = v as { value?: unknown; text?: unknown };
+    if (typeof obj.value === 'string') return obj.value.trim().slice(0, 4000) || null;
+    if (Array.isArray(obj.value)) return obj.value.map(String).join(' ').trim().slice(0, 4000) || null;
+    if (typeof obj.text === 'string') return obj.text.trim().slice(0, 4000) || null;
+    return null;
+  };
+  const references = normalizeReferences(getHeader('references'));
 
   return {
     envelope: {
       messageId,
+      references,
       subject,
       fromAddr: from.address,
       fromName: from.name,

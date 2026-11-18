@@ -66,6 +66,10 @@ export interface MessageDetail extends MessageEnvelope {
   bodyText: string
   bodyHtml: string
   attachments: Attachment[]
+  /** 原信 Message-ID（审计 #10 H1 threading：后端 GET /api/messages/:id 返回；回复时作 In-Reply-To） */
+  messageId?: string
+  /** 原信 References 链（同上；回复/转发时作 References 基础） */
+  references?: string | string[]
 }
 
 export interface Preset {

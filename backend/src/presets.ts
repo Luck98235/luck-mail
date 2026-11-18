@@ -84,6 +84,8 @@ const RAW: Record<string, RawPreset> = {
   'naver.com': ['imap.naver.com', 993, 'SSL', 'smtp.naver.com', 587, 'STARTTLS', 'Naver 须开启两步验证并用应用专用密码，并先在网页设置里开启 IMAP'],
   // Yangtian Machinery (heavycrusher.com) — mail.oqumail.com.
   'heavycrusher.com': ['mail.oqumail.com', 993, 'SSL', 'mail.oqumail.com', 587, 'STARTTLS', ''],
+  // futdesk.ai — mail hosted on OquMail (same as heavycrusher.com).
+  'futdesk.ai': ['mail.oqumail.com', 993, 'SSL', 'mail.oqumail.com', 587, 'STARTTLS', ''],
 };
 
 const EXMAIL: RawPreset = ['imap.exmail.qq.com', 993, 'SSL', 'smtp.exmail.qq.com', 465, 'SSL', ''];

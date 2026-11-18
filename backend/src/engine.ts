@@ -54,6 +54,10 @@ export function flagsSyncIntervalMs(messageCount: number): number {
 // Fetch only the first bytes of the TEXT part for the list snippet; the full
 // source is fetched (and parsed) only when a message is opened.
 const SNIPPET_BYTES = 4096;
+// Audit #10 M-13：信封拉取分页大小——全量重取与增量拉取都按 UID 范围
+// 每 500 封一页、一页一事务；旧版一次取回全部信封并包进一个事务，
+// 万封大文件夹会占满内存并长时间阻塞事件循环。
+const ENVELOPE_PAGE_SIZE = 500;
 // B11: 短命共享连接的闲置保持窗口——队列里连续的 withClient 调用共用
 // 一个连接；最后一个调用完成后闲置这么久无人用就登出。
 const SHARED_IDLE_MS = 2000;
@@ -139,14 +143,33 @@ export class SyncEngine {
   // of the same message (different keys/requests) must not both run:
   // the second would turn a move-to-trash into a permanent delete.
   private deleteInflight = new Set<string>();
+  // Audit #10 L-13：per-message in-flight move guard——与 deleteInflight
+  // 共用同一 key 命名空间（`${accountId}:${messageId}`），删/移互斥：
+  // 移动进行中再删同一封信（或反过来）会两路并行、一路移走一行删错。
+  private moveInflight = new Set<string>();
   // Last full flag comparison per folder id (M5 CONDSTORE fallback throttle).
   private lastFullFlagSync = new Map<number, number>();
+  // Audit #10 L-18：startAll 的错峰定时器——旧版 setTimeout 的句柄
+  // 无人持有，stopAll/进程停机窗口里它们仍可触发 startAccount 重建
+  // 账号。记下来，stopAll 时一并清除。
+  private startTimers = new Set<NodeJS.Timeout>();
   // R3: F1 去重时被跳过的服务器副本 UID（按文件夹）。只记内存：
   // 下次同步直接跳过，不再重复 FETCH；全量重取/文件夹删除时清空。
   private skippedDupeUids = new Map<number, Set<number>>();
 
   constructor(masterKey: Buffer) {
     this.key = masterKey;
+  }
+
+  // Audit #10 L-30：解密失败的统一处理——decryptSecret 在密钥文件损坏/
+  // 被换过时抛错；旧版抛进通用 catch 走退避重连，账号永远在“重连中”
+  // 循环。调用方拿到的是明确的中文错误，不再无限重试。
+  private _decryptAccountPassword(account: AccountRow): string {
+    try {
+      return decryptSecret(account.password_enc, this.key);
+    } catch {
+      throw new Error('账号凭证无法解密（密钥可能已更换），请删除该邮箱后重新添加');
+    }
   }
 
   // ---------- lifecycle ----------
@@ -156,7 +179,12 @@ export class SyncEngine {
     // B3(a): 启动错峰——每账号间隔约 300ms，避免 27 个账号同时建连、
     // 同时 ID+LOGIN，把服务器的并发登录打满（惊群）。
     rows.forEach((row, i) => {
-      setTimeout(() => this.startAccount(row.id), i * 300);
+      // Audit #10 L-18：句柄记下来，stopAll 时可清除（停机窗口内不再重建账号）。
+      const t = setTimeout(() => {
+        this.startTimers.delete(t);
+        this.startAccount(row.id);
+      }, i * 300);
+      this.startTimers.add(t);
     });
   }
 
@@ -211,6 +239,8 @@ export class SyncEngine {
   }
 
   stopAll(): void {
+    for (const t of this.startTimers) clearTimeout(t);
+    this.startTimers.clear();
     for (const id of [...this.states.keys()]) this.stopAccount(id);
   }
 
@@ -227,6 +257,13 @@ export class SyncEngine {
     const state = this.states.get(accountId);
     if (!state) return;
     state.authFailed = true;
+    // Audit #10 M-10：同时清 state.timer（退避重连定时器）——旧版
+    // _markAuthFailed 只清 syncTimer/sharedTimer，已排队的重连定时器
+    // 仍会在几秒/几分钟后触发 _connectLoop 再拿错凭证登录一次。
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
     this._stopPeriodicSync(accountId);
     dropTransporter(accountId);
     const authMsg = '认证失败，请检查密码/授权码（邮箱设置里重新测试或保存后恢复）';
@@ -245,13 +282,29 @@ export class SyncEngine {
   private async _connectLoop(accountId: number): Promise<void> {
     const state = this.states.get(accountId);
     if (!state) return; // stopped
+    // Audit #10 M-10：入口补 authFailed 守卫——_markAuthFailed 之前
+    // 只清定时器，已排队的 _connectLoop 调用（如 _scheduleReconnect
+    // 的回调在 mark 之后才触发时）仍可绕过守卫再拿错凭证登录。
+    if (state.authFailed) return;
     // Audit #8 LOW-4：标记建连进行中，轮询定时器触发时跳过本轮。
     state.connecting = true;
     try {
       // R1: 网易系账号先起轮询定时器——之后无论首连成功与否，轮询
       // 都是同步的驱动力（首连失败时轮询每 5 分钟再试，不用等重连退避）。
       if (state.pollOnly) this._startPeriodicSync(accountId);
-      const password = decryptSecret(state.account.password_enc, this.key);
+      let password: string;
+      try {
+        password = this._decryptAccountPassword(state.account);
+      } catch (e) {
+        // Audit #10 L-30：解密失败（密钥损坏/已换）不重连——旧版抛进
+        // 通用 catch 走退避重连，账号永远在“重连中”循环。
+        const msg = (e as Error).message;
+        logError(`imap decrypt failed account ${accountId}:`, msg);
+        this.setAccountStatus(accountId, 'error', msg);
+        emit('sync', { accountId, state: 'error', error: msg });
+        state.connecting = false;
+        return;
+      }
       // R1: 网易系禁用 auto-IDLE（服务器约 206 秒静默断线，IDLE 无效）。
       const client = makeImapClient(accountToImap(state.account), password, { disableAutoIdle: state.pollOnly });
       state.client = client;
@@ -290,6 +343,11 @@ export class SyncEngine {
           try {
             await this._syncFolder(c, accountId, f);
           } catch (e) {
+            // Audit #10 M-10：首同步逐文件夹 catch 遇认证错即停住并
+            // 中断本轮——旧版只记日志，账号随后仍置 online 并启动轮询，
+            // 错凭证继续每 5 分钟登录一次。抛到外层 catch 走 isAuthError
+            // 分支（_markAuthFailed + 不重连）。
+            if (isAuthError(e)) throw e;
             logError(`sync folder failed account ${accountId} folder ${f.path}:`, (e as Error)?.message || e);
           }
         }
@@ -398,6 +456,9 @@ export class SyncEngine {
     // 完整 LIST（全站约 324 次/小时），现在最多每小时一次；文件夹删除
     // 的发现延迟到 1 小时，与手动刷新同款取舍。
     const needList = !state.lastFolderListAt || Date.now() - state.lastFolderListAt > 60 * 60 * 1000;
+    // Audit #10 L-24：本轮有文件夹同步失败时不把账号写回 'online'——
+    // 旧版无条件写 online，某文件夹反复失败时账号状态看起来一直正常。
+    let hadError = false;
     try {
       await this.withClient(accountId, async (c) => {
         if (needList) await this._syncFolders(c, accountId);
@@ -412,12 +473,17 @@ export class SyncEngine {
               this._markAuthFailed(accountId);
               throw e;
             }
+            hadError = true;
             logError(`poll sync folder failed account ${accountId} folder ${f.path}:`, (e as Error)?.message || e);
           }
         }
         await this._openInbox(c, accountId);
       });
-      getDb().prepare("UPDATE accounts SET status='online', last_sync_at=datetime('now'), error=NULL WHERE id=?").run(accountId);
+      if (hadError) {
+        getDb().prepare("UPDATE accounts SET last_sync_at=datetime('now') WHERE id=?").run(accountId);
+      } else {
+        getDb().prepare("UPDATE accounts SET status='online', last_sync_at=datetime('now'), error=NULL WHERE id=?").run(accountId);
+      }
     } catch (e) {
       logError(`poll sync failed account ${accountId}:`, (e as Error)?.message || e);
       // Audit #9 H2：轮询建连时认证失败（网易账号运行中失效的主路径）：
@@ -441,7 +507,9 @@ export class SyncEngine {
     // B7: 合并——已有同步排队/进行中（syncPending）时直接跳过，不再把同一个
     // INBOX 同步重复排进队列（IDLE 风暴/多 exists 事件时尤为明显）。
     const state = this.states.get(accountId);
-    if (!state || state.syncPending) return;
+    // Audit #10 M-10：认证失败停住的账号不再响应 exists 事件——旧版
+    // 每来一封新邮件就再拿错凭证同步一次，_markAuthFailed 反复触发。
+    if (!state || state.syncPending || state.authFailed) return;
     state.syncPending = true;
     this._runOp(accountId, async (c) => {
       const inbox = this._folderByType(accountId, 'inbox');
@@ -453,7 +521,11 @@ export class SyncEngine {
         getDb().prepare("UPDATE accounts SET last_sync_at=datetime('now') WHERE id=?").run(accountId);
         await this._openInbox(c, accountId);
       }
-    }).catch((e: unknown) => logError(`inbox sync on exists failed account ${accountId}:`, (e as Error)?.message || e))
+    }).catch((e: unknown) => {
+      // Audit #10 M-10：exists 触发的同步遇认证错即停住（同款守卫）。
+      if (isAuthError(e)) { this._markAuthFailed(accountId); return; }
+      logError(`inbox sync on exists failed account ${accountId}:`, (e as Error)?.message || e);
+    })
       .finally(() => { state.syncPending = false; });
   }
 
@@ -522,7 +594,7 @@ export class SyncEngine {
         const db = getDb();
         const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(accountId) as AccountRow | undefined;
         if (!account) throw new Error('账号不存在');
-        const password = decryptSecret(account.password_enc, this.key);
+        const password = this._decryptAccountPassword(account);
         const client = makeImapClient(accountToImap(account), password, { disableAutoIdle: true });
         await client.connect();
         state.sharedClient = client;
@@ -552,12 +624,18 @@ export class SyncEngine {
   // 共享连接（_withSharedClient），不再每个调用各建各的连接、各登一次。
   async withClient<T>(accountId: number, fn: (client: ImapFlow) => Promise<T>): Promise<T> {
     const state = this.states.get(accountId);
+    // Audit #10 M-10：快路径补 authFailed 检查——旧版 state.client
+    // usable 时直接走 _runOp，绕过了 _withSharedClient 里的认证守卫；
+    // 凭证在连接建立后失效时，按需操作仍拿该连接登录/操作。
+    if (state?.authFailed) {
+      throw new Error('认证失败，请检查密码/授权码（邮箱设置里重新测试或保存后恢复）');
+    }
     if (state?.client?.usable) return this._runOp(accountId, fn);
     if (state) return this._withSharedClient(accountId, fn);
     const db = getDb();
     const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(accountId) as AccountRow | undefined;
     if (!account) throw new Error('账号不存在');
-    const password = decryptSecret(account.password_enc, this.key);
+    const password = this._decryptAccountPassword(account);
     const client = makeImapClient(accountToImap(account), password, { disableAutoIdle: true });
     try {
       await client.connect();
@@ -746,44 +824,71 @@ export class SyncEngine {
     // 库里不同时，也走全量（值变了说明服务器端 UID 已重置，必须重取）。
     if (!stored || (Number.isFinite(uidValidity) && stored.uidvalidity !== uidValidity)) {
       // UIDVALIDITY changed (or first sync): full re-fetch of envelopes.
-      // 先 fetch 再替换（事务内删旧插新）：fetch 失败时本地旧数据还在，
-      // 不会留一个空文件夹；重插时不发 new-mail（不是新信，重发会让前端
-      // 重复显示、未读角标膨胀）。
-      const all = await this._fetchEnvelopes(client, '1:*');
-      // D5: 全量重取会删光重插，本地已读状态会被服务器 flags 覆盖——
-      // 先记下本地已读的 UID，重插后恢复（本地已读优先，与增量路径一致）。
-      const readUids = new Set(
-        (db.prepare('SELECT uid FROM messages WHERE folder_id=? AND is_read=1').all(folder.id) as { uid: number }[])
-          .map((r) => r.uid),
+      // Audit #10 M-13：按 UID 范围分页拉取（每 500 封一页、一页一事务）
+      // ——旧版 '1:*' 一次取回全部信封并包进一个事务，万封大文件夹会
+      // 占满内存并长时间阻塞事件循环。先取 UID 清单再分页；清单取不到
+      // 时跳过本轮（不删本地旧数据），下轮再试。
+      // Audit #10 L-14：已读恢复放进每页的插入事务里——旧版删光重插后
+      // 在事务外按 500 一批 UPDATE 恢复已读，崩溃/中断会丢已读状态。
+      // 现在重插前先记本地已读行的 Message-ID（UIDVALIDITY 变了 UID
+      // 全重置，只能按 Message-ID 认），每页插入后在同一事务内把该页
+      // 里命中 Message-ID 的行恢复 is_read=1。无 Message-ID 的行
+      // （极少数）UID 重置后无法认回，已读状态以服务器 flags 为准。
+      let allUids: number[] | null = null;
+      try {
+        const uids = await client.search({ all: true }, { uid: true });
+        if (Array.isArray(uids)) {
+          allUids = uids.map((u) => Number(u)).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+        }
+      } catch (e) {
+        logError(`uid search failed account ${accountId} folder ${folder.path}:`, (e as Error)?.message || e);
+      }
+      if (!allUids) {
+        // UID 清单取不到：跳过本轮全量重取，本地旧数据保留，下轮再试。
+        log(`full re-fetch skipped account ${accountId} folder ${folder.path}: uid list unavailable`);
+        return;
+      }
+      const readByMessageId = new Set<string>(
+        (db.prepare('SELECT message_id FROM messages WHERE folder_id=? AND is_read=1 AND message_id IS NOT NULL')
+          .all(folder.id) as { message_id: string }[]).map((r) => r.message_id),
       );
       // R2: 重插前记下旧行 id，事务成功后删掉它们的正文文件。
       const staleIds = db.prepare('SELECT id FROM messages WHERE folder_id=?').all(folder.id) as { id: number }[];
-      const tx = db.transaction(() => {
+      // 全量重取必先清旧行再重插——首同步也可能有本地旧行（种子行、
+      // 上轮中断残留），不删就会把服务器已删的信复活回来（R2 回归）。
+      // Audit #10 M-13 初版曾只在 stored 存在时清，R2 失败后改回无条件清。
+      const txClear = db.transaction(() => {
         removeMessagesFtsByFolder(folder.id);
         db.prepare('DELETE FROM messages WHERE folder_id=?').run(folder.id);
-        for (const m of all) {
-          try {
-            this._upsertEnvelope(accountId, folder, m, true, false);
-          } catch (e) {
-            logError(`upsert envelope failed account ${accountId} folder ${folder.path} uid ${m.uid}:`, (e as Error)?.message || e);
-          }
-        }
       });
-      tx();
+      txClear();
+      for (let i = 0; i < allUids.length; i += ENVELOPE_PAGE_SIZE) {
+        const chunk = allUids.slice(i, i + ENVELOPE_PAGE_SIZE);
+        const page = await this._fetchEnvelopes(client, `${chunk[0]}:${chunk[chunk.length - 1]}`, {}, { uid: true });
+        // 重插不发 new-mail（不是新信，重发会让前端重复显示、未读角标膨胀）。
+        const txPage = db.transaction(() => {
+          for (const m of page) {
+            try {
+              this._upsertEnvelope(accountId, folder, m, true, false);
+            } catch (e) {
+              logError(`upsert envelope failed account ${accountId} folder ${folder.path} uid ${m.uid}:`, (e as Error)?.message || e);
+            }
+          }
+          // L-14：本页已读恢复与插入同事务（按 Message-ID 认回）。
+          if (readByMessageId.size) {
+            for (const m of page) {
+              const mid = m.envelope?.messageId;
+              if (mid && readByMessageId.has(mid)) {
+                db.prepare('UPDATE messages SET is_read=1 WHERE folder_id=? AND uid=?').run(folder.id, m.uid);
+              }
+            }
+          }
+        });
+        txPage();
+      }
       for (const m of staleIds) removeBodyFiles(m.id);
       // R3: 全量重取后去重记录失效（行已重建），清空。
       this.skippedDupeUids.delete(folder.id);
-      if (readUids.size) {
-        // Audit #8 LOW-6：占位符数 = 已读 UID 数，大文件夹下超 SQLite
-        // 变量上限（32766）会抛错且无兜底；按 500 一批更新。
-        const uids = [...readUids];
-        for (let i = 0; i < uids.length; i += 500) {
-          const batch = uids.slice(i, i + 500);
-          const placeholders = batch.map(() => '?').join(',');
-          db.prepare(`UPDATE messages SET is_read=1 WHERE folder_id=? AND uid IN (${placeholders})`)
-            .run(folder.id, ...batch);
-        }
-      }
       db.prepare(`INSERT INTO sync_state (folder_id, uidvalidity, uidnext, modseq, last_sync_at)
                   VALUES (?,?,?,?,datetime('now'))
                   ON CONFLICT(folder_id) DO UPDATE SET uidvalidity=excluded.uidvalidity,
@@ -807,40 +912,52 @@ export class SyncEngine {
       const skipped = this.skippedDupeUids.get(folder.id);
       const newUids = [...serverUids].filter((u) => !localUids.has(u) && !(skipped && skipped.has(u)));
       if (newUids.length) {
-        // 从最小的新 UID 取到末尾（中间已知的会被 upsert 覆盖，无害）。
-        // range 是 UID，必须传 {uid:true}，否则当序号取、超范围返回空。
-        // B8: 大数组不用 Math.min(...newUids) 展开（参数栈溢出风险），改循环取最小值。
-        let minNewUid = newUids[0];
-        for (const u of newUids) if (u < minNewUid) minNewUid = u;
-        const fresh = await this._fetchEnvelopes(client, `${minNewUid}:*`, {}, { uid: true });
-        // Audit #8 LOW-3（数据库）：增量同步的逐封 upsert 包进一个事务——
-        // 原来每封约 5 条语句各走一次 autocommit 提交，1000 封新邮件
-        // 突发就是约 5000 次独立事务。
         // Audit #9 L1：new-mail 事件在事务提交成功后才发出——之前在
         // _upsertEnvelope 内、事务提交前发出，崩溃/回滚会留幽灵事件。
+        // Audit #10 M-13：新邮件按 UID 范围分页拉取（每 500 封一页、
+        // 一页一事务）——旧版 `${minNewUid}:*` 一次取回全部新信封并包进
+        // 一个事务，长时间离线后一次几千封新邮件会占满内存并长时间阻塞
+        // 事件循环。页内范围取回的已知 UID 由 upsert 覆盖，无害。
         const pendingNew: DeferredMailEvent[] = [];
-        const txNew = db.transaction(() => {
-          for (const m of fresh) {
-            try {
-              this._upsertEnvelope(accountId, folder, m, true, true, pendingNew);
-            } catch (e) {
-              logError(`upsert envelope failed account ${accountId} folder ${folder.path} uid ${m.uid}:`, (e as Error)?.message || e);
+        const sortedNew = [...newUids].sort((a, b) => a - b);
+        for (let i = 0; i < sortedNew.length; i += ENVELOPE_PAGE_SIZE) {
+          const chunk = sortedNew.slice(i, i + ENVELOPE_PAGE_SIZE);
+          // range 是 UID，必须传 {uid:true}，否则当序号取、超范围返回空。
+          const fresh = await this._fetchEnvelopes(client, `${chunk[0]}:${chunk[chunk.length - 1]}`, {}, { uid: true });
+          const txNew = db.transaction(() => {
+            for (const m of fresh) {
+              try {
+                this._upsertEnvelope(accountId, folder, m, true, true, pendingNew);
+              } catch (e) {
+                logError(`upsert envelope failed account ${accountId} folder ${folder.path} uid ${m.uid}:`, (e as Error)?.message || e);
+              }
             }
-          }
-        });
-        txNew();
+          });
+          txNew();
+        }
         for (const d of pendingNew) emit(d.event, d.payload);
       }
       // Flag changes since last MODSEQ (CONDSTORE).
+      // Audit #10 M-11：被 5 分钟守卫挡住的行不推进 modseq——
+      // _upsertEnvelope 守卫挡住时返回 'skipped'（见该函数），这里
+      // 置 skipModseqAdvance，末尾写回时仍用旧 modseq，下一轮
+      // changedSince 从旧值起算、重新比对这些行。
+      let skipModseqAdvance = false;
       if (highestModseq && stored.modseq && highestModseq > stored.modseq) {
         const changed = await this._fetchEnvelopes(client, '1:*', { changedSince: BigInt(stored.modseq) });
         // Audit #9 M9：MODSEQ 变化分支逐封 upsert 包进一个事务（之前逐封
         // autocommit）；事件收集后在提交成功后发出。
+        // Audit #10 M-11：被 5 分钟守卫挡住的行（本地刚改过已读、服务器
+        // 尚未回读）不推进该文件夹 modseq——旧版无条件推进，下次同步
+        // changedSince 从新 modseq 起算，这些行的更新就被永久跳过。
+        // _upsertEnvelope 在守卫挡住时返回 'skipped'（见该函数），这里
+        // 据此决定是否推进 modseq。
         const pendingChanged: DeferredMailEvent[] = [];
         const txChanged = db.transaction(() => {
           for (const m of changed) {
             try {
-              this._upsertEnvelope(accountId, folder, m, false, true, pendingChanged);
+              const outcome = this._upsertEnvelope(accountId, folder, m, false, true, pendingChanged);
+              if (outcome === 'skipped') skipModseqAdvance = true;
             } catch (e) {
               logError(`upsert envelope failed account ${accountId} folder ${folder.path} uid ${m.uid}:`, (e as Error)?.message || e);
             }
@@ -881,8 +998,11 @@ export class SyncEngine {
           }
         }
       }
+      // Audit #10 M-11：守卫挡住本轮已读更新时不推进 modseq（用旧值写回），
+      // 下一轮 changedSince 从旧 modseq 起算、重新比对这些行。
+      const nextModseq = skipModseqAdvance ? stored.modseq : highestModseq;
       db.prepare('UPDATE sync_state SET uidnext=?, modseq=?, last_sync_at=datetime(\'now\') WHERE folder_id=?')
-        .run(uidNextDb, highestModseq, folder.id);
+        .run(uidNextDb, nextModseq, folder.id);
     }
     refreshFolderCounts(folder.id);
     db.prepare('UPDATE folders SET uidvalidity=?, uidnext=?, modseq=? WHERE id=?')
@@ -901,15 +1021,22 @@ export class SyncEngine {
   // flip a just-read message back to unread (guard lives in the UPDATE's
   // `updated_at < datetime('now', '-5 minutes')` condition).
   private async _syncFlagsFull(client: ImapFlow, accountId: number, folder: FolderRow, messageCount?: number): Promise<void> {
+    // OquMail 已发送未读 bug：sent/drafts 不参与 flags 全量对账——这些
+    // 文件夹的邮件一律已读（见 _upsertEnvelope），服务器 flags（OquMail
+    // 不给已发送打 \Seen）不能把本地翻回未读。
+    if (folder.type === 'sent' || folder.type === 'drafts') return;
     const now = Date.now();
     const last = this.lastFullFlagSync.get(folder.id) || 0;
     if (now - last < flagsSyncIntervalMs(messageCount ?? 0)) return;
-    this.lastFullFlagSync.set(folder.id, now);
+    // Audit #10 M-17：时间戳改为 fetch 成功后再写——旧版在 fetch 之前
+    // 就先置，下次对账被推迟整个档位（本轮若失败，下次要等 15/30/60
+    // 分钟才重试）。
     const db = getDb();
     const serverRead = new Map<number, boolean>();
     for await (const msg of client.fetch('1:*', { flags: true, uid: true }, { uid: true })) {
       serverRead.set(Number(msg.uid), [...(msg.flags || [])].includes('\\Seen'));
     }
+    this.lastFullFlagSync.set(folder.id, Date.now());
     if (!serverRead.size) return;
     const localRows = db.prepare('SELECT id, uid, is_read FROM messages WHERE folder_id=?').all(folder.id) as { id: number; uid: number; is_read: number }[];
     // Audit #9 M9：逐行 UPDATE 包进一个事务（之前每行一次 autocommit）；
@@ -1006,28 +1133,32 @@ export class SyncEngine {
   // 墓碑又挡着它不再显示、界面里永远删不掉。只删 keepUid 之外的命中；
   // keepUid 为 null 时全部命中都删（彻底删除时清扫已发送文件夹用）。
   // 失败只记日志、不让本次删除失败（主删除已成功）。
-  private async _deleteOtherCopiesInFolder(accountId: number, folder: FolderRow, messageId: string, keepUid: number | null, verify?: { subject: string; from: string }): Promise<void> {
-    try {
-      const others = await this.withClient(accountId, async (client) => {
-        return this._findUidsByMessageId(
-          client, folder.path, messageId,
-          keepUid != null ? { centerUid: keepUid, verify } : { verify },
-        );
-      });
+  // Audit #10 M-14：查找与删除合并进同一次会话——旧版 find 与 delete
+  // 各走一次 withClient（各建各的连接、各登一次）；现在无 client 时
+  // 也只开一次 withClient、里面先找后删；批量删除传共享 client 进来，
+  // 全批共用一个会话。
+  private async _deleteOtherCopiesInFolder(accountId: number, folder: FolderRow, messageId: string, keepUid: number | null, verify?: { subject: string; from: string }, client?: ImapFlow): Promise<void> {
+    const sweep = async (c: ImapFlow): Promise<void> => {
+      const others = await this._findUidsByMessageId(
+        c, folder.path, messageId,
+        keepUid != null ? { centerUid: keepUid, verify } : { verify },
+      );
       const targets = keepUid != null ? others.filter((u) => u !== keepUid) : others;
       if (!targets.length) return;
-      await this.withClient(accountId, async (client) => {
-        await client.mailboxOpen(folder.path);
-        for (const u of targets) {
-          try {
-            await client.messageFlagsAdd(String(u), ['\\Deleted'], { uid: true });
-            await client.messageDelete(String(u), { uid: true });
-          } catch (e) {
-            logError(`delete duplicate copy failed account ${accountId} folder ${folder.path} uid ${u}:`, (e as Error)?.message || e);
-          }
+      await c.mailboxOpen(folder.path);
+      for (const u of targets) {
+        try {
+          await c.messageFlagsAdd(String(u), ['\\Deleted'], { uid: true });
+          await c.messageDelete(String(u), { uid: true });
+        } catch (e) {
+          logError(`delete duplicate copy failed account ${accountId} folder ${folder.path} uid ${u}:`, (e as Error)?.message || e);
         }
-      });
+      }
       log(`deleted ${targets.length} duplicate server ${targets.length > 1 ? 'copies' : 'copy'} of Message-ID ${messageId} in folder ${folder.path}`);
+    };
+    try {
+      if (client) await sweep(client);
+      else await this.withClient(accountId, sweep);
     } catch (e) {
       logError(`delete duplicate copies failed account ${accountId} folder ${folder.path}:`, (e as Error)?.message || e);
     }
@@ -1053,13 +1184,18 @@ export class SyncEngine {
     return out;
   }
 
-  private _upsertEnvelope(accountId: number, folder: FolderRow, msg: FetchMessageObject, isNewCandidate: boolean, emitNewMail = true, deferred?: DeferredMailEvent[]): number {
+  private _upsertEnvelope(accountId: number, folder: FolderRow, msg: FetchMessageObject, isNewCandidate: boolean, emitNewMail = true, deferred?: DeferredMailEvent[]): number | 'skipped' {
     const db = getDb();
     const env = msg.envelope || {};
     const from = env.from?.[0] || {};
     const to = (env.to || []).map((a) => a.address).filter(Boolean) as string[];
     const flags = [...(msg.flags || [])];
-    const isRead = flags.includes('\\Seen');
+    // OquMail 已发送未读 bug：sent/drafts 文件夹的邮件一律按已读处理——
+    // 部分服务商（OquMail）不给已发送里的邮件打 \Seen，服务器 flags
+    // 永远是未读；已发送/草稿本来就是自己发出去/写好的信，没有“未读”
+    // 的概念。isRead 在下面三处共用（新行插入、已有行更新、去重合并）。
+    const forceRead = folder.type === 'sent' || folder.type === 'drafts';
+    const isRead = forceRead || flags.includes('\\Seen');
     let snippet = '';
     const textPart = msg.bodyParts?.get?.('TEXT');
     if (textPart) {
@@ -1105,11 +1241,14 @@ export class SyncEngine {
           db.prepare('UPDATE messages SET snippet=?, flags_json=? WHERE id=?')
             .run(snippetChanged ? snippet : (existing.snippet || ''), JSON.stringify(flags), existing.id);
         }
-        return existing.id;
+        // Audit #10 M-11：5 分钟守卫挡住了本次已读更新（info.changes===0）
+        // ——返回 'skipped'，调用方（MODSEQ 分支）据此不推进 modseq，
+        // 下一轮重新比对这行，不让更新被永久丢弃。
+        return 'skipped';
       }
       db.prepare(`UPDATE messages SET is_read=?, snippet=?, flags_json=?,
                   updated_at=datetime('now') WHERE id=?`)
-        .run(existing.is_read,
+        .run(forceRead ? 1 : existing.is_read,
           snippetChanged ? snippet : (existing.snippet || ''),
           JSON.stringify(flags), existing.id);
       return existing.id;
@@ -1149,6 +1288,12 @@ export class SyncEngine {
           this.skippedDupeUids.set(folder.id, skipped);
         }
         skipped.add(msg.uid);
+        // OquMail 已发送未读 bug：合并后 surviving 的行必须保持已读——
+        // 先到的那份可能是服务器自动存的无 \Seen 副本（旧数据），合并
+        // 时把它翻成已读（sent/drafts 一律已读）。
+        if (forceRead) {
+          db.prepare('UPDATE messages SET is_read=1 WHERE id=? AND is_read=0').run(dup.id);
+        }
         return dup.id;
       }
     }
@@ -1207,6 +1352,9 @@ export class SyncEngine {
     const db = getDb();
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow | undefined;
     if (!row) throw new Error('邮件不存在');
+    // Audit #10 L-3：引擎方法校验 row.account_id === 传入 accountId——
+    // 旧版只按本地行 id 取信，路由层一旦漏校验就会跨账号读信。
+    if (row.account_id !== accountId) throw new Error('邮件不属于该账号');
     if (row.body_path) {
       // Audit #8 LOW-2：崩溃窗口——body_path 已入库、文件未落盘时，
       // 直接返回会让正文永久为空（early return 挡住重取）；两个正文
@@ -1264,9 +1412,9 @@ export class SyncEngine {
     const tx = db.transaction(() => {
       db.prepare('DELETE FROM attachments WHERE message_id=?').run(row.id);
       db.prepare(`UPDATE messages SET body_path=?, snippet=?, subject=?,
-                  has_attachments=?, updated_at=datetime('now') WHERE id=?`)
+                  has_attachments=?, "references"=?, updated_at=datetime('now') WHERE id=?`)
         .run(bodyPath, parsed.snippet, parsed.envelope.subject || row.subject,
-          parsed.hasAttachments ? 1 : 0, row.id);
+          parsed.hasAttachments ? 1 : 0, parsed.envelope.references || null, row.id);
       for (const a of parsed.attachments) {
         db.prepare('INSERT INTO attachments (message_id, filename, content_type, size, path, cached, part) VALUES (?,?,?,?,?,?,?)')
           .run(row.id, a.filename, a.contentType, a.size, a.path, a.cached ? 1 : 0, a.part || null);
@@ -1291,6 +1439,8 @@ export class SyncEngine {
     const db = getDb();
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow | undefined;
     if (!row) throw new Error('邮件不存在');
+    // Audit #10 L-3：见 _fetchFullMessage。
+    if (row.account_id !== accountId) throw new Error('邮件不属于该账号');
     const folder = db.prepare('SELECT * FROM folders WHERE id=?').get(row.folder_id) as FolderRow | undefined;
     if (!folder) throw new Error('文件夹不存在');
     if (row.is_read === (read ? 1 : 0)) return row;
@@ -1307,14 +1457,39 @@ export class SyncEngine {
     return db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow;
   }
 
-  async moveMessage(accountId: number, messageId: number, targetFolderId: number): Promise<MessageRow> {
+  async moveMessage(accountId: number, messageId: number, targetFolderId: number, opts: { skipDeleteGuard?: boolean } = {}): Promise<MessageRow> {
     const db = getDb();
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow | undefined;
     if (!row) throw new Error('邮件不存在');
+    // Audit #10 L-3：见 _fetchFullMessage。
+    if (row.account_id !== accountId) throw new Error('邮件不属于该账号');
     const target = db.prepare('SELECT * FROM folders WHERE id=? AND account_id=?').get(targetFolderId, accountId) as FolderRow | undefined;
     if (!target) throw new Error('目标文件夹不存在');
     const source = db.prepare('SELECT * FROM folders WHERE id=?').get(row.folder_id) as FolderRow | undefined;
     if (!source) throw new Error('源文件夹不存在');
+    // Audit #10 L-13：删/移互斥——删除进行中再移同一封信直接报冲突
+    // （与 deleteMessage 的 moveInflight 检查对称）。_deleteMessage
+    // 内部的移动（移入已删除）传 skipDeleteGuard：外层 deleteMessage
+    // 已持有 deleteInflight，内部移动不再重复登记。
+    const opKey = `${accountId}:${messageId}`;
+    if (!opts.skipDeleteGuard) {
+      if (this.deleteInflight.has(opKey) || this.moveInflight.has(opKey)) {
+        const err = new Error('该邮件正在处理中，请稍后再试') as Error & { status?: number; code?: string };
+        err.status = 409;
+        err.code = 'DELETE_IN_FLIGHT';
+        throw err;
+      }
+      this.moveInflight.add(opKey);
+    }
+    try {
+    return await this._moveMessage(accountId, messageId, row, target, source);
+    } finally {
+      if (!opts.skipDeleteGuard) this.moveInflight.delete(opKey);
+    }
+  }
+
+  private async _moveMessage(accountId: number, messageId: number, row: MessageRow, target: FolderRow, source: FolderRow, client?: ImapFlow): Promise<MessageRow> {
+    const db = getDb();
     // messageMove returns a UID map only when the server supports UIDPLUS.
     // Without it, fall back to looking the moved message up in the target
     // folder by Message-ID; if that fails too, throw and leave the local
@@ -1323,40 +1498,22 @@ export class SyncEngine {
     // or the wrong mail, and the server copy would never sync back).
     // Audit #8 LOW-1：无 Message-ID 的信还有一层兜底——移动前后目标文件
     // 夹 EXISTS +1 时，取目标文件夹的最大 UID（刚移入的信一定是最新那封）。
-    const newUid = await this.withClient(accountId, async (client) => {
-      await client.mailboxOpen(source.path);
-      let targetExistsBefore: number | null = null;
-      if (!row.message_id) {
-        try {
-          const mb = await client.mailboxOpen(target.path, { readOnly: true });
-          targetExistsBefore = typeof mb?.exists === 'number' ? mb.exists : null;
-          await client.mailboxOpen(source.path);
-        } catch { targetExistsBefore = null; }
-      }
-      // 必须传 {uid:true}：row.uid 是 UID，默认当序号就是空操作，信就移不过去。
-      const result = await client.messageMove(String(row.uid), target.path, { uid: true });
+    // Audit #10 M-14：client 由批量删除传进来时共用该会话，不另开连接。
+    let newUid: number | null;
+    if (client) newUid = await this._doMove(client, row, target, source);
+    else newUid = await this.withClient(accountId, (c) => this._doMove(c, row, target, source));
+    if (newUid == null && row.message_id) {
+      // Audit #10 L-17：再确认一次——move 本身可能已成功，只是 UID 映射/
+      // Message-ID 反查那一刻还没看到（服务器复制滞后）。旧版直接 502，
+      // 用户以为移动失败而重试，实则本地行过期、下次同步才自愈；这里
+      // 再查一次目标文件夹，查到就按成功处理。
       try {
-        const map = result ? result.uidMap : undefined;
-        const mapped = map?.get(row.uid);
-        if (typeof mapped === 'number' && Number.isFinite(mapped)) return mapped;
-      } catch { /* fall through to Message-ID lookup */ }
-      if (!row.message_id) {
-        if (targetExistsBefore == null) return null;
-        try {
-          const mb = await client.mailboxOpen(target.path, { readOnly: true });
-          if (typeof mb?.exists === 'number' && mb.exists === targetExistsBefore + 1) {
-            const uids = await client.search({ all: true }, { uid: true });
-            if (Array.isArray(uids) && uids.length) {
-              let max = -1;
-              for (const u of uids) { const n = Number(u); if (n > max) max = n; }
-              if (max > 0) return max;
-            }
-          }
-        } catch { /* fall through to null */ }
-        return null;
-      }
-      return this._findUidByMessageId(client, target.path, row.message_id);
-    });
+        const retryUid = client
+          ? await this._findUidByMessageId(client, target.path, row.message_id as string)
+          : await this.withClient(accountId, (c) => this._findUidByMessageId(c, target.path, row.message_id as string));
+        if (retryUid != null) newUid = retryUid;
+      } catch { /* ignore — 下面仍按失败处理 */ }
+    }
     if (newUid == null) {
       throw new Error('移动后无法确认新位置（目标文件夹里找不到这封邮件），本地未更新');
     }
@@ -1370,6 +1527,44 @@ export class SyncEngine {
     return db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow;
   }
 
+  // The IMAP-side move itself (mailboxOpen → messageMove → UID lookup).
+  // Takes an already-open client so batch deletes can share one session
+  // (audit #10 M-14); single moves go through withClient as before.
+  private async _doMove(client: ImapFlow, row: MessageRow, target: FolderRow, source: FolderRow): Promise<number | null> {
+    await client.mailboxOpen(source.path);
+    let targetExistsBefore: number | null = null;
+    if (!row.message_id) {
+      try {
+        const mb = await client.mailboxOpen(target.path, { readOnly: true });
+        targetExistsBefore = typeof mb?.exists === 'number' ? mb.exists : null;
+        await client.mailboxOpen(source.path);
+      } catch { targetExistsBefore = null; }
+    }
+    // 必须传 {uid:true}：row.uid 是 UID，默认当序号就是空操作，信就移不过去。
+    const result = await client.messageMove(String(row.uid), target.path, { uid: true });
+    try {
+      const map = result ? result.uidMap : undefined;
+      const mapped = map?.get(row.uid);
+      if (typeof mapped === 'number' && Number.isFinite(mapped)) return mapped;
+    } catch { /* fall through to Message-ID lookup */ }
+    if (!row.message_id) {
+      if (targetExistsBefore == null) return null;
+      try {
+        const mb = await client.mailboxOpen(target.path, { readOnly: true });
+        if (typeof mb?.exists === 'number' && mb.exists === targetExistsBefore + 1) {
+          const uids = await client.search({ all: true }, { uid: true });
+          if (Array.isArray(uids) && uids.length) {
+            let max = -1;
+            for (const u of uids) { const n = Number(u); if (n > max) max = n; }
+            if (max > 0) return max;
+          }
+        }
+      } catch { /* fall through to null */ }
+      return null;
+    }
+    return this._findUidByMessageId(client, target.path, row.message_id);
+  }
+
   async deleteMessage(accountId: number, messageId: number): Promise<boolean> {
     // Audit #9 M1：per-message 互斥——不同 key 的并发/先后删除同一封信时，
     // 第二路直接报冲突，不执行第二次删除（否则“移到已删除”会变成
@@ -1379,7 +1574,9 @@ export class SyncEngine {
     // （messageRoutes.ts 单删 catch 目前一律 502）须据此返回 409，
     // 该映射不在本次可改文件范围内，见报告。
     const delKey = `${accountId}:${messageId}`;
-    if (this.deleteInflight.has(delKey)) {
+    // Audit #10 L-13：删/移互斥——移动进行中再删同一封信也直接报冲突
+    // （旧版只拦 deleteInflight，移动中的信照样能被删）。
+    if (this.deleteInflight.has(delKey) || this.moveInflight.has(delKey)) {
       const err = new Error('该邮件正在删除中，请勿重复删除') as Error & { status?: number; code?: string };
       err.status = 409;
       err.code = 'DELETE_IN_FLIGHT';
@@ -1393,10 +1590,12 @@ export class SyncEngine {
     }
   }
 
-  private async _deleteMessage(accountId: number, messageId: number): Promise<boolean> {
+  private async _deleteMessage(accountId: number, messageId: number, client?: ImapFlow): Promise<boolean> {
     const db = getDb();
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow | undefined;
     if (!row) throw new Error('邮件不存在');
+    // Audit #10 L-3：见 _fetchFullMessage。
+    if (row.account_id !== accountId) throw new Error('邮件不属于该账号');
     const folder = db.prepare('SELECT * FROM folders WHERE id=?').get(row.folder_id) as FolderRow | undefined;
     if (!folder) throw new Error('文件夹不存在');
     // 是否永久删除只看邮件实际所在文件夹：只有已在已删除文件夹里的信才
@@ -1406,34 +1605,44 @@ export class SyncEngine {
     if (folder.type !== 'trash') {
       const trash = this._folderByType(accountId, 'trash');
       if (!trash) throw new Error('账号没有已删除文件夹，无法删除这封邮件（请检查垃圾邮件文件夹是否已同步）');
-      await this.moveMessage(accountId, messageId, trash.id);
+      // Audit #10 M-14：批量删除传共享 client 进来，移动与清扫都在
+      // 同一会话里；单删走 moveMessage 的 withClient 路径。
+      if (client) await this._moveMessage(accountId, messageId, row, trash, folder, client);
+      else await this.moveMessage(accountId, messageId, trash.id, { skipDeleteGuard: true });
       // F1 附带：从已发送删信时，把同文件夹内同一 Message-ID 的其他
       // 服务器副本一并删掉（163/QQ 自动保存的那份），否则原件移走后
       // 另一份还留在已发送、墓碑又挡着它不再显示、界面里永远删不掉。
       if (folder.type === 'sent' && row.message_id) {
         await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid,
-          { subject: row.subject || '', from: row.from_addr || '' });
+          { subject: row.subject || '', from: row.from_addr || '' }, client);
       }
       return true;
     }
-    await this.withClient(accountId, async (client) => {
+    if (client) {
       await client.mailboxOpen(folder.path);
       // 必须传 {uid:true}：row.uid 是 UID，默认当序号就是空操作，信删不掉。
       await client.messageFlagsAdd(String(row.uid), ['\\Deleted'], { uid: true });
       await client.messageDelete(String(row.uid), { uid: true });
-    });
+    } else {
+      await this.withClient(accountId, async (c) => {
+        await c.mailboxOpen(folder.path);
+        // 必须传 {uid:true}：row.uid 是 UID，默认当序号就是空操作，信删不掉。
+        await c.messageFlagsAdd(String(row.uid), ['\\Deleted'], { uid: true });
+        await c.messageDelete(String(row.uid), { uid: true });
+      });
+    }
     // F1 附带：彻底删除时同样清掉同文件夹内同一 Message-ID 的其他
     // 服务器副本（两份副本先后被移进已删除的情形）。
     if (row.message_id) {
       await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid,
-        { subject: row.subject || '', from: row.from_addr || '' });
+        { subject: row.subject || '', from: row.from_addr || '' }, client);
       // L3: 彻底删除时也清扫同账号已发送文件夹里的同 Message-ID 副本
       // （第一次清扫失败、或副本在已发送里时，墓碑会挡着它永不显示、
       // 界面里永远删不掉，只占服务器空间）。
       const sentFolder = this._folderByType(accountId, 'sent');
       if (sentFolder && sentFolder.id !== folder.id) {
         await this._deleteOtherCopiesInFolder(accountId, sentFolder, row.message_id, null,
-          { subject: row.subject || '', from: row.from_addr || '' });
+          { subject: row.subject || '', from: row.from_addr || '' }, client);
       }
     }
     const folderId = row.folder_id;
@@ -1453,6 +1662,36 @@ export class SyncEngine {
     return true;
   }
 
+  // Audit #10 M-14：批量删除——同账号的信在一次 withClient 会话里
+  // 删完（移动 + 副本清扫都在同一会话里）。旧版逐封走 deleteMessage，
+  // 每封最多 4 个会话（移动 1 + 清扫 2 + 已发送清扫 1）、200 封最坏
+  // 约 800 次登录。逐封 try/catch：单封失败进 failed、批次继续；
+  // 整个会话建不起来时抛错，由调用方把该账号全部 id 记为失败。
+  // 每封处理期间持有 deleteInflight（与单删互斥），处理完释放。
+  async deleteMessagesBatch(accountId: number, ids: number[]): Promise<{ ok: number[]; failed: { id: number; error: string }[] }> {
+    const ok: number[] = [];
+    const failed: { id: number; error: string }[] = [];
+    await this.withClient(accountId, async (client) => {
+      for (const id of ids) {
+        const delKey = `${accountId}:${id}`;
+        if (this.deleteInflight.has(delKey) || this.moveInflight.has(delKey)) {
+          failed.push({ id, error: '该邮件正在处理中，请稍后再试' });
+          continue;
+        }
+        this.deleteInflight.add(delKey);
+        try {
+          await this._deleteMessage(accountId, id, client);
+          ok.push(id);
+        } catch (e) {
+          failed.push({ id, error: String((e as Error)?.message || e).slice(0, 200) });
+        } finally {
+          this.deleteInflight.delete(delKey);
+        }
+      }
+    });
+    return { ok, failed };
+  }
+
   // Stream one attachment live from IMAP to `writable` (attachments are
   // metadata-only — this is the ONLY way down, nothing is written to disk).
   // `att.part` is the BODYSTRUCTURE part number recorded at parse time.
@@ -1466,6 +1705,8 @@ export class SyncEngine {
     const db = getDb();
     const row = db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow | undefined;
     if (!row) throw new Error('邮件不存在');
+    // Audit #10 L-3：见 _fetchFullMessage。
+    if (row.account_id !== accountId) throw new Error('邮件不属于该账号');
     if (!att.part) throw new Error('该附件未记录 IMAP 位置，无法实时取回');
     const folder = db.prepare('SELECT * FROM folders WHERE id=?').get(row.folder_id) as FolderRow | undefined;
     if (!folder) throw new Error('文件夹不存在');

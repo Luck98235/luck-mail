@@ -52,6 +52,9 @@ export interface MessageRow {
   folder_id: number | null;
   uid: number;
   message_id: string | null;
+  // Audit #10 threading：原信 References 头（正文拉取时解析存入），
+  // GET /api/messages/:id 返回给前端做回复/转发 threading 用。
+  references?: string | null;
   subject: string;
   from_addr: string;
   from_name: string;
@@ -97,6 +100,13 @@ export function openDb(): Db {
   // S10: 数据库文件只允许属主读（旧版 0644，服务器上任何本地账号
   // 都能读全部邮件内容——FTS5 表里就是全部正文明文）。
   try { fs.chmodSync(DB_FILE, 0o600); } catch { /* ignore */ }
+  // Audit #10 M-4：WAL 模式的 -wal/-shm 由 SQLite 以默认 umask 创建
+  // （通常 0644），本地其他账号可读其中近期写入页（正文 FTS 明文、
+  // password_enc 都在其中）。与 DB 文件同款强制 0600；WAL 文件在
+  // checkpoint 后可能重建，这里每次 openDb 都复查一次。
+  for (const suffix of ['-wal', '-shm']) {
+    try { fs.chmodSync(DB_FILE + suffix, 0o600); } catch { /* ignore (file may not exist yet) */ }
+  }
   return db;
 }
 
@@ -200,6 +210,7 @@ function initSchema(db: Db): void {
     folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
     uid INTEGER NOT NULL,
     message_id TEXT,
+    "references" TEXT,
     subject TEXT NOT NULL DEFAULT '',
     from_addr TEXT NOT NULL DEFAULT '',
     from_name TEXT NOT NULL DEFAULT '',
@@ -289,6 +300,10 @@ function initSchema(db: Db): void {
     idempotency_key TEXT PRIMARY KEY,
     task_id TEXT,
     message_db_id INTEGER,
+    -- Audit #10 M-6：状态机 in_progress/done/failed（进行中 10 分钟后过期可重认领）。
+    status TEXT NOT NULL DEFAULT 'done',
+    -- Audit #9 L14：失败标记（与 status='failed' 同步写，旧行回填依据）。
+    failed_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   `);
@@ -321,11 +336,53 @@ function initSchema(db: Db): void {
     db.exec('ALTER TABLE sent_idempotency ADD COLUMN planned_message_id TEXT');
   }
 
-  // ---- Audit #9 L14：delete_idempotency 加 failed_at ----
-  // 单删失败时占位行打失败标记，同一 key 重试返回 502 而非谎报 duplicate。
-  const delIdemCols = db.prepare('PRAGMA table_info(delete_idempotency)').all() as { name: string }[];
-  if (delIdemCols.length && !delIdemCols.map((c) => c.name).includes('failed_at')) {
+  // ---- Audit #10 M-6：delete_idempotency 加 status 列 ----
+  // 状态机：in_progress（进行中）/ done（已完成）/ failed（失败）。
+  // 旧行（无此列时建的）按 failed_at 回填：有 failed_at → failed，
+  // 其余 → done（当时只有成功占位才会留到现在）。进行中的占位在
+  // 10 分钟后过期（路由层按 created_at 判断，见 messageRoutes），
+  // 崩溃残留不再让重试 7 天都谎报成功。
+  const delIdemCols2 = db.prepare('PRAGMA table_info(delete_idempotency)').all() as { name: string }[];
+  // 兜底：极旧库可能缺 failed_at 列（审计 #9 L14 才加），先补再回填。
+  if (delIdemCols2.length && !delIdemCols2.map((c) => c.name).includes('failed_at')) {
     db.exec('ALTER TABLE delete_idempotency ADD COLUMN failed_at TEXT');
+  }
+  if (delIdemCols2.length && !delIdemCols2.map((c) => c.name).includes('status')) {
+    db.exec("ALTER TABLE delete_idempotency ADD COLUMN status TEXT NOT NULL DEFAULT 'done'");
+    db.exec("UPDATE delete_idempotency SET status='failed' WHERE failed_at IS NOT NULL");
+  }
+
+  // ---- Audit #10（threading）：messages 加 references 列 ----
+  // 回复/转发要把原信的 References 链传给收件方（与 In-Reply-To 一起
+  // 归入原会话）。正文拉取时从 References 头解析后存这里；GET
+  // /api/messages/:id 原样返回（未拉过正文的信为 NULL，前端只发
+  // In-Reply-To，仍可 threading）。
+  // 注意：references 是 SQLite 保留字（FOREIGN KEY ... REFERENCES），
+  // SQL 里必须写成带双引号的 "references"，裸写会报 syntax error。
+  const msgCols2 = db.prepare('PRAGMA table_info(messages)').all() as { name: string }[];
+  if (msgCols2.length && !msgCols2.map((c) => c.name).includes('references')) {
+    db.exec('ALTER TABLE messages ADD COLUMN "references" TEXT');
+  }
+
+  // ---- OquMail 已发送未读 bug：存量回填（一次性，幂等） ----
+  // OquMail 不给已发送里的邮件打 \Seen，旧同步把已发送/草稿的信都记成
+  // 未读。部署重启后自动生效一次：把 sent/drafts 文件夹里现有的未读行
+  // 全翻成已读，并重算受影响文件夹的计数。幂等：跑过一次后 is_read=0
+  // 的行已不存在，再跑就是空操作（WHERE is_read=0）。
+  // trash/spam/inbox 不动；账号角标 SUM 口径不动（本来就是对的）。
+  {
+    const affected = db.prepare(
+      `SELECT DISTINCT folder_id FROM messages
+       WHERE is_read=0 AND folder_id IN (SELECT id FROM folders WHERE type IN ('sent','drafts'))`,
+    ).all() as { folder_id: number }[];
+    if (affected.length) {
+      const info = db.prepare(
+        `UPDATE messages SET is_read=1
+         WHERE folder_id IN (SELECT id FROM folders WHERE type IN ('sent','drafts')) AND is_read=0`,
+      ).run();
+      for (const f of affected) refreshFolderCounts(f.folder_id);
+      log(`backfill: marked ${info.changes} sent/draft messages as read (${affected.length} folders)`);
+    }
   }
 
   // ---- Audit #5 (17): messages 按 Message-ID 唯一 ----
@@ -386,6 +443,19 @@ function initSchema(db: Db): void {
   db.exec(
     'CREATE INDEX IF NOT EXISTS idx_messages_account_date ' +
     'ON messages(account_id, date DESC, id DESC)',
+  );
+  // ---- Audit #10 L-11：聚合视图与 all-unread 的索引 ----
+  // M5 的两个索引只覆盖“文件夹视图 / 账号级视图”；默认聚合视图是
+  // folder_id IN (子查询)，跨多个 folder_id 时无法全局定序，
+  // all-unread（is_read=0）更是无任何可用索引。规模 ≤10k 封时代价
+  // 很小，但索引本身便宜，先补上。
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_messages_date_id ' +
+    'ON messages(date DESC, id DESC)',
+  );
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_messages_unread_date ' +
+    'ON messages(is_read, date DESC, id DESC)',
   );
 
   // ---- Audit #9 L8：drafts.idempotency_key 唯一索引 ----
@@ -500,24 +570,40 @@ export function searchMessageIds(q: string): { ids: number[]; truncated: boolean
   const longTerms = terms.filter((t) => [...t].length >= 3);
   const shortTerms = terms.filter((t) => [...t].length < 3);
 
+  // Audit #10 M-8：先取交集、再截断——旧版 FTS 与 LIKE 各自 LIMIT 2000
+  // 截断后再取交集，一封同时命中长词（FTS 排名 2001 开外）和短词的信
+  // 会被丢掉，而 truncated:true + total（交集后长度）还会让前端以为
+  // “仅显示前 2000 条”实际只剩几十条。现在两分支各取带排序的超集
+  // （LIMIT 2001 探测，见 L-25），交集后再按相关度排序、截断到 2000。
+  // Audit #10 L-25：恰好 2000 命中时旧版 `rows.length >= 2000` 即误报
+  // truncated——改 LIMIT 2001 探测，只有真正超过 2000 才置 truncated。
+  const FETCH_LIMIT = 2001;
+  const RESULT_LIMIT = 2000;
   // FTS 命中集 + bm25 分（分越小越相关）。
   let ftsIds: Set<number> | null = null;
   const ftsRank = new Map<number, number>();
   // D4: 去引号后为空的词直接跳过——`"""` 会拼成 MATCH '""'，
   // FTS 语法错误 500。matchTerms 为空时不做 FTS 约束（走 LIKE 或返回空）。
-  // Audit #9 L5：任一分支命中达 LIMIT 2000 即截断，置 truncated 透传给调用方。
+  // Audit #10 L-4：`*` 在引号短语里仍可能触发 FTS5 语法错（如 `***`），
+  // 先去掉 `*`；MATCH 本身再包 try/catch，语法错时当作该分支无命中
+  // （返回空结果，不再 500）。
   let truncated = false;
-  const matchTerms = longTerms.map((t) => t.replace(/"/g, '')).filter((t) => t.length > 0);
+  const matchTerms = longTerms.map((t) => t.replace(/["*]/g, '')).filter((t) => t.length > 0);
   if (matchTerms.length) {
     const match = matchTerms.map((t) => `"${t}"`).join(' ');
     // Audit #8 LOW-1（数据库）：MATCH 原来返回全部命中行、无 LIMIT——
-    // 常见词一次返回上万行再在 JS 里交集；加 LIMIT 2000 封顶。
-    const rows = db.prepare(
-      'SELECT rowid AS id, bm25(messages_fts) AS rank FROM messages_fts WHERE messages_fts MATCH ? ORDER BY rank LIMIT 2000'
-    ).all(match) as { id: number; rank: number }[];
-    if (rows.length >= 2000) truncated = true;
-    ftsIds = new Set(rows.map((r) => r.id));
-    for (const r of rows) ftsRank.set(r.id, r.rank);
+    // 常见词一次返回上万行再在 JS 里交集；加 LIMIT 封顶。
+    try {
+      const rows = db.prepare(
+        'SELECT rowid AS id, bm25(messages_fts) AS rank FROM messages_fts WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?'
+      ).all(match, FETCH_LIMIT) as { id: number; rank: number }[];
+      if (rows.length > RESULT_LIMIT) truncated = true;
+      ftsIds = new Set(rows.map((r) => r.id));
+      for (const r of rows) ftsRank.set(r.id, r.rank);
+    } catch {
+      // FTS 语法错（如残留的特殊操作符）：该分支无命中，不抛 500。
+      ftsIds = new Set();
+    }
   }
   // LIKE 命中集：每个短词都必须命中（词与词之间 AND；单个词在主题/发件人/正文任一处命中即可）。
   let likeIds: Set<number> | null = null;
@@ -532,11 +618,14 @@ export function searchMessageIds(q: string): { ids: number[]; truncated: boolean
     }
     const rows = db.prepare(
       // Audit #8 MED-2（数据库）：短词 LIKE 在 FTS 表上全表扫（含全部正文），
-      // 搜索范围不变（body_text 继续搜），只加 LIMIT 2000 封顶——
+      // 搜索范围不变（body_text 继续搜），只加 LIMIT 封顶——
       // 单次短词搜索的扫描量有界，正常搜索（命中 <2000）不受影响。
-      `SELECT rowid AS id FROM messages_fts WHERE ${likeClauses.join(' AND ')} LIMIT 2000`
-    ).all(...params) as { id: number }[];
-    if (rows.length >= 2000) truncated = true;
+      // Audit #10 M-8：LIKE 分支补确定性 ORDER BY（旧版无序取样，同查询
+      // 多次结果可不同）——按 rowid 倒序（越新越前），与纯 LIKE 命中的
+      // 展示顺序一致。
+      `SELECT rowid AS id FROM messages_fts WHERE ${likeClauses.join(' AND ')} ORDER BY rowid DESC LIMIT ?`
+    ).all(...params, FETCH_LIMIT) as { id: number }[];
+    if (rows.length > RESULT_LIMIT) truncated = true;
     likeIds = new Set(rows.map((r) => r.id));
   }
   // 交集：必须同时满足长词组与短词组（以前是并集，任一组命中就算，太宽）。
@@ -551,14 +640,18 @@ export function searchMessageIds(q: string): { ids: number[]; truncated: boolean
     return { ids: [], truncated };
   }
   // 按相关度排序：FTS 命中按 bm25 升序；纯 LIKE 命中无分，排在后面、按 id 倒序（越新越前）。
-  return { ids: [...ids].sort((a, b) => {
+  // 交集后再截断到 2000：超过时 truncated=true（两分支超集探测已置过，
+  // 这里按交集后实际长度再算一次为准）。
+  const sorted = [...ids].sort((a, b) => {
     const ra = ftsRank.get(a);
     const rb = ftsRank.get(b);
     if (ra !== undefined && rb !== undefined) return ra - rb;
     if (ra !== undefined) return -1;
     if (rb !== undefined) return 1;
     return b - a;
-  }), truncated };
+  });
+  if (sorted.length > RESULT_LIMIT) truncated = true;
+  return { ids: sorted.slice(0, RESULT_LIMIT), truncated };
 }
 
 export function refreshFolderCounts(folderId: number): void {

@@ -12,7 +12,7 @@
   - `setupRequired=true` 表示还没有任何用户（首次使用），前端显示“创建账号”页。
 - `POST /api/auth/setup` `{username, password, confirm}` → 201 `{ok:true}`。
   - 仅当无用户时可用，否则 409。用户名必填（不要邮箱后缀，最多 64 位）；密码 8–128 位；两次一致。弱口令（只含一类字符）成功时响应带 `passwordHint` 提示，不强制。失败 5 次锁定 15 分钟（429 + `retryAfter` 秒）。
-- `POST /api/auth/login` `{username, password, rememberMe?}` → 200 `{ok:true, username}` + Set-Cookie。错 401；锁定 429。`rememberMe=true` 时建 30 天会话，否则 1 天（不传默认 1 天）。登录成功时吊销该用户全部旧会话（其他设备会被踢下线，本次会话保持有效；有旧会话被吊销时响应带 `revokedOtherSessions` 个数）。
+- `POST /api/auth/login` `{username, password, rememberMe?}` → 200 `{ok:true, username}` + Set-Cookie。错 401；锁定 429。`rememberMe=true` 时建 30 天会话，否则 1 天（不传默认 1 天）。多点登录（用户 2026-11-19 决定）：登录不再吊销该用户其他会话，手机、平板、桌面可同时在线；改密码仍轮换全部会话。
 - `POST /api/auth/logout` → 200，清 Cookie。
 - `POST /api/auth/change-password` `{current, next}` → 200。`next` 8–128 位；弱口令成功时响应带 `passwordHint` 提示。当前密码错 5 次锁定 15 分钟（429，与登录锁共用计数器）。改密码成功后全部会话（含当前）轮换一次并保留原过期时间，前端无感不用重登。
 

@@ -25,21 +25,43 @@ export interface SendMailInput {
 }
 
 // One cached transporter per account id; invalidated on credential/server change.
+// Audit #10 M-3：连接池闲置 TTL 10 分钟——旧版 Map 无过期，邮箱明文密码
+// 常驻内存直至进程退出/改密。超过 TTL 未用的缓存条目在下次 get 时
+// close() 并清掉 _password；同时每次 getTransporter 调用都扫一遍过期条目。
 interface CachedTransporter {
   transporter: Transporter;
   _password: string;
   _smtpKey: string;
+  lastUsedAt: number;
 }
 
 const transporters = new Map<number, CachedTransporter>();
+const TRANSPORTER_IDLE_TTL_MS = 10 * 60 * 1000;
+
+function pruneTransporters(): void {
+  const now = Date.now();
+  for (const [id, cached] of transporters) {
+    if (now - cached.lastUsedAt > TRANSPORTER_IDLE_TTL_MS) {
+      try { cached.transporter.close(); } catch { /* ignore */ }
+      transporters.delete(id);
+    }
+  }
+}
 
 export function getTransporter(account: AccountRow, password: string): Transporter {
+  pruneTransporters();
   const cached = transporters.get(account.id);
   if (cached && cached._password === password && cached._smtpKey === smtpKey(accountToImap(account))) {
+    cached.lastUsedAt = Date.now();
     return cached.transporter;
   }
+  if (cached) {
+    // 凭证/服务器变了：旧池先关再换（旧版直接覆盖，旧连接与旧密码
+    // 仍留在 Map 外的 transporter 对象里直至 GC）。
+    try { cached.transporter.close(); } catch { /* ignore */ }
+  }
   const transporter = makeSmtpTransporter(accountToImap(account), password);
-  transporters.set(account.id, { transporter, _password: password, _smtpKey: smtpKey(accountToImap(account)) });
+  transporters.set(account.id, { transporter, _password: password, _smtpKey: smtpKey(accountToImap(account)), lastUsedAt: Date.now() });
   return transporter;
 }
 
@@ -62,8 +84,12 @@ function splitAddrs(v: string | string[] | undefined): string[] {
 // Build the nodemailer mail options (from / to / cc / bcc / subject /
 // text / html / attachments) — shared by buildRawMail and sendMail.
 function buildMailOptions(account: AccountRow, input: SendMailInput) {
+  // Audit #10 L-6：发件人显示名与主题的头注入——旧版只去掉 `"`，
+  // CR/LF 仍可穿过（display_name 是用户在邮箱设置里自填的）。去 CR/LF、
+  // 去 `"`、限长 200；主题的 CR/LF 也一并去掉（nodemailer 内部会编码，
+  // 这里先清一遍不留歧义）。
   const from = account.display_name
-    ? `"${account.display_name.replace(/"/g, '')}" <${account.email}>`
+    ? `"${account.display_name.replace(/[\r\n"]/g, '').slice(0, 200)}" <${account.email}>`
     : account.email;
   // Threading 头先消毒：去 CR/LF（防头注入）、限长；格式不对的直接丢弃、
   // 不让一封回复因为头格式问题发不出去。
@@ -82,7 +108,7 @@ function buildMailOptions(account: AccountRow, input: SendMailInput) {
     to: splitAddrs(input.to),
     cc: splitAddrs(input.cc),
     bcc: splitAddrs(input.bcc),
-    subject: input.subject || '',
+    subject: String(input.subject || '').replace(/[\r\n]/g, ''),
     text: input.text || undefined,
     html: input.html || undefined,
     ...(inReplyTo ? { inReplyTo } : {}),

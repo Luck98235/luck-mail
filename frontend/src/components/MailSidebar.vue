@@ -43,7 +43,7 @@
         </div>
         <div class="space-y-0.5 text-sm" id="account-list">
           <div v-for="(a, idx) in mail.accounts" :key="a.id" class="acct-item" :class="{ expanded: mail.expanded.has(a.id) }">
-            <!-- 点邮箱行：未展开时展开 + 切单邮箱收件箱，已展开时再点折叠；点 `>`：只展开/折叠 -->
+            <!-- 点邮箱行：展开 + 切单邮箱收件箱（已展开时再点仍切收件箱、不折叠）；点 `>`：只展开/折叠 -->
             <div class="acct-row group flex items-center gap-2 px-2 py-1.5 text-slate-700 hover:bg-blue-100/50 rounded cursor-pointer" @click="onAccountRow(a.id)">
               <i class="fa-solid fa-chevron-right w-3 text-[10px] text-slate-400 cursor-pointer" title="展开/折叠文件夹" @click.stop="onToggleExpand(a.id)"></i>
               <span class="w-5 shrink-0 text-right text-[11px] text-slate-400">{{ String(idx + 1).padStart(2, '0') }}</span>
@@ -151,7 +151,10 @@ async function retryFolders(id: number): Promise<void> {
   checkFoldersAfterLoad(id)
 }
 function onFoldersHintClick(id: number): void {
-  if (foldersFailed.value.has(id)) void retryFolders(id)
+  // 展开后没文件夹就点这里重试——不只限加载失败时：刷新恢复的展开态
+  // 也可能从没发过加载请求（2026-11-19 修复前就是这样一直转圈），
+  // 点一下就补拉一次。
+  void retryFolders(id)
 }
 
 // 认证失败标记：点它打开该账号的设置（桌面端；移动端不渲染本组件，

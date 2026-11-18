@@ -33,13 +33,91 @@ function ipLocked(req: Request, scope: string): number {
   return 0;
 }
 
-// 定时清理：过期锁已在 ipLocked/ipFail 里清零；这里扫掉无有效锁且
+// Audit #10 M-1：登录锁定改为双轨计数——旧版失败计数在 users 行上、
+// 与 IP 无关：攻击者对已知用户名连错 5 次即锁 15 分钟，锁过期后 5 次
+// 又锁，可无限期锁死唯一账号（锁定 DoS），锁期内站长连改密码也被挡。
+// 现在登录失败分两轨记（都在内存，与 ipAttempts 同款 TTL 清理）：
+//   (a) 按 (user_id, IP)：同一 IP 对同一用户连错 5 次 → 该 IP 对该用户锁 15 分钟；
+//   (b) 按 user_id 全局：跨 IP 累计连错 20 次 → 该用户锁 15 分钟（防多 IP 分布式爆破）。
+// 单 IP 攻击者最多锁住自己那条 IP，站长换个 IP 仍能登录；全局轨阈值
+// 20 次，正常用户误输够不着。成功登录清零两轨。
+// users 行上的 failed_attempts/locked_until 自此只归改密码用（认证后
+// 操作，攻击者须先拿到会话），登录不再读写它。
+const userIpAttempts = new Map<string, { count: number; lockedUntil: number; updatedAt: number }>();
+const userGlobalAttempts = new Map<number, { count: number; lockedUntil: number; updatedAt: number }>();
+export const LOGIN_IP_MAX_ATTEMPTS = 5;
+export const LOGIN_GLOBAL_MAX_ATTEMPTS = 20;
+
+function userIpKey(userId: number, req: Request): string {
+  return `${userId}:${req.ip || req.socket?.remoteAddress || 'unknown'}`;
+}
+
+function trackFail(rec: { count: number; lockedUntil: number; updatedAt: number }, maxAttempts: number): { count: number; lockedUntil: number } {
+  // 锁已过期：先清零再计本次失败（与 ipFail 同款语义）。
+  if (rec.lockedUntil && rec.lockedUntil <= Date.now()) {
+    rec.count = 0;
+    rec.lockedUntil = 0;
+  }
+  rec.count += 1;
+  rec.updatedAt = Date.now();
+  if (rec.count >= maxAttempts) rec.lockedUntil = Date.now() + LOCKOUT_MS;
+  return rec;
+}
+
+export function userIpLockRemaining(userId: number, req: Request): number {
+  const rec = userIpAttempts.get(userIpKey(userId, req));
+  if (!rec) return 0;
+  if (rec.lockedUntil > Date.now()) return Math.ceil((rec.lockedUntil - Date.now()) / 1000);
+  if (rec.lockedUntil) userIpAttempts.delete(userIpKey(userId, req));
+  return 0;
+}
+
+export function userGlobalLockRemaining(userId: number): number {
+  const rec = userGlobalAttempts.get(userId);
+  if (!rec) return 0;
+  if (rec.lockedUntil > Date.now()) return Math.ceil((rec.lockedUntil - Date.now()) / 1000);
+  if (rec.lockedUntil) userGlobalAttempts.delete(userId);
+  return 0;
+}
+
+export function userIpFail(userId: number, req: Request): { count: number; lockedUntil: number } {
+  const k = userIpKey(userId, req);
+  const rec = userIpAttempts.get(k) || { count: 0, lockedUntil: 0, updatedAt: Date.now() };
+  const out = trackFail(rec, LOGIN_IP_MAX_ATTEMPTS);
+  userIpAttempts.set(k, rec);
+  return out;
+}
+
+export function userGlobalFail(userId: number): { count: number; lockedUntil: number } {
+  const rec = userGlobalAttempts.get(userId) || { count: 0, lockedUntil: 0, updatedAt: Date.now() };
+  const out = trackFail(rec, LOGIN_GLOBAL_MAX_ATTEMPTS);
+  userGlobalAttempts.set(userId, rec);
+  return out;
+}
+
+export function userIpReset(userId: number, req: Request): void {
+  userIpAttempts.delete(userIpKey(userId, req));
+}
+
+export function userGlobalReset(userId: number): void {
+  userGlobalAttempts.delete(userId);
+}
+
+// 定时清理：过期锁已在各 ipLocked/ipFail 里清零；这里扫掉无有效锁且
 // 超过 24 小时未更新的陈旧记录，避免 Map 无限增长。unref，不挡进程退出。
 setInterval(() => {
   const now = Date.now();
   for (const [k, rec] of ipAttempts) {
     if (rec.lockedUntil && rec.lockedUntil <= now) ipAttempts.delete(k);
     else if (!rec.lockedUntil && now - rec.updatedAt > IP_ATTEMPT_TTL_MS) ipAttempts.delete(k);
+  }
+  for (const [k, rec] of userIpAttempts) {
+    if (rec.lockedUntil && rec.lockedUntil <= now) userIpAttempts.delete(k);
+    else if (!rec.lockedUntil && now - rec.updatedAt > IP_ATTEMPT_TTL_MS) userIpAttempts.delete(k);
+  }
+  for (const [k, rec] of userGlobalAttempts) {
+    if (rec.lockedUntil && rec.lockedUntil <= now) userGlobalAttempts.delete(k);
+    else if (!rec.lockedUntil && now - rec.updatedAt > IP_ATTEMPT_TTL_MS) userGlobalAttempts.delete(k);
   }
 }, 60 * 60 * 1000).unref();
 
@@ -163,6 +241,8 @@ export function parseSqliteUtc(s: string): Date {
 }
 
 // Failed-login bookkeeping on the user row (5 fails -> lock 15 min).
+// Audit #10 M-1：自此只归改密码用（认证后操作，攻击者须先拿到会话）；
+// 登录失败改走内存双轨（userIpFail / userGlobalFail），不再读写该行。
 export function userLocked(user: UserRow): number {
   if (user.locked_until && parseSqliteUtc(user.locked_until) > new Date()) {
     return Math.ceil((parseSqliteUtc(user.locked_until).getTime() - Date.now()) / 1000);

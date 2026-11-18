@@ -89,6 +89,9 @@ onMounted(async () => {
 async function submit(): Promise<void> {
   error.value = ''
   if (!username.value.trim()) { error.value = '请输入用户名。'; return }
+  // 用户名不要带邮箱后缀（审计 #10 布局 L4）：与设置页改用户名同一条校验；
+  // 登录与创建账号都拦，后端是否兜底由后端线确认。
+  if (username.value.includes('@')) { error.value = '用户名不要带邮箱后缀。'; return }
   // 密码 ≥8 位只在创建账号时校验（isSetup）：登录时不拦短密码，
   // 老账号的密码可能短于 8 位，拦了就永远登不进去了。
   if (isSetup.value && password.value.length < 8) { error.value = '密码至少 8 位。'; return }
