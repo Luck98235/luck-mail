@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Audit #24–#26 (2026-11-19): #24 found only a contract wording drift (:104, add-mailbox test flow) — rewritten to state that the create endpoint itself verifies connectivity before saving and `POST /api/accounts/:id/test` is only for already-created accounts. #25 and #26 (user-requested final review) both came back with zero findings on both routes; audit-fix loop closed.
+- Audit #24–#26 (2026-11-19): #24 found only a contract wording drift (:104, add-mailbox test flow) — rewritten to state that the create endpoint itself verifies connectivity before saving and `POST /api/accounts/:id/test` is only for already-created accounts. #25 and #26 (user-requested final review) both came back with zero findings on both routes; audit-fix loop closed. Audit #27 (user-requested repeat final review): zero findings on both routes, third consecutive clean audit.
 
 - Audit #23 fixes (2026-11-19): backend LOW-1 — adding the same mailbox twice concurrently no longer returns 500: the INSERT in `POST /api/accounts` and in the CSV import now catches the UNIQUE constraint and returns 409 "mailbox already added" (import: that row goes to `failed` and the batch continues); verify-all section 27 added (320/320). Doc drift D1 — contract :35 rewritten: for a single add, imapHost/smtpHost are required and do not fall back to presets (only port/encryption still do); CSV import still fills a blank host from the preset. Frontend audit #23: clean, 0 findings.
 
