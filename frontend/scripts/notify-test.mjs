@@ -176,10 +176,11 @@ async function main() {
 
   // 10. 跨标签页同步：store 监听 storage 事件，luck-mail-notify 变化时同步 notifyEnabled
   // （静态源码断言，同 noautoopen-test 的做法；真跨标签行为由浏览器验证覆盖）
+  // 审计 #11 M2：监听器改成多键分发（NOTIFY_KEY 只是其中一支），断言按新结构匹配。
   {
     const storeSrc = readFileSync(new URL('../src/stores/mail.ts', import.meta.url), 'utf8')
     const hasListener = /window\.addEventListener\('storage'/.test(storeSrc)
-      && /e\.key !== NOTIFY_KEY/.test(storeSrc)
+      && /e\.key === NOTIFY_KEY/.test(storeSrc)
       && /notifyEnabled\.value = e\.newValue === '1'/.test(storeSrc)
     check('跨标签页同步：mail.ts 监听 storage 事件同步 notifyEnabled', hasListener)
   }

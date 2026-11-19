@@ -16,7 +16,7 @@ backend/
     config.ts             环境变量、目录、主密钥（.key 0600）、阈值常量
     db.ts                 SQLite schema（WAL）、FTS5 trigram、body 文件读写
     cryptoUtil.ts         scrypt 密码哈希、AES-256-GCM 账号密码加密
-    auth.ts               会话 Cookie（lm_session）、5 次锁定 15 分钟
+    auth.ts               会话 Cookie（`lm_session`，`COOKIE_SECURE=1` 时为 `__Host-lm_session`）、5 次锁定 15 分钟
     presets.ts            服务商预设表（另含 exmail）
     sanitize.ts           DOMPurify（JSDOM）：去脚本/事件属性/1x1 追踪像素
     mailUtil.ts           文件夹类型判定、BODYSTRUCTURE 附件 part
@@ -25,12 +25,14 @@ backend/
     parseWorker.ts        worker_threads 解析入口（只收文件路径，不收大 Buffer）
     imapUtil.ts           IMAP ID（RFC 2971）、连通测试、SMTP transporter 构造
     smtpUtil.ts           Nodemailer 发送 + MIME 原始报文（APPEND 到已发送）
+    idempotency.ts        发信/删信幂等占位（claimSendKey、delete claim）
     engine.ts             同步引擎：每账号一连接、IDLE、增量同步、读写删移、附件实时流
     hub.ts                Socket.io 广播（new-mail / mail-updated / mail-deleted / sync / account）
     routes/
       authRoutes.ts       status / setup / login / logout / change-password
       accountRoutes.ts    presets / accounts CRUD / test / refresh / folders
       messageRoutes.ts    列表 / 详情 / 标已读 / 移动 / 删除 / 发信 / 附件下载 / 搜索
+      draftRoutes.ts      服务端草稿 CRUD（POST / PUT / DELETE / GET 分页）
       miscRoutes.ts       settings（签名、默认账号）
   scripts/
     verify-all.mjs        本地全量验证脚本（见下）
@@ -57,11 +59,21 @@ npm start            # node dist/server.js
 首次启动会自动建 `data/`、生成 32 字节主密钥 `.key`（权限 0600）、建库开 WAL。
 `PUBLIC_DIR` 里没有 `index.html` 时，`/` 返回占位页说明后端已跑起来，不报错退出。
 
+## 首次建账号（一次性引导凭证）
+
+全新部署或删库重建后，`users` 表为空，首次启动时后端生成一个一次性引导 token：
+
+- token 写进数据目录的 `.setup-token` 文件（权限 0600），同时打到启动日志：`[setup] first-run bootstrap token: <token> （also in DATA_DIR/.setup-token; deleted after the first user is created)`；
+- 登录页显示“创建管理员账号”时，须在“引导凭证”一栏填入该 token，再填用户名/密码提交（`POST /api/auth/setup` 带 `setupToken` 字段）；
+- token 不对或缺失时后端返回 403；建成首个用户后 token 文件自动删除，该栏不再出现；token 猜错会计入 IP 锁定（5 次失败锁 15 分钟，锁检查在 token 校验之前，审计 #12 L5）；
+- 重启后、首个用户建成前，token 仍然有效（文件还在就沿用，不重新生成）；已建过用户时 `POST /api/auth/setup` 直接返回 409。
+
 ## 验证结果（本地，`npm run verify`）
 
 验证脚本 `scripts/verify-all.mjs`：在临时 `DATA_DIR` 上起编译后的服务器，
-脚本内共 169 处 `check()` 调用；最近一次完整运行（2026-11-18）**168 项通过，0 失败**
-（分支内断言按实际执行路径计入——import18b 的端到端断言与回退分支互斥，
+断言总数见最近一次 `node scripts/verify-all.mjs` 的输出（以 0 失败为准；
+审计 #17 D1 起不再在文档里写死通过数——每次加断言都会让硬数字过期。
+分支内断言按实际执行路径计入——import18b 的端到端断言与回退分支互斥，
 一次运行只走其中一条）。
 
 注意：并非全程只用假账号——第 7 节账号测试（`verify-all.mjs:286-296`，
@@ -71,7 +83,7 @@ npm start            # node dist/server.js
 
 - **启动/构建**：`tsc` 严格模式编译通过；`node dist/server.js` 正常监听。
 - **认证**：setup（短密码 400、重复 409）、login（错密 401、未知用户 5 次后 429 +
-  `retryAfter`）、未登录调 `/api/*` 401、登录后 `lm_session` Cookie 生效。
+  `retryAfter`）、未登录调 `/api/*` 401、登录后会话 Cookie 生效（`COOKIE_SECURE=1` 时名为 `__Host-lm_session`，否则为 `lm_session`）。
 - **预设/账号**：`163.com` 预设正确、`exmail` 在表、未知域名回落 `imap./smtp.`；
   加假账号返回 400 且写明是 IMAP 哪一步失败、无 500、无堆栈外泄、账号未入库。
 - **加密**：AES-256-GCM 加密后入库、解密还原一致；`.key` 32 字节、权限 0600。
@@ -88,7 +100,7 @@ npm start            # node dist/server.js
   `onerror` 与 `javascript:` 链接也被剥掉。
 - **Worker**：>5MB 正文（约 10.5MB）在 worker 里解析成功、主线程未阻塞；
   12MB 附件只存元信息、磁盘零文件。
-- **Socket.io**：带有效 `lm_session` Cookie 的客户端连上并收到 `refresh-all`
+- **Socket.io**：带有效会话 Cookie（`COOKIE_SECURE=1` 时为 `__Host-lm_session`）的客户端连上并收到 `refresh-all`
   触发的 `sync {state:"done"}` 事件；无 Cookie 的连接被拒绝。
 - **状态/设置**：签名保存后读回一致；未知接口 404 JSON。
 
@@ -161,9 +173,15 @@ npm start            # node dist/server.js
   口径没变。用户手动把已发送的信标未读也会在下次同步时被翻回已读
   （这是口径，不是 bug）。
 
-## 尚未用真实账号验证收信/发信全流程
+### OquMail 发信限制（threading 头被剥离，审计 #12 H2）
 
-诚实说明：以上验证主要用**假账号/假授权码**完成（例外见上：第 7 节与
+- OquMail 服务器会在 SMTP 提交后整封重写：新 Message-ID + 剥离 In-Reply-To/References。父级实测：planned Message-ID 改用发件账号真实域名（`<uuid@heavycrusher.com>`）也照样重写；163 发到 QQ 时 planned Message-ID 原样保留——是 OquMail 服务端行为，不是 luck-mail 的问题（luck-mail 自己 APPEND 的已发送副本带正确的 threading 头，值与原信 Message-ID 一致）。
+- 影响：OquMail 账号（heavycrusher.com / futdesk.ai 等 mail.oqumail.com 托管域名）发出的回复在收件方无法归入原会话，只能看到孤立新会话。
+- 对策：不改发信路径（改 Message-ID 域名已证实无效）；已发送去重对此类账号用指纹兜底（主题/发件人/收件人/时间±10 秒/大小±1024 字节，`engine.ts` 的 `sentFingerprintMatches`；审计 #13 L2 起加收件人），至少保证“所有已发送”里一次发送只显示一行、删一封能清掉另一份副本。崩溃窗口重认领也按指纹查已发送（审计 #13 HIGH：本地库 + 服务器已发送文件夹两路；重认领时 size 未知，该分支放宽不校验大小）。审计 #12 之前已产生的旧重复行不自动合并清理，手动删其中一封可触发清扫清掉另一份；彻底删除时清扫删掉的双生副本 Message-ID 也写进墓碑，防复活（审计 #13 L1/L3）。
+
+## 尚未用真实账号验证收信/发信全流程（2026-11-19 更新：已由线上实际使用覆盖）
+
+原先诚实说明：以上验证主要用**假账号/假授权码**完成（例外见上：第 7 节与
 import18b 回退分支会用假凭证联网访问真实 163 服务器）。以下须用户用真实 163
 客户端授权码验证后才能算闭环（本机不向用户索要任何密码/授权码）：
 
@@ -173,6 +191,28 @@ import18b 回退分支会用假凭证联网访问真实 163 服务器）。以�
 3. 发一封真实邮件：Nodemailer 发送 + APPEND 副本到已发送 + 本地写库。
 4. 移动/删除/标已读等 IMAP 写操作回写服务器。
 5. 多账号（163 + QQ）同时在线、断线重连、Socket.io 实时角标。
+
+**2026-11-19 更新**：线上（mm.ynzb.cn，134.175.136.13）已有 **31 个真实账号**
+在跑（163 ×24、QQ ×3、OquMail ×4），真实收发信已发生，上述 5 项均已由线上
+实际使用覆盖，不再是“尚未验证”：
+1. 31 个真实账号均已完成 IMAP 登录、文件夹 LIST 与增量同步，163 走 5 分钟轮询。
+2. 浏览器验证中多次打开真实邮件：全文拉取、DOMPurify 清洗、附件实时下载均正常。
+3. 线上已发送已有 17 封真实发出记录（2026-11-19 快照；Nodemailer 发送 + 已发送 APPEND + 本地写库）。
+4. 移动/删除/标已读的 IMAP 回写已在浏览器验证与日常使用中发生（删除防复活、
+   标已读同步均经多轮验证）。
+5. 31 账号同时在线、断线重连、Socket.io 实时角标已在生产跑通（新邮件推送、
+   未读角标即时亮起均已验证）。
+
+## 依赖安全跟踪（审计 #11）
+
+- **multer**：CVE-2026-113872（GHSA-q7qp-rjg7-q26m，HIGH）影响 2.0.0–<2.5.0，
+  触发条件是配置了异步 fileFilter 且请求中途被 abort；本项目两处 multer 配置
+  均未配 fileFilter，漏洞路径不可达。已升级到 ≥2.5.0（见 `package.json`）。
+- **exceljs 4.4.0**：多个 2026-11 公布的未修复 CVE（CVE-2026-128346/128338/
+  78207/128339/128341/128342，均为读路径 `xlsx.load` / WorkbookReader / note
+  序列化），截至审计 #11 时无修复版。本项目只用 exceljs **写**导出
+  （`writeBuffer`），不读任何外部文件、不建 notes，漏洞路径走不到；待上游
+  发布修复版后再升级。导入已改 CSV，不用 exceljs 读。
 
 ## 给父级集成部署的建议（只写建议，不执行）
 

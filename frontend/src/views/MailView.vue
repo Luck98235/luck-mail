@@ -81,12 +81,51 @@ function onToastClick(): void {
 // 点草稿：回填到写信弹窗
 watch(() => mail.composeDraft, (d) => {
   if (!d) return
-  composeInitial.value = { to: d.to, subject: d.subject, body: d.text, accountId: d.accountId, draftId: d.id }
+  // 写信窗已开时 open 不变、ComposeModal 的 open watch 不触发，新 initial
+  // 会被丢掉——直接返回、不替换正在编辑的内容。这条分支实际不可达：
+  // 写信窗是全屏遮罩（fixed inset-0 z-50），窗开着时底层点击到不了草稿行，
+  // 审计 #14 LOW-1 删掉了原来这里弹的“请先关闭当前写信窗”toast（死代码），
+  // 只留静默守卫作防御。
+  if (composeOpen.value) {
+    mail.composeDraft = null
+    return
+  }
+  // 审计 #16 LOW-4：草稿所属账号可能已被另一标签页删掉（草稿随账号级联
+  // 删除），此时发件人下拉里没有对应选项、打开的是空白发件人的写信窗；
+  // 先校验账号还在，不在则提示并刷新草稿列表、不开窗。accountId 为 null
+  // 的草稿（无指定账号）不受影响，仍按原流程打开。
+  if (d.accountId != null && !mail.accounts.some((a) => a.id === d.accountId)) {
+    mail.showToast('该邮箱已被删除')
+    void mail.loadDrafts()
+    mail.composeDraft = null
+    return
+  }
+  composeInitial.value = {
+    to: d.to, subject: d.subject, body: d.text, accountId: d.accountId, draftId: d.id,
+    // 审计 #11 H1/L15：草稿的 threading 与抄送透传回写信弹窗（重开草稿再发
+    // 仍是同一会话，cc 不丢）；审计 #12 B1：后端 GET /api/drafts 返回的
+    // references 是数组（draftRoutes publicDraft split 成数组），不是
+    // 空格串——直接 .split 会在数组上抛 TypeError，回复草稿永远打不开。
+    // 这里归一化（与下面 replyReferences 的详情写法一致），字符串也兼容。
+    ...(d.inReplyTo ? { inReplyTo: d.inReplyTo } : {}),
+    ...(d.references ? { references: (Array.isArray(d.references) ? d.references : d.references.split(' ')).filter(Boolean) } : {}),
+    ...(d.cc?.length ? { cc: d.cc.join(', ') } : {})
+  }
   composeOpen.value = true
   mail.composeDraft = null
 })
 
 function openCompose(prefill: ComposeInitial = {}): void {
+  // 写信窗已开时 open 不变、弹窗的 open watch 不触发，新 initial 会被丢掉——
+  // 直接返回、不替换正在编辑的内容。这条分支实际不可达（写信窗是全屏遮罩，
+  // 窗开着时底层点击到不了回复/转发/写信按钮），审计 #14 LOW-1 删掉了原来
+  // 这里弹的“请先关闭当前写信窗”toast（死代码），只留静默守卫作防御。
+  if (composeOpen.value) {
+    return
+  }
+  // 审计 #15 MED-1：零邮箱时写信入口直接拦住——写信窗的发件人下拉是空的，
+  // 打开也存不上草稿、发不出去；提示用户先添加邮箱。
+  if (!mail.accounts.length) { mail.showToast('请先添加邮箱'); return }
   composeInitial.value = prefill
   composeOpen.value = true
 }
@@ -97,15 +136,28 @@ function quoteOf(m: MessageDetail): string {
 
 // 回复 threading（审计 #10 H1）：原信 Message-ID 作 In-Reply-To，
 // 原 References 链 + 原 Message-ID 作 References；后端在发信时据此写头。
+// 审计 #13 LOW-2：字符串分支须拆分——以前 `[m.references]` 把整条空格串
+// 当成一个 References 元素；与 composeDraft watch 的归一化一致。
 function replyReferences(m: MessageDetail): string[] {
-  const refs = typeof m.references === 'string' ? [m.references] : (m.references || [])
+  const refs = typeof m.references === 'string' ? m.references.split(' ').filter(Boolean) : (m.references || [])
   return m.messageId ? [...refs, m.messageId] : refs
+}
+
+// 审计 #11 M5：回复/转发主题前缀同时认中文与英文（Re:/Fw:/Fwd:，大小写不敏感）；
+// 原主题为空时不加前缀（不留孤零零的“回复：”）。
+function withReplyPrefix(subject: string | undefined, prefix: '回复：' | '转发：'): string {
+  const s = (subject || '').trim()
+  if (!s) return ''
+  if (prefix === '回复：' && (s.startsWith('回复：') || /^re\s*:/i.test(s))) return s
+  if (prefix === '转发：' && (s.startsWith('转发：') || /^fw(d)?\s*:/i.test(s))) return s
+  return `${prefix}${s}`
 }
 
 function reply(m: MessageDetail): void {
   openCompose({
-    to: m.from,
-    subject: m.subject?.startsWith('回复：') ? m.subject : `回复：${m.subject}`,
+    // 审计 #11 L23：有 Reply-To 时优先发给它（详情接口返回的 replyTo 字段），无则沿用发件人。
+    to: m.replyTo || m.from,
+    subject: withReplyPrefix(m.subject, '回复：'),
     body: quoteOf(m),
     accountId: m.accountId,
     ...(m.messageId ? { inReplyTo: m.messageId } : {}),
@@ -117,7 +169,7 @@ function forward(m: MessageDetail): void {
   // 转发不带 In-Reply-To，只带 References（原链 + 原 Message-ID）。
   openCompose({
     to: '',
-    subject: m.subject?.startsWith('转发：') ? m.subject : `转发：${m.subject}`,
+    subject: withReplyPrefix(m.subject, '转发：'),
     body: quoteOf(m),
     accountId: m.accountId,
     ...(replyReferences(m).length ? { references: replyReferences(m) } : {})
@@ -126,7 +178,8 @@ function forward(m: MessageDetail): void {
 
 async function logout(): Promise<void> {
   mail.disconnectRealtime()
-  mail.resetSessionState()
+  // 审计 #11 L1：退出时清掉持久化导航/移动端/展开/删除视图状态，下次登录从默认视图进。
+  mail.resetSessionState(true)
   await auth.logout()
   router.replace('/login')
 }

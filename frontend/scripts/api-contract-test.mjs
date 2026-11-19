@@ -58,6 +58,17 @@ async function main() {
   r = await j('/api/messages/send', { method: 'POST', body: JSON.stringify({ accountId: 1, to: ['a@example.com'], subject: 't', text: 'hi' }) })
   check('POST /api/messages/send（JSON）→ 201 {ok, id, messageId}', r.status === 201 && r.data.ok === true && r.data.id != null)
 
+  // 审计 #12 B1/M4：草稿 references 形状——真实后端 GET /api/drafts 返回
+  // references 为 string[]（无则 null）、cc 为 string[]；以前 mock 原样
+  // 回显 POST 的字符串，前端在冒烟里永远走不到数组分支，B1 漏网。
+  // 这里 POST 时按前端 draftSnapshot 的做法传空格串，GET 回来须是数组。
+  r = await j('/api/drafts', { method: 'POST', body: JSON.stringify({ accountId: 1, to: 'a@example.com', subject: '契约草稿', text: 'hi', inReplyTo: '<orig@local>', references: '<ref1@local> <orig@local>', cc: ['c@example.com'] }) })
+  check('POST /api/drafts → 200 {ok, draft}', r.status === 200 && r.data.ok === true && r.data.draft?.id != null)
+  r = await j('/api/drafts')
+  const contractDraft = (r.data.drafts || []).find((d) => d.subject === '契约草稿')
+  check('GET /api/drafts → references 为 string[]（不是空格串）', r.data.ok === true && Array.isArray(contractDraft?.references) && contractDraft.references.includes('<orig@local>'), JSON.stringify(contractDraft?.references))
+  check('GET /api/drafts → cc 为 string[]、inReplyTo 为字符串', Array.isArray(contractDraft?.cc) && contractDraft.cc.includes('c@example.com') && contractDraft?.inReplyTo === '<orig@local>', JSON.stringify(contractDraft))
+
   r = await j('/api/settings')
   check('GET /api/settings → {settings:{signature, defaultAccountId}}', r.data.ok === true && 'signature' in r.data.settings && 'defaultAccountId' in r.data.settings)
 

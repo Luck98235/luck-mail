@@ -45,6 +45,18 @@ const MALICIOUS_HTML = '<p>正常段落</p>'
   + '<a href="https://example.com" target="_blank ">尾空格 target</a>'
   + '<style>p{color:red}</style>'
   + '<form><input name="q"></form>'
+  // 审计 #11 L5：追踪像素不只 1x1——0 尺寸与隐藏样式的图也要删，正常图保留。
+  + '<img src="https://tracker.example.com/pixel-1x1.png" width="1" height="1">'
+  + '<img src="https://tracker.example.com/pixel-0x0.png" width="0" height="0">'
+  + '<img src="https://tracker.example.com/pixel-style-0.png" style="width:0;height:0">'
+  + '<img src="https://tracker.example.com/pixel-hidden.png" style="display:none">'
+  + '<img src="https://tracker.example.com/pixel-invisible.png" style="visibility:hidden">'
+  + '<img src="https://tracker.example.com/pixel-collapse.png" style="visibility:collapse">'
+  + '<img src="https://tracker.example.com/pixel-opacity.png" style="opacity:0">'
+  + '<img src="https://tracker.example.com/pixel-opacity-dot.png" style="opacity:.0">'
+  + '<img src="https://tracker.example.com/pixel-1dot0.png" style="width:1.0px;height:1.0px">'
+  + '<img src="https://tracker.example.com/pixel-0dot0.png" style="width:0.0px;height:0.0px">'
+  + '<img src="https://tracker.example.com/normal.png" width="100" height="50" alt="正常图片">'
 
 async function main() {
   const mock = createMockServer()
@@ -120,6 +132,20 @@ async function main() {
     srcdoc.includes('href="https://example.com"') && srcdoc.includes('target="_blank"') && srcdoc.includes('rel="noopener noreferrer"'))
   check('消毒：iframe 仍为沙盒（无 allow-scripts）',
     (frame.getAttribute('sandbox') || '').includes('allow-same-origin') && !(frame.getAttribute('sandbox') || '').includes('allow-scripts'))
+  // 审计 #11 L5：追踪像素不只 1x1——0 尺寸与隐藏样式的图也要删，正常图保留。
+  check('消毒：1x1 追踪像素被删', !srcdoc.includes('pixel-1x1'))
+  check('消毒：0x0 追踪像素被删', !srcdoc.includes('pixel-0x0'))
+  check('消毒：样式 0 尺寸追踪图被删', !srcdoc.includes('pixel-style-0'))
+  check('消毒：display:none 追踪图被删', !srcdoc.includes('pixel-hidden'))
+  check('消毒：visibility:hidden 追踪图被删', !srcdoc.includes('pixel-invisible'))
+  // 审计 #15 LOW-4：visibility:collapse 也须删，与后端同配置。
+  check('消毒：visibility:collapse 追踪图被删', !srcdoc.includes('pixel-collapse'))
+  check('消毒：opacity:0 追踪图被删', !srcdoc.includes('pixel-opacity'))
+  // 审计 #16 LOW-3 跟进：opacity:.0、width/height:1.0px 与 0.0px 也是合法 CSS 零值，须删。
+  check('消毒：opacity:.0 追踪图被删', !srcdoc.includes('pixel-opacity-dot'))
+  check('消毒：width/height:1.0px 追踪图被删', !srcdoc.includes('pixel-1dot0'))
+  check('消毒：width/height:0.0px 追踪图被删', !srcdoc.includes('pixel-0dot0'))
+  check('消毒：正常尺寸图片保留', srcdoc.includes('normal.png'))
 
   await mock.close()
   dom.window.close()

@@ -1,10 +1,10 @@
 // 草稿接口（审计 #5 后用户定夺，后端草稿）：草稿只存 drafts 表，
 // 不进 FTS、不进 messages 表、不参与同步；删账号时级联删除。
 // 契约（与前端约定）：
-//   GET    /api/drafts           -> {ok, drafts:[{id, accountId, to, subject, text, idempotencyKey, updatedAt}]}（updatedAt 倒序）
-//   POST   /api/drafts           body {accountId, to, subject, text, idempotencyKey?}
+//   GET    /api/drafts           -> {ok, drafts:[{id, accountId, to, subject, text, inReplyTo, references, cc, idempotencyKey, updatedAt}]}（updatedAt 倒序）
+//   POST   /api/drafts           body {accountId, to, subject, text, inReplyTo?, references?, cc?, idempotencyKey?}
 //                                idempotencyKey 缺失时服务端生成；accountId 不存在 -> 400
-//   PUT    /api/drafts/:id       body {to?, subject?, text?, accountId?}；idempotencyKey 永不变更；不存在 -> 404
+//   PUT    /api/drafts/:id       body {to?, subject?, text?, accountId?, inReplyTo?, references?, cc?}；idempotencyKey 永不变更；不存在 -> 404
 //   DELETE /api/drafts/:id       不存在 -> 404
 // 发信成功后由 /api/messages/send 按 draftId 删草稿行（见 messageRoutes）。
 import express from 'express';
@@ -18,9 +18,43 @@ export interface DraftRow {
   to_addrs: string;
   subject: string;
   text: string;
+  // Audit #11 threading：回复/转发草稿的 threading 字段（草稿重开后不丢）。
+  in_reply_to: string | null;
+  references: string | null;
+  cc: string | null;
   idempotency_key: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// Audit #11 threading：references 存库时是空格拼成的字符串，返回时切回
+// 数组（与 GET /api/messages/:id 的 references 形状一致）；cc 存库时
+// 是 JSON 数组字符串，返回时解析回数组。
+function parseCcJson(s: string | null): string[] {
+  if (!s) return [];
+  try {
+    const v: unknown = JSON.parse(s);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+  } catch { return []; }
+}
+
+function normReferences(v: unknown): string | null {
+  if (Array.isArray(v)) {
+    const s = (v as unknown[]).filter((x): x is string => typeof x === 'string').map((s) => s.trim()).filter(Boolean).join(' ');
+    return s || null;
+  }
+  if (typeof v === 'string') {
+    const s = v.trim();
+    return s || null;
+  }
+  return null;
+}
+
+function normCc(v: unknown): string | null {
+  const arr: string[] = Array.isArray(v)
+    ? (v as unknown[]).filter((x): x is string => typeof x === 'string').map((s) => s.trim()).filter(Boolean)
+    : (typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean) : []);
+  return arr.length ? JSON.stringify(arr) : null;
 }
 
 function publicDraft(row: DraftRow): Record<string, unknown> {
@@ -30,6 +64,9 @@ function publicDraft(row: DraftRow): Record<string, unknown> {
     to: row.to_addrs,
     subject: row.subject,
     text: row.text,
+    inReplyTo: row.in_reply_to || null,
+    references: row.references ? row.references.split(/\s+/).filter(Boolean) : null,
+    cc: parseCcJson(row.cc),
     idempotencyKey: row.idempotency_key,
     updatedAt: row.updated_at,
   };
@@ -46,7 +83,7 @@ export function draftRoutes(): express.Router {
     const off = Math.max(Number(req.query.offset) || 0, 0);
     const total = (db.prepare('SELECT COUNT(*) c FROM drafts').get() as { c: number }).c;
     const rows = db.prepare(
-      `SELECT id, account_id, to_addrs, subject, text, idempotency_key,
+      `SELECT id, account_id, to_addrs, subject, text, in_reply_to, "references", cc, idempotency_key,
               created_at, updated_at FROM drafts ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`,
     ).all(lim, off) as DraftRow[];
     res.json({ ok: true, drafts: rows.map(publicDraft), total });
@@ -81,13 +118,18 @@ export function draftRoutes(): express.Router {
     let info: { lastInsertRowid: number | bigint };
     try {
       info = db.prepare(
-        `INSERT INTO drafts (account_id, to_addrs, subject, text, idempotency_key)
-         VALUES (?,?,?,?,?)`,
+        `INSERT INTO drafts (account_id, to_addrs, subject, text, in_reply_to, "references", cc, idempotency_key)
+         VALUES (?,?,?,?,?,?,?,?)`,
       ).run(
         accountId,
         typeof b.to === 'string' ? b.to : '',
         typeof b.subject === 'string' ? b.subject : '',
         typeof b.text === 'string' ? b.text : '',
+        // Audit #11 threading：新建草稿时一并存 threading 字段（回复/
+        // 转发自动保存/存草稿后重开仍带 In-Reply-To/References/cc）。
+        typeof b.inReplyTo === 'string' ? b.inReplyTo.trim() || null : null,
+        normReferences(b.references),
+        normCc(b.cc),
         key,
       );
     } catch (e) {
@@ -122,14 +164,20 @@ export function draftRoutes(): express.Router {
     }
     // idempotencyKey 永不变更（即使 body 里传了也忽略）——草稿重开
     // 发信时复用同一 key，防重复发信。
+    // Audit #11 threading：threading 字段只在 body 明确传了时更新，
+    // 不传则保留草稿原值（自动保存只传 to/subject/text 时不丢 threading）。
     db.prepare(
       `UPDATE drafts SET account_id=?, to_addrs=?, subject=?, text=?,
+       in_reply_to=?, "references"=?, cc=?,
        updated_at=datetime('now') WHERE id=?`,
     ).run(
       accountId,
       typeof b.to === 'string' ? b.to : row.to_addrs,
       typeof b.subject === 'string' ? b.subject : row.subject,
       typeof b.text === 'string' ? b.text : row.text,
+      b.inReplyTo !== undefined ? (typeof b.inReplyTo === 'string' ? b.inReplyTo.trim() || null : null) : row.in_reply_to,
+      b.references !== undefined ? normReferences(b.references) : row.references,
+      b.cc !== undefined ? normCc(b.cc) : row.cc,
       id,
     );
     const updated = db.prepare('SELECT * FROM drafts WHERE id=?').get(id) as DraftRow;

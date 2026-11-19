@@ -29,7 +29,15 @@ export async function spoolToTemp(readable: Readable, messageDbId: number | null
       }
     },
   });
-  await pipeline(readable, counter, fs.createWriteStream(tmp));
+  // Audit #11 L5：pipeline 失败（超 100MB 上限/流中断）时删掉已建的
+  // 临时文件——旧版直接 reject，写了一半的 luck-mail-parse-*.eml
+  // 残留在 os.tmpdir() 里（每封超大邮件最多残留 100MB）。
+  try {
+    await pipeline(readable, counter, fs.createWriteStream(tmp));
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    throw e;
+  }
   return tmp;
 }
 

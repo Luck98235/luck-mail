@@ -143,11 +143,15 @@ export async function streamToParsed(
     return null;
   };
   const references = normalizeReferences(getHeader('references'));
+  // Audit #11 threading：Reply-To 头（mailparser 解析成地址对象数组），
+  // 只取第一个地址；无 Reply-To 头时为 null（前端回复时回落到 From）。
+  const replyTo = getAddr('reply-to').address || null;
 
   return {
     envelope: {
       messageId,
       references,
+      replyTo,
       subject,
       fromAddr: from.address,
       fromName: from.name,

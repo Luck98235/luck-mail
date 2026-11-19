@@ -139,6 +139,14 @@ app.use('/api', requireAuth);
 // ——旧版缺失即放行，curl/脚本可绕过第一层校验直接带 Cookie 写接口。
 // 浏览器 fetch/XHR 的 POST/PUT/DELETE 一律带 Origin，不误拦正常前端；
 // 登录/setup 走 /api/auth，不受本层约束（首次建账号可能用 curl）。
+// Audit #11 L8（取舍说明，不改行为）：/api/auth/login、/api/auth/setup
+// 不受第二层约束，残留登录 CSRF 面——无 Origin 的非浏览器请求可跨站
+// POST 到 /api/auth/login，把受害者登入攻击者的账号（随后受害者发信
+// 走攻击者账号）。接受该取舍的理由：(1) setup 必须能用 curl 做（首次
+// 建账号无浏览器会话）；(2) 现代浏览器表单 POST 会带 Origin，第一层
+// 能拦住浏览器侧的跨站登录；(3) SameSite=Strict 已挡住跨站请求携带
+// 已有会话 Cookie；(4) 单用户自用系统，攻击价值极低。登录也要求
+// Origin/Referer 会更干净，但会挡掉 curl 登录，需权衡后另议。
 app.use('/api', (req, res, next) => {
   if (req.method !== 'POST' && req.method !== 'PUT' && req.method !== 'DELETE') return next();
   const src = req.headers.origin || req.headers.referer || '';
@@ -238,6 +246,13 @@ async function main(): Promise<void> {
       if (attempts.length >= 30) return next(new Error('unauthorized'));
       attempts.push(nowMs);
       socketHandshakeAttempts.set(ip, attempts);
+      // Audit #11 L4：握手限流计数剪枝（复用 rateLimit 的 >1000 模式）——
+      // 旧版只增不删，一次握手过的 IP 永远留在 Map 里。
+      if (socketHandshakeAttempts.size > 1000) {
+        for (const [k, v] of socketHandshakeAttempts) {
+          if (!v.length || nowMs - v[v.length - 1] >= 60_000) socketHandshakeAttempts.delete(k);
+        }
+      }
       const cookieHeader = socket.handshake.headers.cookie || '';
       const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
       const token = match ? decodeURIComponent(match[1]) : null;

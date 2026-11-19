@@ -43,6 +43,19 @@
           </div>
           <p class="text-xs text-slate-400 mt-1.5">密码至少 8 位。</p>
         </div>
+        <div v-if="isSetup">
+          <label class="block text-xs text-slate-500 mb-1.5">引导凭证</label>
+          <div class="relative">
+            <input
+              v-model="setupToken" :type="showSetupToken ? 'text' : 'password'" autocomplete="off"
+              placeholder="首次建账号的引导凭证" class="w-full border border-slate-200 rounded-lg px-3 py-2.5 pr-10 text-sm outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400"
+            >
+            <button type="button" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 w-7 h-7" :title="showSetupToken ? '隐藏引导凭证' : '显示引导凭证'" @click="showSetupToken = !showSetupToken">
+              <i :class="showSetupToken ? 'fa-regular fa-eye-slash' : 'fa-regular fa-eye'"></i>
+            </button>
+          </div>
+          <p class="text-xs text-slate-400 mt-1.5">在服务器启动日志或数据目录的 .setup-token 文件里查看（首次建账号后即失效）。</p>
+        </div>
 
         <label v-if="!isSetup" class="flex items-center gap-2 text-xs text-slate-500 select-none cursor-pointer">
           <input v-model="remember" type="checkbox" class="accent-blue-500 w-4 h-4">
@@ -73,8 +86,10 @@ const auth = useAuthStore()
 const username = ref<string>('')
 const password = ref<string>('')
 const confirm = ref<string>('')
+const setupToken = ref<string>('')
 const showPassword = ref<boolean>(false)
 const showConfirm = ref<boolean>(false)
+const showSetupToken = ref<boolean>(false)
 const remember = ref<boolean>(false)
 const busy = ref<boolean>(false)
 const error = ref<string>('')
@@ -97,13 +112,16 @@ async function submit(): Promise<void> {
   if (isSetup.value && password.value.length < 8) { error.value = '密码至少 8 位。'; return }
   if (!isSetup.value && !password.value) { error.value = '请输入密码。'; return }
   if (isSetup.value && password.value !== confirm.value) { error.value = '两次输入的密码不一致。'; return }
+  // 审计 #12 H1：全新部署/删库重建时 setup 必须带一次性引导 token，
+  // 否则后端 403；前端以前没有这个输入框，首个账号永远建不出来。
+  if (isSetup.value && !setupToken.value.trim()) { error.value = '请输入引导凭证（服务器启动日志或数据目录的 .setup-token 文件里查看）。'; return }
   busy.value = true
   // “30天内免登录”：勾选值随登录请求发给后端（rememberMe），后端据此建
   // 30 天或 1 天会话；不勾选时后端默认 1 天（审计 #5：以前前端不传，
   // 后端缺省恒为 30 天，复选框是摆设）。偏好仍记 localStorage 供下次回填。
   try { localStorage.setItem('luck-mail-remember', remember.value ? '1' : '0') } catch { /* 忽略 */ }
   const ok = isSetup.value
-    ? await auth.setup(username.value.trim(), password.value, confirm.value)
+    ? await auth.setup(username.value.trim(), password.value, confirm.value, setupToken.value.trim())
     : await auth.login(username.value.trim(), password.value, remember.value)
   busy.value = false
   if (ok) router.replace('/')

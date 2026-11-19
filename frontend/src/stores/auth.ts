@@ -48,10 +48,10 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function setup(name: string, password: string, confirm: string): Promise<boolean> {
+  async function setup(name: string, password: string, confirm: string, setupToken?: string): Promise<boolean> {
     lastError.value = ''
     try {
-      await api.setup(name, password, confirm)
+      await api.setup(name, password, confirm, setupToken)
       loggedIn.value = true
       username.value = name
       setupRequired.value = false

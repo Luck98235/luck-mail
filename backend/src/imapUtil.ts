@@ -1,4 +1,5 @@
 import { ImapFlow } from 'imapflow';
+import dns from 'node:dns';
 import nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
 import { log, ALLOW_PRIVATE_MAIL_HOSTS } from './config.js';
@@ -46,15 +47,86 @@ export function accountToImap(a: AccountRow): ImapAccount {
   };
 }
 
-// Audit #10 M-2：拒绝回环/私有/链路本地/组播字面 IP——已认证的 SSRF：
-// 邮箱服务器地址原来只验非空与端口范围，可指向 127.0.0.1、内网段或
-// 169.254.169.254（云元数据）。主机名仍按原样解析（DNS 解析后是否
-// 内网由上游网络隔离处理——服务端只应连互联网邮件服务商；常见内网
-// 主机名如 localhost 也一并拒绝）。
-// 字面 IPv4/IPv6 的判定：10/8、172.16/12、192.168/16、127/8、169.254/16、
-// 0.0.0.0/8、100.64/10（CGNAT）、192.0.0.0/24、192.0.2.0/24、198.51.100.0/24、
-// 203.0.113.0/24（文档段）、224.0.0.0/4（组播）、240.0.0.0/4（保留）、
-// ::1、fe80::/10、fc00::/7、ff00::/8、::（未指定）。
+// Audit #11 L7：字面 IP 先归一化成 32 位整数再判定——旧版只认标准
+// 点分十进制与冒号 IPv6，Node 的解析器（getaddrinfo）却会把非常规
+// 写法也解析成 127.0.0.1，已实测证实：'2130706433'、'0x7f.0.0.1'、
+// '0177.0.0.1'、'0x7f000001' 全部解析到 127.0.0.1，'::ffff:127.0.0.1'
+// 是 IPv4 映射 IPv6。归一化覆盖：单数字（十进制/0x 十六进制/0 八进制）、
+// 2/3/4 段点分（每段可为十进制/0x/0 前缀）、IPv4 映射 IPv6（::ffff:a.b.c.d
+// 与 ::ffff:7f00:0001 两种写法，十六进制段数不限——::ffff:0:7f00:0001、
+// ::ffff:0:0:7f00:0001 都是 127.0.0.1，见 Audit #16 LOW-1）。主机名
+// （含字母的段）一律不是字面 IP，不拦截。
+function ipv4PartToInt(part: string): number | null {
+  if (!/^(0[xX][0-9a-fA-F]+|0[0-7]*|[0-9]+)$/.test(part)) return null;
+  let v: number;
+  if (/^0[xX]/.test(part)) v = parseInt(part, 16);
+  else if (/^0[0-9]+$/.test(part)) v = parseInt(part, 8);
+  else v = parseInt(part, 10);
+  return Number.isSafeInteger(v) && v >= 0 ? v : null;
+}
+
+// 把各种写法的 IPv4 字面量归一化成 32 位整数；不是字面 IP 返回 null。
+function ipv4LiteralToInt(h: string): number | null {
+  const parts = h.split('.');
+  if (parts.length < 1 || parts.length > 4) return null;
+  const nums: number[] = [];
+  for (const p of parts) {
+    const v = ipv4PartToInt(p);
+    if (v === null) return null;
+    nums.push(v);
+  }
+  if (nums.length === 1) {
+    return nums[0] <= 0xffffffff ? nums[0] >>> 0 : null;
+  }
+  if (nums.length === 2) {
+    if (nums[0] > 255 || nums[1] > 0xffffff) return null;
+    return (((nums[0] << 24) | nums[1]) >>> 0);
+  }
+  if (nums.length === 3) {
+    if (nums[0] > 255 || nums[1] > 255 || nums[2] > 0xffff) return null;
+    return (((nums[0] << 24) | (nums[1] << 16) | nums[2]) >>> 0);
+  }
+  if (nums.some((v) => v > 255)) return null;
+  return (((nums[0] << 24) | (nums[1] << 16) | (nums[2] << 8) | nums[3]) >>> 0);
+}
+
+// 32 位 IPv4 整数是否属于回环/私有/链路本地/组播/保留段。
+function isPrivateIPv4Int(n: number): boolean {
+  const a = (n >>> 24) & 0xff;
+  const b = (n >>> 16) & 0xff;
+  const c = (n >>> 8) & 0xff;
+  if (a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 0) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+  if (a === 198 && b === 51 && c === 100) return true;
+  if (a === 203 && b === 0 && c === 113) return true;
+  if (a >= 224 && a <= 239) return true; // 组播
+  if (a >= 240) return true; // 保留段
+  return false;
+}
+// 把 IPv6 字面展开成 8 段十六进制组（处理 :: 压缩），无效形状返回
+// null。Audit #17 LOW-1：SSRF 判定需要按展开后的段位判断是不是
+// IPv4 映射/兼容形式，不能只认 ::ffff: 前缀（未压缩的
+// 0:0:0:0:0:ffff:7f00:1 与兼容形式 ::7f00:1 都会漏网）。点分十进制
+// 尾部（::ffff:127.0.0.1）由调用方先行处理，不进这里。
+function expandIPv6Groups(v6: string): string[] | null {
+  const parts = v6.split('::');
+  if (parts.length > 2) return null;
+  const left = parts[0] ? parts[0].split(':') : [];
+  const right = parts.length === 2 ? (parts[1] ? parts[1].split(':') : []) : [];
+  const total = left.length + right.length;
+  if (parts.length === 1 && total !== 8) return null;
+  if (total > 8) return null;
+  const groups = [...left, ...Array<string>(8 - total).fill('0'), ...right];
+  if (groups.length !== 8) return null;
+  if (!groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups;
+}
 export function isPrivateOrLoopbackHost(host: string): boolean {
   const h = String(host || '').trim().toLowerCase();
   if (!h) return false;
@@ -63,6 +135,42 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
   const v6 = h.replace(/^\[(.*)\]$/, '$1');
   if (v6.includes(':')) {
     if (v6 === '::1' || v6 === '::') return true;
+    // IPv4 映射/兼容 IPv6：分两支判定（Audit #17 LOW-1 修正——第一版
+    // 只留展开分支，把 #16 的 ::ffff: 多段写法误放行了）。
+    // (a) ::ffff: 前缀：沿用 Audit #16 LOW-1 的保守口径——取最后 32 位
+    // 判定（最后两段作高低 16 位），前面的 0 段只是补位。注意
+    // ::ffff:0:7f00:0001 严格展开是 0:0:0:0:ffff:0:7f00:0001，
+    // 不在 ::ffff:0:0/96 映射范围里，但 #16 已定按最后 32 位拦截，
+    // 断言在位，不得收窄（可疑写法宁可多拦；正常邮件服务器不会用
+    // 这种地址）。
+    // (b) 其余写法：展开成 8 段后判定——前 5 段全 0 且第 6 段为 0
+    // （兼容 ::/96）或 0xffff（映射 ::ffff:0:0/96）时，尾部就是一个
+    // IPv4，按 IPv4 规则判定；前段非零（如 2001:db8::7f00:1）不得
+    // 按 IPv4 解释。
+    // 点分十进制尾部（::ffff:127.0.0.1）仍按旧口径直接取尾部判定。
+    if (v6.includes('.')) {
+      const n = ipv4LiteralToInt(v6.slice(v6.lastIndexOf(':') + 1));
+      if (n !== null) return isPrivateIPv4Int(n);
+      // 尾部不是合法 IPv4 字面 → 落到下方首段判定（无效字面不拦截）。
+    } else if (v6.startsWith('::ffff:')) {
+      const groups = v6.slice('::ffff:'.length).split(':').filter(Boolean);
+      if (groups.length >= 2 && groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
+        const n = ((parseInt(groups[groups.length - 2], 16) << 16) | parseInt(groups[groups.length - 1], 16)) >>> 0;
+        return isPrivateIPv4Int(n);
+      }
+      return false;
+    } else {
+      const groups = expandIPv6Groups(v6);
+      if (groups !== null) {
+        const embedded = groups.slice(0, 5).every((g) => parseInt(g, 16) === 0)
+          && (parseInt(groups[5], 16) === 0 || parseInt(groups[5], 16) === 0xffff);
+        if (embedded) {
+          const n = ((parseInt(groups[6], 16) << 16) | parseInt(groups[7], 16)) >>> 0;
+          return isPrivateIPv4Int(n);
+        }
+      }
+      // 展开失败（无效字面）或不是 IPv4 嵌入形式 → 落到下方首段判定。
+    }
     const head = v6.split(':')[0];
     const first = parseInt(head, 16);
     if (Number.isNaN(first)) return false;
@@ -71,22 +179,58 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
     if ((first & 0xff00) === 0xff00) return true; // ff00::/8 组播
     return false;
   }
-  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (!m) return false; // 不是字面 IPv4（主机名）→ 不拦截
-  const [a, b] = [Number(m[1]), Number(m[2])];
-  if (a === 10) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 127) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 0) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
-  if (a === 192 && b === 0 && (Number(m[3]) === 0 || Number(m[3]) === 2)) return true;
-  if (a === 198 && b === 51 && Number(m[3]) === 100) return true;
-  if (a === 203 && b === 0 && Number(m[3]) === 113) return true;
-  if (a >= 224 && a <= 239) return true; // 组播
-  if (a >= 240) return true; // 保留段
+  // IPv4 字面：标准点分十进制与非常规写法（单数字/0x/0 前缀）一律
+  // 先归一化成 32 位整数再判定；主机名（含字母的段）返回 null，不拦截。
+  const n = ipv4LiteralToInt(h);
+  if (n === null) return false; // 不是字面 IPv4（主机名）→ 不拦截
+  return isPrivateIPv4Int(n);
+}
+
+// Audit #12 L4：主机名解析结果校验——任一主机解析出的地址是私有/
+// 回环地址即返回 true。解析失败（NXDOMAIN、超时等）返回 false、
+// 不提前拦截，让调用方的建连报错（信息更准确）；字面量主机直接调
+// isPrivateOrLoopbackHost 也能判定，这里统一走同一口径。
+export async function hostsResolveToPrivate(hosts: string[]): Promise<boolean> {
+  for (const host of hosts) {
+    let addrs: dns.LookupAddress[];
+    try {
+      addrs = await dns.promises.lookup(String(host || '').trim(), { all: true });
+    } catch { continue; }
+    for (const a of addrs) {
+      if (isPrivateOrLoopbackHost(a.address)) return true;
+    }
+  }
   return false;
+}
+
+// Audit #13 L4：同步建连前的解析校验（缓存版）——审计 #12 L4 的校验
+// 只在加账号/改服务器/导入（testConnectivity）时跑，引擎同步用的已存
+// 账号直连，不再校验解析结果；主机 DNS 事后被改指私有地址（DNS 重绑定）
+// 时同步会照连。改在引擎每次新建 IMAP 连接前都校验一次：通过的主机
+// 缓存 5 分钟（同步周期内不再重复查 DNS，延迟不上升）；失败的不缓存，
+// 下次建连重查（失败路径本来就走不通，不怕多一次 lookup）。
+// 字面量私有地址每次都拦（判定不花 DNS，本来就便宜）。ALLOW_PRIVATE_
+// MAIL_HOSTS=1 时同样放行（仅 verify-all 本地测试用）。
+// 残留：缓存窗口内 DNS 被改指私有地址仍会放行一次（最长 5 分钟），以及
+// lookup 与建连之间的 TOCTOU——单用户系统、只有站长本人能加账号，可接受。
+const _safeHostCache = new Map<string, number>();
+const SAFE_HOST_CACHE_TTL_MS = 5 * 60 * 1000;
+export async function assertHostsSafe(hosts: string[]): Promise<void> {
+  if (ALLOW_PRIVATE_MAIL_HOSTS) return;
+  const now = Date.now();
+  const toCheck: string[] = [];
+  for (const h of hosts) {
+    const host = String(h || '').trim();
+    if (!host) continue;
+    if (isPrivateOrLoopbackHost(host)) throw new Error('连接失败（服务器地址不合法）');
+    const at = _safeHostCache.get(host);
+    if (at != null && now - at < SAFE_HOST_CACHE_TTL_MS) continue;
+    toCheck.push(host);
+  }
+  if (toCheck.length && await hostsResolveToPrivate(toCheck)) {
+    throw new Error('连接失败（服务器地址不合法）');
+  }
+  for (const h of toCheck) _safeHostCache.set(h, now);
 }
 
 export function makeImapClient(
@@ -120,6 +264,11 @@ async function testImap(
   logger?: unknown,
 ): Promise<{ ok: boolean; serverInfo: unknown }> {
   const client = makeImapClient(account, password, { logger });
+  // Audit #18 LOW-1 纵深防御：短命测试连接也没有 error 监听；connect→
+  // logout 窗口极小，但对方 RST 仍会在无监听时抛错打死进程。挂一个空
+  // 兜底（连接失败本身由 await connect() 的 rejection 报告，不记日志，
+  // 免得正常测连通失败也刷一条 error 日志）。
+  client.on('error', () => {});
   try {
     await client.connect();
     // connect() runs startSession(): CAPABILITY, ID, LOGIN, ID again.
@@ -222,6 +371,16 @@ export async function testConnectivity(
   // 见 config.ts；生产绝不设）。
   if (!ALLOW_PRIVATE_MAIL_HOSTS
     && (isPrivateOrLoopbackHost(account.imapHost) || isPrivateOrLoopbackHost(account.smtpHost))) {
+    return { imapOk: false, smtpOk: false, error: '连接失败（服务器地址不合法）' };
+  }
+  // Audit #12 L4：字面量检查拦不住解析到私有地址的主机名（DNS
+  // rebinding / 攻击者控制的解析）。建连前用 dns.lookup 校验解析结果——
+  // 任一解析地址是私有/回环地址即拒绝，文案与字面量路径统一。查不到
+  // （NXDOMAIN 等）时不提前失败，让后续建连报错（信息更准确）。
+  // 残留：lookup 与建连之间仍有竞态窗口（TOCTOU），单用户系统、只有
+  // 站长本人能加账号，该残留可接受；检查范围只到解析结果，不做连接时
+  // 复核。ALLOW_PRIVATE_MAIL_HOSTS=1 时同样放行。
+  if (!ALLOW_PRIVATE_MAIL_HOSTS && await hostsResolveToPrivate([account.imapHost, account.smtpHost])) {
     return { imapOk: false, smtpOk: false, error: '连接失败（服务器地址不合法）' };
   }
   const budgetSec = Math.max(1, Math.round(timeoutMs / 1000));

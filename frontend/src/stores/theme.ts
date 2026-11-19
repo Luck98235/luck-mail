@@ -29,6 +29,18 @@ export const useThemeStore = defineStore('theme', () => {
     apply(saved || document.body.getAttribute('data-theme') || 'blue')
   }
 
+  // 审计 #11 M2：跨标签同步主题——另一标签页换主题时本页也跟上；只改内存态
+  // 与 body 属性，不写回 localStorage（防乒乓；storage 事件只在其他标签页
+  // 触发，本页写不触发自己的事件）。非法值回落蓝色。
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('storage', (e: StorageEvent) => {
+      if (e.key !== THEME_KEY || !e.newValue) return
+      const name = THEMES.some((t) => t.key === e.newValue) ? e.newValue : 'blue'
+      current.value = name
+      document.body.setAttribute('data-theme', name)
+    })
+  }
+
   // ---- 配色面板（单例，由 MailView 渲染；各处调色板按钮调 togglePanel（内部再调 openPanel）） ----
   const panelOpen = ref<boolean>(false)
   const panelPos = ref<{ left: number; top: number }>({ left: 0, top: 0 })

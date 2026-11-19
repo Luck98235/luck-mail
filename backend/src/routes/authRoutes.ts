@@ -82,18 +82,23 @@ export function authRoutes(): express.Router {
     if (!expectedToken) {
       return res.status(403).json({ ok: false, error: '引导凭证缺失，请查看服务器启动日志或 DATA_DIR/.setup-token' });
     }
+    // Audit #12 L5：锁检查放 token 校验之前——旧版先验 token 再查锁，
+    // token 猜测路径本身不被锁限制（token 是 192 位随机值、实际不可
+    // 猜测，失败仍计数；调换顺序只为锁语义正确）。
+    const remaining = ipLockRemaining(req, 'setup');
+    if (remaining > 0) {
+      return res.status(429).json({ ok: false, error: '账号已锁定，请稍后再试', retryAfter: remaining });
+    }
     const provided = typeof setupToken === 'string' ? setupToken.trim() : '';
     if (!provided || provided.length !== expectedToken.length
       || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expectedToken))) {
       ipFail(req, 'setup');
       return res.status(403).json({ ok: false, error: '引导凭证不正确' });
     }
-    const remaining = ipLockRemaining(req, 'setup');
-    if (remaining > 0) {
-      return res.status(429).json({ ok: false, error: '账号已锁定，请稍后再试', retryAfter: remaining });
-    }
+    // Audit #14 LOW-2：表单校验失败不计入 IP 锁定——用户名/密码格式
+    // 不对是用户自己输错，不应 5 次就锁 IP 15 分钟（首次建账号本是
+    // 一次性流程）；只有上面的 token 猜错才调 ipFail 计数。
     const fail = (msg: string, code = 400): Response => {
-      ipFail(req, 'setup');
       return res.status(code).json({ ok: false, error: msg });
     };
     if (!username || typeof username !== 'string' || !username.trim()) return fail('用户名必填');
@@ -289,9 +294,27 @@ export function authRoutes(): express.Router {
     if (name.length > MAX_USERNAME_LEN) return res.status(400).json({ ok: false, error: '用户名最多 64 位' });
     const user = db.prepare('SELECT * FROM users WHERE id=?').get(req.user?.id) as UserRow | undefined;
     if (!user) return res.status(401).json({ ok: false, error: '当前密码不正确' });
+    // Audit #11 L6：改用户名失败也计数/锁定（5 次锁 15 分钟，与改密码
+    // 同款 users 行计数器）——旧版验密码失败直接 401、不计数，会话被盗
+    // 后可凭此接口无限次猜密码（把它当无锁定的密码 oracle）。
+    const lockedSec = userLocked(user);
+    if (lockedSec > 0) {
+      return res.status(429).json({ ok: false, error: '账号已锁定，请稍后再试', retryAfter: lockedSec });
+    }
+    if (user.locked_until && parseSqliteUtc(user.locked_until) <= new Date()) {
+      userReset(db, user.id);
+      user.failed_attempts = 0;
+      user.locked_until = null;
+    }
     if (typeof current !== 'string' || !(await verifyPassword(current, user.salt, user.password_hash))) {
+      const lockSec = userFail(db, user);
+      if (lockSec > 0) {
+        return res.status(429).json({ ok: false, error: '账号已锁定，请稍后再试', retryAfter: lockSec });
+      }
       return res.status(401).json({ ok: false, error: '当前密码不正确' });
     }
+    // 验对密码即证明持有人知道密码，清掉残留的失败计数（与登录成功同款）。
+    db.prepare('UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?').run(user.id);
     const taken = db.prepare('SELECT id FROM users WHERE username=? COLLATE NOCASE AND id != ?')
       .get(name, req.user?.id) as { id: number } | undefined;
     if (taken) return res.status(409).json({ ok: false, error: '该用户名已被使用' });

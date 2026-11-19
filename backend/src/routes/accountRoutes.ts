@@ -386,13 +386,24 @@ export function accountRoutes(ctx: Ctx): express.Router {
         continue;
       }
       const sortOrder = (db.prepare('SELECT COALESCE(MAX(sort_order),-1)+1 v FROM accounts').get() as { v: number }).v;
-      const info = db.prepare(
-        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port,
-          imap_secure, smtp_host, smtp_port, smtp_secure, sort_order, status)
-         VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
-      ).run(email, displayName, encryptSecret(password, masterKey),
-        account.imapHost, account.imapPort, account.imapSecure,
-        account.smtpHost, account.smtpPort, account.smtpSecure, sortOrder);
+      // Audit #23 LOW-1：同款 UNIQUE 兜底——导入进行中另一路加了同一邮箱
+      // 时，撞唯一约束的行进 failed、批次继续，不让整批 500。
+      let info: { lastInsertRowid: number | bigint };
+      try {
+        info = db.prepare(
+          `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port,
+            imap_secure, smtp_host, smtp_port, smtp_secure, sort_order, status)
+           VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+        ).run(email, displayName, encryptSecret(password, masterKey),
+          account.imapHost, account.imapPort, account.imapSecure,
+          account.smtpHost, account.smtpPort, account.smtpSecure, sortOrder);
+      } catch (e) {
+        if (/UNIQUE constraint/i.test(String((e as Error)?.message || e))) {
+          pushFailed(rnum, email, '该邮箱已添加过');
+          continue;
+        }
+        throw e;
+      }
       const newRow = db.prepare('SELECT * FROM accounts WHERE id=?').get(Number(info.lastInsertRowid)) as AccountRow;
       engine.startAccount(newRow.id);
       emit('account', { action: 'added', account: publicAccount(newRow) });
@@ -417,6 +428,17 @@ export function accountRoutes(ctx: Ctx): express.Router {
     if (!password || typeof password !== 'string') {
       return res.status(400).json({ ok: false, error: '密码/授权码必填' });
     }
+    // 添加邮箱必填校验（用户 2026-11-19 要求）：接收/发送服务器为必填项。
+    // 注意：旧版这里不校验缺失——validateServerFields 只在字段传了才查
+    // 非空，缺字段时下面用 preset 回落补齐，请求能一路走到连通测试。
+    // 现在缺失或空字符串直接 400，不再靠预设回落兜底（PUT 编辑不受影响，
+    // 编辑是部分更新、缺字段表示保持原值，仍走 validateServerFields）。
+    if (typeof b.imapHost !== 'string' || !b.imapHost.trim()) {
+      return res.status(400).json({ ok: false, error: '接收服务器（IMAP）必填' });
+    }
+    if (typeof b.smtpHost !== 'string' || !b.smtpHost.trim()) {
+      return res.status(400).json({ ok: false, error: '发送服务器（SMTP）必填' });
+    }
     const err = validateServerFields(b as ServerFields);
     if (err) return res.status(400).json({ ok: false, error: err });
     if (db.prepare('SELECT id FROM accounts WHERE email=?').get(email)) {
@@ -428,8 +450,11 @@ export function accountRoutes(ctx: Ctx): express.Router {
     if (accountCount >= MAX_ACCOUNTS) {
       return res.status(400).json({ ok: false, error: `邮箱数量已达上限（${MAX_ACCOUNTS} 个）` });
     }
-    const preset = resolvePreset(email);
-    if (!preset) return res.status(400).json({ ok: false, error: '邮箱地址格式不正确' });
+    // Audit #12 L6：删死代码——旧版 `if (!preset)` 走不到：上面邮箱正则
+    // 已拦住无 @/无域名的地址，resolvePreset 对通过正则的地址永不返回
+    // null（presets.ts：未知域名回落 imap./smtp.<domain>）。非空断言
+    // 只为过类型检查，运行时恒成立。
+    const preset = resolvePreset(email)!;
     const account: ImapAccount = {
       email,
       imapHost: (b.imapHost as string) || preset.imapHost,
@@ -445,13 +470,23 @@ export function accountRoutes(ctx: Ctx): express.Router {
       return res.status(400).json({ ok: false, error: test.error || '连接测试失败' });
     }
     const sortOrder = (db.prepare('SELECT COALESCE(MAX(sort_order),-1)+1 v FROM accounts').get() as { v: number }).v;
-    const info = db.prepare(
-      `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port,
-        imap_secure, smtp_host, smtp_port, smtp_secure, sort_order, status)
-       VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
-    ).run(email, (b.displayName as string) || '', encryptSecret(password as string, masterKey),
-      account.imapHost, account.imapPort, account.imapSecure,
-      account.smtpHost, account.smtpPort, account.smtpSecure, sortOrder);
+    // Audit #23 LOW-1：INSERT 包 try/catch——并发重复提交时两路都通过
+    // 前置查重，第二路撞 email 唯一约束；此时返回 409 而不是 500。
+    let info: { lastInsertRowid: number | bigint };
+    try {
+      info = db.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port,
+          imap_secure, smtp_host, smtp_port, smtp_secure, sort_order, status)
+         VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run(email, (b.displayName as string) || '', encryptSecret(password as string, masterKey),
+        account.imapHost, account.imapPort, account.imapSecure,
+        account.smtpHost, account.smtpPort, account.smtpSecure, sortOrder);
+    } catch (e) {
+      if (/UNIQUE constraint/i.test(String((e as Error)?.message || e))) {
+        return res.status(409).json({ ok: false, error: '该邮箱已添加过' });
+      }
+      throw e;
+    }
     const row = db.prepare('SELECT * FROM accounts WHERE id=?').get(Number(info.lastInsertRowid)) as AccountRow;
     engine.startAccount(row.id);
     emit('account', { action: 'added', account: publicAccount(row) });

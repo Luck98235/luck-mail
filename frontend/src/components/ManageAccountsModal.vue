@@ -188,15 +188,28 @@ function rebuildRowsPreservingEdits(excludeId: number | null = null): void {
   rows.value = merged
 }
 // 表格里是否还有未保存的改动（备注名/启用/删除标记/顺序任一与服务器不一致）
+// 审计 #12 L3：顺序比较须按账号 id 序列比——旧版用压缩序号 0..n-1 与
+// orig.sortOrder 比，但后端删账号不压缩 sort_order（留空洞），删过账号
+// 后每次打开弹窗、什么都不改、点 X/取消都会误报“改动尚未保存”。
+// 现在：当前显示顺序（去掉已删标记的行）与服务器按 sortOrder 排好的
+// 顺序（同样去掉已删标记的行）逐项比 id，顺序一致即无改动。
 function hasUnsavedEdits(): boolean {
   if (rows.value.some((r) => r._deleted)) return true
-  let order = 0
   for (const row of rows.value) {
     if (row._deleted) continue
     const orig = mail.accounts.find((a) => a.id === row.id)
     if (!orig) return true
-    if ((row.displayName || '') !== (orig.displayName || '') || row.enabled !== orig.enabled || orig.sortOrder !== order) return true
-    order++
+    if ((row.displayName || '') !== (orig.displayName || '') || row.enabled !== orig.enabled) return true
+  }
+  const currentOrder = rows.value.filter((r) => !r._deleted).map((r) => r.id)
+  const serverOrder = mail.accounts
+    .filter((a) => !rows.value.some((r) => r.id === a.id && r._deleted))
+    .slice()
+    .sort((x, y) => (x.sortOrder ?? 0) - (y.sortOrder ?? 0))
+    .map((a) => a.id)
+  if (currentOrder.length !== serverOrder.length) return true
+  for (let i = 0; i < currentOrder.length; i++) {
+    if (currentOrder[i] !== serverOrder[i]) return true
   }
   return false
 }
@@ -205,8 +218,15 @@ async function onAccountSaved(): Promise<void> {
   addOpen.value = false
   editingRow.value = null
   await mail.loadAccounts()
-  rebuildRowsPreservingEdits(savedId)
-  if (hasUnsavedEdits()) mail.showToast('邮箱管理里的改动尚未保存，点“确定”保存')
+  // 审计 #11 L19：该行备注名在表格里被改过（与刚加载的服务器值不同）时保留
+  // 表格值、不被服务器值覆盖（rebuild 时不排除该行），并提示一次；否则按
+  // 旧逻辑排除该行（取服务器刚保存的值）。
+  const tableChanged = savedId != null
+    && rows.value.some((r) => r.id === savedId && (r.displayName || '') !== (mail.accounts.find((a) => a.id === savedId)?.displayName || ''))
+  rebuildRowsPreservingEdits(tableChanged ? null : savedId)
+  if (tableChanged && hasUnsavedEdits()) mail.showToast('该邮箱的备注名以表格里的改动为准，已保留；邮箱管理里的改动尚未保存，点“确定”保存')
+  else if (tableChanged) mail.showToast('该邮箱的备注名以表格里的改动为准，已保留')
+  else if (hasUnsavedEdits()) mail.showToast('邮箱管理里的改动尚未保存，点“确定”保存')
 }
 
 async function confirm(): Promise<void> {

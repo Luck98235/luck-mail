@@ -87,27 +87,49 @@ export interface AttachmentPart {
 // Walk a bodyStructure tree (imapflow) depth-first (document order) and
 // collect attachment parts with their IMAP part numbers ("2", "1.2", ...),
 // so a >10 MB attachment can later be streamed live from IMAP by part.
+//
+// 收集口径必须与 mailparser 的 isAttachment 完全一致（mailparser
+// lib/mail-parser.js createNode）：textTypes = ['text/plain',
+// 'text/html', 'message/delivery-status']；isAttachment = 类型不在
+// textTypes 里，或 disposition（归一化后）不是 'inline'——其中无
+// disposition 的非文本部件归一化成 'attachment'，未知 disposition
+// 值也归一化成 'attachment'，无 disposition 的文本部件归一化成
+// 'inline'。旧版只收 disposition attachment/inline 或带文件名的叶部
+// 件，mailparser 却对任何非文本部件都发 attachment 事件——一封带
+// Content-Type: application/octet-stream（无 disposition、无 name）
+// 部件的信，解析侧附件数组里有它、BODYSTRUCTURE 侧没有它，
+// matchAttachmentParts 纯按索引配对，后续附件的 part 号整体错位一位
+// （Audit #16 LOW-2）。按 mailparser 同款口径：非文本叶部件全收
+// （无文件名时记 null），文本叶部件只在 disposition 为 attachment
+// （或未知值）时收；disposition inline 的文本部件是正文，不收。
+const MAILPARSER_TEXT_TYPES = new Set(['text/plain', 'text/html', 'message/delivery-status']);
 export function collectAttachmentParts(bodyStructure: MessageStructureObject | null | undefined): AttachmentPart[] {
   const out: AttachmentPart[] = [];
-  const walk = (node: MessageStructureObject | undefined | null): void => {
+  const walk = (node: MessageStructureObject | undefined | null, isRoot = false): void => {
     if (!node) return;
     if (node.childNodes) {
       for (const c of node.childNodes) walk(c);
       return;
     }
-    const disp = (node.disposition || '').toLowerCase();
+    const type = (node.type || '').toLowerCase();
+    const rawDisp = (node.disposition || '').toLowerCase();
+    // mailparser 同款归一化：未知 disposition 值 → 'attachment'。
+    const disp = rawDisp && rawDisp !== 'attachment' && rawDisp !== 'inline' ? 'attachment' : rawDisp;
     const params = { ...(node.parameters || {}), ...(node.dispositionParameters || {}) } as Record<string, string>;
     const filename = params.filename || params.name || null;
-    if (disp === 'attachment' || disp === 'inline' || filename) {
+    if (!MAILPARSER_TEXT_TYPES.has(type) || disp === 'attachment') {
       out.push({
-        part: node.part || null,
+        // Audit #17 LOW-2：单部件邮件的 BODYSTRUCTURE 根节点没有 part 号；
+        // RFC 3501 里单部件正文即 part 1，根节点记 '1' 而不是 null，
+        // 否则附件列得出、下载时 !att.part 直接 404。
+        part: node.part || (isRoot ? '1' : null),
         filename,
         size: node.size || 0,
         contentType: node.type || 'application/octet-stream',
       });
     }
   };
-  walk(bodyStructure);
+  walk(bodyStructure, true);
   return out;
 }
 
@@ -143,6 +165,10 @@ export interface ParsedMessage {
     // 存 messages.references，GET /api/messages/:id 返回给前端做
     // 回复/转发 threading 用。
     references: string | null;
+    // Audit #11 threading：原信 Reply-To 头（单个地址字符串，无则 null），
+    // 与 references 同款：解析后存 messages.reply_to，详情接口返回，
+    // 前端回复时优先发往 Reply-To。
+    replyTo: string | null;
     subject: string;
     fromAddr: string;
     fromName: string;

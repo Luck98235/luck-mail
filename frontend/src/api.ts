@@ -116,8 +116,8 @@ export interface MessagesResponse { ok: boolean; messages: MessageEnvelope[]; to
 export const api = {
   // 认证
   authStatus: () => request<AuthStatus>('/api/auth/status'),
-  setup: (username: string, password: string, confirm: string) =>
-    request<{ ok: boolean }>('/api/auth/setup', { method: 'POST', body: { username, password, confirm } }),
+  setup: (username: string, password: string, confirm: string, setupToken?: string) =>
+    request<{ ok: boolean }>('/api/auth/setup', { method: 'POST', body: { username, password, confirm, ...(setupToken ? { setupToken } : {}) } }),
   login: (username: string, password: string, rememberMe?: boolean) =>
     request<{ ok: boolean; username: string }>('/api/auth/login', { method: 'POST', body: { username, password, rememberMe } }),
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
@@ -155,28 +155,28 @@ export const api = {
   folders: (accountId: number) => request<{ ok: boolean; folders: Folder[] }>(`/api/accounts/${accountId}/folders`),
 
   // 邮件
-  // 搜索是全局的（审计 #10 M3）：带 q 时不发 view/accountId/folderId，
-  // 后端按设计忽略视图过滤、搜全站邮件；不带 q 时按视图取列表。
+  // 搜索口径（审计 #17 MED-1 定夺）：带 q 时也照常发 view/accountId/folderId，
+  // 后端按视图限定搜索范围——收件箱/未读视图保持全局（审计 #10 M3 的本意：
+  // “所有收件箱”里搜要搜全站），草稿/已发送/已删除/文件夹视图按文件夹限定
+  //（否则草稿视图会搜出收件箱的信、还当草稿行显示，删它等于删真信）。
+  // 不带 q 时按视图取列表。
   messages: ({ view, accountId, folderId, q, limit = 50, offset = 0, signal }: {
     view?: string; accountId?: number | null; folderId?: number | null; q?: string; limit?: number; offset?: number; signal?: AbortSignal
   } = {}) => {
     const p = new URLSearchParams()
-    if (q) {
-      p.set('q', q)
-    } else {
-      if (view) p.set('view', view)
-      if (accountId) p.set('accountId', String(accountId))
-      if (folderId) p.set('folderId', String(folderId))
-    }
+    if (q) p.set('q', q)
+    if (view) p.set('view', view)
+    if (accountId) p.set('accountId', String(accountId))
+    if (folderId) p.set('folderId', String(folderId))
     p.set('limit', String(limit))
     p.set('offset', String(offset))
     return request<MessagesResponse>(`/api/messages?${p.toString()}`, signal ? { signal } : undefined)
   },
-  message: (id: number | string) => request<{ ok: boolean; message: MessageDetail }>(`/api/messages/${id}`),
+  message: (id: number | string) => request<{ ok: boolean; message: MessageDetail }>(`/api/messages/${encodeURIComponent(String(id))}`),
   setRead: (id: number | string, read: boolean) =>
-    request<{ ok: boolean }>(`/api/messages/${id}/read`, { method: 'POST', body: { read } }),
+    request<{ ok: boolean }>(`/api/messages/${encodeURIComponent(String(id))}/read`, { method: 'POST', body: { read } }),
   moveMessage: (id: number | string, folderId: number) =>
-    request<{ ok: boolean }>(`/api/messages/${id}/move`, { method: 'POST', body: { folderId } }),
+    request<{ ok: boolean }>(`/api/messages/${encodeURIComponent(String(id))}/move`, { method: 'POST', body: { folderId } }),
   // 单封删除：彻底删除与否以后端实际文件夹为准（folder.type==='trash'），
   // 客户端 permanent 查询参数已废弃（后端已忽略），不再发（F12c）。
   // 删信幂等键（审计 #6）：每次删除动作生成一个 key 传给后端（body 的
@@ -185,7 +185,7 @@ export const api = {
   // “移到已删除”重试后会变成永久删除。key 由调用方（store）生成并保管，
   // 这里只负责透传。
   deleteMessage: (id: number | string, idempotencyKey?: string) =>
-    request<{ ok: boolean; duplicate?: boolean }>(`/api/messages/${id}`, { method: 'DELETE', body: idempotencyKey ? { idempotencyKey } : undefined }),
+    request<{ ok: boolean; duplicate?: boolean }>(`/api/messages/${encodeURIComponent(String(id))}`, { method: 'DELETE', body: idempotencyKey ? { idempotencyKey } : undefined }),
   // 批量删除：首次提交异步返回 { ok, taskId, status:'running' }；同一 key 重复提交
   // 返回第一次任务的已有状态（running/finished/unknown，见 messageRoutes 幂等注释），
   // 进度走 getDeleteStatus；请求体不带 permanent（彻底与否以后端实际
@@ -203,7 +203,7 @@ export const api = {
     request<{ ok: boolean; running: boolean; total: number; deleted: number; startedAt: number; view: { kind: string; accountId: number | null; folderId: number | null } | null; taskId?: string; failed?: Array<{ id: number; error: string }>; finishedAt?: string }>(taskId ? `/api/messages/delete-status?taskId=${encodeURIComponent(taskId)}` : '/api/messages/delete-status'),
   // 正文翻译：英文 → 中文（后端调免费翻译接口），返回译文纯文本。
   translateMessage: (id: number | string) =>
-    request<{ ok: boolean; translated: string; alreadyChinese: boolean }>(`/api/messages/${id}/translate`, { method: 'POST' }),
+    request<{ ok: boolean; translated: string; alreadyChinese: boolean }>(`/api/messages/${encodeURIComponent(String(id))}/translate`, { method: 'POST' }),
   // 发信返回：id 是本地已发送记录 id（有则前端据此打开）；
   // rejected 是被收件方服务器拒收的收件人；warning 表示已发出但未存入已发送文件夹。
   // 超时 120 秒：后端一次发信可能耗时 50 秒以上（SMTP 超时 15+15+30 秒 +
@@ -214,10 +214,19 @@ export const api = {
   sendMessageJson: (payload: Record<string, unknown>) =>
     request<{ ok: boolean; id: number; messageId: string; rejected?: string[]; warning?: string }>('/api/messages/send', { method: 'POST', body: payload, timeoutMs: 120000, timeoutMessage: '发送超时，邮件可能已发出，请先到已发送查看再重发' }),
   // 草稿（服务端，2026-11-18 用户定夺：草稿进数据库，不再写 localStorage）
-  listDrafts: () => request<{ ok: boolean; drafts: Draft[] }>('/api/drafts'),
-  createDraft: (payload: { accountId: number | null; to: string; subject: string; text: string; idempotencyKey?: string }) =>
+  // 审计 #11 H1：创建/更新时可带 inReplyTo/references/cc（threading 与抄送随草稿持久化）。
+  listDrafts: (params?: { limit?: number; offset?: number }) => {
+    // 审计 #13 MED-2：后端 /api/drafts 默认 limit 50，超 50 封的旧草稿
+    // 在界面上打不开。调用方按 limit=200 分段拉到 total。
+    const p = new URLSearchParams()
+    if (params?.limit !== undefined) p.set('limit', String(params.limit))
+    if (params?.offset !== undefined) p.set('offset', String(params.offset))
+    const qs = p.toString()
+    return request<{ ok: boolean; drafts: Draft[]; total?: number }>(`/api/drafts${qs ? `?${qs}` : ''}`)
+  },
+  createDraft: (payload: { accountId: number | null; to: string; subject: string; text: string; idempotencyKey?: string; inReplyTo?: string; references?: string; cc?: string[] }) =>
     request<{ ok: boolean; draft: Draft }>('/api/drafts', { method: 'POST', body: payload }),
-  updateDraft: (id: number | string, payload: { accountId?: number | null; to?: string; subject?: string; text?: string }) =>
+  updateDraft: (id: number | string, payload: { accountId?: number | null; to?: string; subject?: string; text?: string; inReplyTo?: string; references?: string; cc?: string[] }) =>
     request<{ ok: boolean; draft: Draft }>(`/api/drafts/${encodeURIComponent(String(id))}`, { method: 'PUT', body: payload }),
   deleteDraft: (id: number | string) =>
     request<{ ok: boolean }>(`/api/drafts/${encodeURIComponent(String(id))}`, { method: 'DELETE' }),
@@ -226,7 +235,11 @@ export const api = {
   settings: () => request<{ ok: boolean; settings: Settings }>('/api/settings'),
   updateSettings: (payload: Settings) => request<{ ok: boolean }>('/api/settings', { method: 'PUT', body: payload }),
 
-  // 备份到本地：下载 tar.gz（.key + data/），文件名从 Content-Disposition 取。
+  // 附件下载：走与备份/导出同一条 blob 下载路径（401 时跳登录，见
+  // downloadBlobFile；审计 #15 LOW-3：以前 ReadingPane 用原生 fetch，
+  // 会话过期只 toast 401、不跳登录）。
+  downloadAttachment: (messageId: number | string, attId: number | string, defaultFilename: string) =>
+    downloadBlobFile(`/api/messages/${encodeURIComponent(String(messageId))}/attachments/${encodeURIComponent(String(attId))}`, '附件下载', defaultFilename),
   // 文件下载走 blob，不走 request()（那是 JSON 的）。
   // POST：后端只接受 POST（防跨站顶层导航 CSRF 触发下载，审计 #5 安全轨 S1）。
   // 超时 120 秒（审计 #10 安全 L6）：备份打包耗时随数据量增长，30 秒不够。

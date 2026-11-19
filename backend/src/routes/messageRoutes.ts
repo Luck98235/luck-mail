@@ -10,10 +10,11 @@ import {
 } from '../db.js';
 import type { MessageRow, AttachmentRow } from '../db.js';
 import { envelopeOf } from '../engine.js';
-import type { SyncEngine } from '../engine.js';
+import type { SyncEngine, SentFingerprint } from '../engine.js';
 import { sendMail, buildRawMail } from '../smtpUtil.js';
 import { smtpResponseCode, isTransientSmtpError, isPermanentSmtpError, isAuthError } from '../imapUtil.js';
-import { claimSendKey, completeSendKey, releaseSendKey, newPlannedMessageId } from '../idempotency.js';
+import { claimSendKey, completeSendKey, releaseSendKey, newPlannedMessageId, findSendKey } from '../idempotency.js';
+import { parseSqliteUtcMs } from '../auth.js';
 import { decryptSecret } from '../cryptoUtil.js';
 import { emit } from '../hub.js';
 import { log } from '../config.js';
@@ -111,6 +112,17 @@ function isValidEmail(addr: string): boolean {
   return /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(addr);
 }
 
+// 发信地址解析（用户 2026-11-19 要求）：字符串或数组都按半角/全角逗号拆
+//（中文输入习惯下全角逗号常见），逐项 trim、去空；格式判定仍走
+// isValidEmail。数组元素里也可能含逗号（如前端 FormData 直传整串），
+// 所以数组分支同样逐项再拆。
+function splitAddrList(value: string | string[] | undefined): string[] {
+  const parts = Array.isArray(value)
+    ? value.flatMap((v) => String(v ?? '').split(/[,，]/))
+    : String(value || '').split(/[,，]/);
+  return parts.map((s) => s.trim()).filter(Boolean);
+}
+
 // multer/busboy 把 multipart 文件名按 Latin-1 解码，中文等非 ASCII 文件名会变成乱码
 // （UTF-8 字节被当成 Latin-1 读，如“门槛”变成“é—¨æ§”）。把 Latin-1 再转回 UTF-8
 // 即可还原；用往返校验兜底：只有“转回 UTF-8 再按 Latin-1 读回去等于原值”时才采用，
@@ -194,6 +206,13 @@ function listMessages(req: Request, res: Response): void {
     }
     hits.push(nowMs);
     searchThrottle.set(ip, hits);
+    // Audit #11 L4：searchThrottle 剪枝（复用 rateLimit 的 >1000 模式）——
+    // 旧版只增不删，长期运行的进程里不同 IP 的时间戳数组只增不减。
+    if (searchThrottle.size > 1000) {
+      for (const [k, v] of searchThrottle) {
+        if (!v.length || nowMs - v[v.length - 1] >= 60_000) searchThrottle.delete(k);
+      }
+    }
     const cacheKey = JSON.stringify([q, view, accountId, folderId, lim, off]);
     const cached = searchDedupCache.get(cacheKey);
     if (cached && nowMs - cached.at < 500) {
@@ -202,16 +221,34 @@ function listMessages(req: Request, res: Response): void {
     }
     const sendSearch = (body: Record<string, unknown>): void => {
       searchDedupCache.set(cacheKey, { at: Date.now(), body });
+      // Audit #11 L4：searchDedupCache 加 TTL 清理——旧版只增不删，每条
+      // 还存一份完整响应体。写时删掉超过 5 秒的旧条目（去重窗口只有
+      // 500ms，5 秒后绝无命中价值）；仍超 1000 条时按插入顺序继续删旧条目。
+      for (const [k, v] of searchDedupCache) {
+        if (Date.now() - v.at >= 5000) searchDedupCache.delete(k);
+      }
+      while (searchDedupCache.size > 1000) {
+        const oldest = searchDedupCache.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        searchDedupCache.delete(oldest);
+      }
       res.json(body);
     };
-    // 搜索默认全局：不按当前视图过滤。以前搜只在当前视图里找，
-    // 150/209 封信在“其他文件夹”（如广告邮件）里，在“所有收件箱”里搜
-    // 永远搜不到，用户会以为搜索坏了。搜到后结果里带 folder_path，
-    // 用户能看到每封信在哪个文件夹。
-    // searchMessageIds 已按相关度排好序：直接按此顺序分页、展示，不再按时间重排。
+    // Audit #17 MED-1：搜索按视图限定——收件箱/未读视图保持全局
+    // （审计 #10 定：以前搜只在当前视图里找，150/209 封信在“其他文件
+    // 夹”里，在“所有收件箱”里搜永远搜不到）；草稿/已发送/已删除/
+    // 文件夹视图按文件夹限定。以前 q 分支完全忽略 viewFilter，草稿
+    // 视图的“IMAP 命中”里混进收件箱的信、total 虚高，用户在草稿视图
+    // 删一封搜出的“草稿”实际删的是收件箱真信。复用 viewFilter 已有
+    // 的 where/params 与搜索 id 做交集，不另造过滤逻辑；搜到后结果里
+    // 带 folder_path，用户能看到每封信在哪个文件夹。
+    // searchMessageIds 已按相关度排好序：交集后仍按此顺序分页、展示，不再按时间重排。
     // Audit #9 L5：命中达 2000 时 searchMessageIds 截断并置 truncated，
-    // 这里原样透传；total 仍是本次返回的 id 列表长度（不悄悄改语义），
-    // 前端凭 truncated:true 提示“仅显示前 2000 条”。
+    // 这里原样透传；total 仍是本次返回的 id 列表长度（不悄悄改语义）。
+    // Audit #18 D1：truncated 是全局 FTS 候选集（2000 封顶）被截断的标志——
+    // 限定视图交集后 total 可能远小于 2000 仍带 truncated:true，含义是
+    // “限定结果可能不完整”，不是“只显示了前 2000 条”；前端也不消费该
+    // 标志（frontend/src 全文无 truncated 引用），旧注释“前端凭此提示”已过期。
     // Audit #10 L-4：searchMessageIds 本身已对 FTS 语法错做防护，
     // 这里再包一层——畸形查询绝不 500。
     let searchResult: { ids: number[]; truncated: boolean } | null;
@@ -221,11 +258,26 @@ function listMessages(req: Request, res: Response): void {
       log('search failed', String(q).slice(0, 100), (e as Error)?.message || e);
       searchResult = { ids: [], truncated: false };
     }
-    const ids = searchResult?.ids ?? null;
+    let ids = searchResult?.ids ?? null;
     const truncated = searchResult?.truncated ?? false;
     if (!ids || ids.length === 0) {
       sendSearch({ ok: true, messages: [], total: 0, ...(truncated ? { truncated: true } : {}) });
       return;
+    }
+    // 文件夹限定视图才做交集：all-inbox / all-unread / 不带 view 时保持
+    // 全局（viewFilter 的 account 过滤也不套用，与审计 #10 口径一致）。
+    const scopedViews = new Set(['all-sent', 'all-drafts', 'all-trash', 'folder']);
+    if (scopedViews.has(view || '') && vf.where) {
+      const placeholders = ids.map(() => '?').join(',');
+      const kept = db.prepare(
+        `SELECT m.id FROM messages m WHERE ${vf.where} AND m.id IN (${placeholders})`,
+      ).all(...(vf.params as never[]), ...(ids as never[])) as { id: number }[];
+      const keptSet = new Set(kept.map((r) => r.id));
+      ids = ids.filter((id) => keptSet.has(id));
+      if (!ids.length) {
+        sendSearch({ ok: true, messages: [], total: 0, ...(truncated ? { truncated: true } : {}) });
+        return;
+      }
     }
     const total = ids.length;
     const pageIds = ids.slice(off, off + lim);
@@ -256,8 +308,15 @@ function listMessages(req: Request, res: Response): void {
 // 查到返回 { localId }（本地没有时 localId 为 null，下次同步会取回）；
 // 查不到返回 null。服务器查不到/IMAP 不通时当作没查到（继续发送，
 // 但复用同一个 planned Message-ID，收件方仍可凭 ID 去重）。
+// Audit #13 HIGH：fp 传了时再加指纹分支——OquMail 服务器副本的
+// Message-ID 已被重写，Message-ID 两路都查不到；指纹（主题/发件人/
+// 收件人/时间/大小，见 engine.sentFingerprintMatches）才能认出它。
+// 本地指纹查 messages 表（findSentFingerprintDuplicate），服务器指纹
+// 查已发送文件夹（engine.findSentByFingerprint）。fpOpts.requireSize
+// 为 false 时放宽（重认领检查点在编译 raw 之前、size 未知）。
 async function findAlreadySent(
   engine: SyncEngine, accountId: number, messageId: string,
+  fp?: SentFingerprint, fpOpts?: { requireSize?: boolean },
 ): Promise<{ localId: number | null } | null> {
   const db = getDb();
   const local = db.prepare(
@@ -271,6 +330,25 @@ async function findAlreadySent(
     if (onServer) return { localId: null };
   } catch (e) {
     log('send re-claim server sent check failed', accountId, (e as Error)?.message || e);
+  }
+  if (fp) {
+    try {
+      const sentFolder = db.prepare(
+        `SELECT id FROM folders WHERE account_id=? AND type='sent' LIMIT 1`,
+      ).get(accountId) as { id: number } | undefined;
+      if (sentFolder) {
+        const fpLocal = engine.findSentFingerprintDuplicate(accountId, sentFolder.id, fp, fpOpts);
+        if (fpLocal != null) return { localId: fpLocal };
+      }
+    } catch (e) {
+      log('send re-claim local fingerprint check failed', accountId, (e as Error)?.message || e);
+    }
+    try {
+      const onServerFp = await engine.findSentByFingerprint(accountId, fp, fpOpts);
+      if (onServerFp) return { localId: null };
+    } catch (e) {
+      log('send re-claim server fingerprint check failed', accountId, (e as Error)?.message || e);
+    }
   }
   return null;
 }
@@ -407,8 +485,13 @@ export function messageRoutes(ctx: Ctx): express.Router {
         // References 链——前端回复时把 messageId 当 In-Reply-To、
         // 把 references 当 References 传回发信接口，收件方归入原会话。
         // 未拉过正文的信 references 为 null，前端只发 In-Reply-To。
+        // Audit #11：references 改数组返回（库里是空格拼成的字符串，
+        // 这里切开；前端与发信接口都接受 string | string[]）。
         messageId: row.message_id || null,
-        references: row.references || null,
+        references: row.references ? row.references.split(/\s+/).filter(Boolean) : null,
+        // Audit #11 threading：原信 Reply-To（单个地址字符串，无则 null），
+        // 前端回复时优先发往 Reply-To（无 Reply-To 时回落到 From）。
+        replyTo: row.reply_to || null,
         cc: JSON.parse(row.cc_json || '[]') as string[],
         bodyText,
         bodyHtml,
@@ -457,6 +540,13 @@ export function messageRoutes(ctx: Ctx): express.Router {
     try {
       await engine.moveMessage(row.account_id, id, folderId);
     } catch (e) {
+      // Audit #11 L1：与单删同款——删/移进行中再移同一封信报 409 冲突
+      //（旧版一律 502，前端显示“移动失败”，用户可能误以为移动失败而重试）。
+      const ec = e as Error & { status?: number; code?: string };
+      if (ec?.status === 409 || ec?.code === 'DELETE_IN_FLIGHT') {
+        res.status(409).json({ ok: false, error: ec.message || '该邮件正在处理中，请稍后再试' });
+        return;
+      }
       res.status(502).json({ ok: false, error: `IMAP 移动失败：${String((e as Error)?.message || e).slice(0, 300)}` });
       return;
     }
@@ -902,18 +992,21 @@ export function messageRoutes(ctx: Ctx): express.Router {
       const outParas: string[] = [];
       // DeepL 不限流，无需段间延迟（1.1 秒延迟是为百度 QPS=1 加的，DeepL 为主后已去掉）。
       for (const chunks of paras) {
-        if (controller.signal.aborted) return;
+        // Audit #11 L2：deadline 到时不能静默 return——旧版三处 aborted
+        // return 都不发响应，客户端还连着时请求一直挂到 Node 默认 300 秒
+        // 超时；与拉正文后的 aborted 检查同款：客户端还在就回 504。
+        if (controller.signal.aborted) { clearTimeout(deadlineTimer); if (!req.destroyed) res.status(504).json({ ok: false, error: '翻译超时（超过 25 秒），请缩短正文后重试' }); return; }
         const parts: string[] = [];
         for (const c of chunks) {
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted) { clearTimeout(deadlineTimer); if (!req.destroyed) res.status(504).json({ ok: false, error: '翻译超时（超过 25 秒），请缩短正文后重试' }); return; }
           parts.push(await translateWithDeepL(c, controller.signal));
         }
         outParas.push(parts.join(' '));
       }
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) { clearTimeout(deadlineTimer); if (!req.destroyed) res.status(504).json({ ok: false, error: '翻译超时（超过 25 秒），请缩短正文后重试' }); return; }
       res.json({ ok: true, translated: outParas.join('\n\n'), alreadyChinese: false });
     } catch (e) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) { clearTimeout(deadlineTimer); if (!req.destroyed) res.status(504).json({ ok: false, error: '翻译超时（超过 25 秒），请缩短正文后重试' }); return; }
       log('translate failed', id, (e as Error)?.message || e);
       const code = (e as { code?: string })?.code;
       if (code === 'RATE_LIMITED') {
@@ -1022,13 +1115,13 @@ export function messageRoutes(ctx: Ctx): express.Router {
         return;
       }
       const to = b.to as string | string[] | undefined;
-      const toList = Array.isArray(to) ? to : String(to || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const toList = splitAddrList(to);
       if (!toList.length) {
         res.status(400).json({ ok: false, error: '收件人必填', ...keyField() });
         return;
       }
-      const ccList = Array.isArray(b.cc) ? (b.cc as string[]) : String(b.cc || '').split(',').map((s) => s.trim()).filter(Boolean);
-      const bccList = Array.isArray(b.bcc) ? (b.bcc as string[]) : String(b.bcc || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const ccList = splitAddrList(b.cc as string | string[] | undefined);
+      const bccList = splitAddrList(b.bcc as string | string[] | undefined);
       // Audit #9 L10：收件人基本格式校验——"not-an-email" 以前能通过
       // 校验直至 SMTP 550 才报 502；非法地址现在前置 400。
       const invalidAddrs = [...toList, ...ccList, ...bccList].filter((a) => !isValidEmail(a));
@@ -1065,13 +1158,20 @@ export function messageRoutes(ctx: Ctx): express.Router {
       // 删除时带上该条件；另一标签页在发信期间又编辑过草稿时删除不匹配、
       // 草稿保留（不丢用户的新编辑），而不是按 id 无条件删掉。
       let draftUpdatedAt: string | null = null;
+      // Audit #11 threading：从草稿发信时，请求体没带 threading 字段
+      // 就用草稿存的（草稿重开后回复仍归入原会话）。只在发信时兜底，
+      // 不改请求体本身。
+      let draftThreading: { inReplyTo: string | null; references: string | null } | null = null;
       if (Number.isFinite(draftIdEarly) && draftIdEarly > 0) {
-        const draftOwner = db.prepare('SELECT account_id, updated_at FROM drafts WHERE id=?').get(draftIdEarly) as { account_id: number; updated_at: string } | undefined;
+        const draftOwner = db.prepare('SELECT account_id, updated_at, in_reply_to, "references" FROM drafts WHERE id=?').get(draftIdEarly) as { account_id: number; updated_at: string; in_reply_to: string | null; references: string | null } | undefined;
         if (draftOwner && draftOwner.account_id !== accountId) {
           res.status(400).json({ ok: false, error: '草稿不属于该发件账号', ...keyField() });
           return;
         }
-        if (draftOwner) draftUpdatedAt = draftOwner.updated_at;
+        if (draftOwner) {
+          draftUpdatedAt = draftOwner.updated_at;
+          draftThreading = { inReplyTo: draftOwner.in_reply_to, references: draftOwner.references };
+        }
       }
       // Audit #9 L8 连带：duplicate 认领等提前 return 路径也要删掉本次
       // 发送认领到的那一行草稿（只删 draftId 这一行，绝不删用户仍在
@@ -1103,6 +1203,12 @@ export function messageRoutes(ctx: Ctx): express.Router {
       {
         // Audit #5b：认领时预生成 Message-ID 并存进行（重认领沿用），
         // 本次发送全程用它，不再每次请求现生成。
+        // Audit #13 HIGH：重认领的指纹日期锚点——占位行首次认领时间。
+        // claimSendKey 的 F6 过期路径会删掉旧行重插（created_at 变成
+        // 重认领时间），所以必须在认领之前先读出旧行的 created_at；
+        // 原发送就发生在首次认领后数秒内，服务器副本的 date 落在它
+        // ±10 秒内。旧行不存在时（全新认领）不会走到重认领分支。
+        const priorClaimRow = findSendKey(accountId, idemKey);
         const claim = claimSendKey(accountId, idemKey, newPlannedMessageId());
         if (claim.status === 'duplicate') {
           deleteClaimedDraft();
@@ -1123,8 +1229,21 @@ export function messageRoutes(ctx: Ctx): express.Router {
         // Audit #5b：过期占位重认领——先查这封是不是已经发出去了
         // （SMTP 成功后、回填前崩溃的窗口）：先查本地已发送文件夹，
         // 本地没有再查服务器已发送文件夹；查到就直接返回原结果，不重发。
+        // Audit #13 HIGH：指纹分支——OquMail 服务器副本 Message-ID 已被
+        // 重写，Message-ID 两路查不到；指纹（主题/发件人/收件人/时间，
+        // 日期锚点是旧占位行的首次认领时间）才能认出它。size 未知
+        // （检查点在编译 raw 之前），该分支放宽、不校验大小。
         if (claim.reclaimed && claim.plannedMessageId) {
-          const already = await findAlreadySent(engine, accountId, claim.plannedMessageId);
+          const claimDateMs = parseSqliteUtcMs(priorClaimRow?.created_at);
+          const reclaimFp: SentFingerprint | undefined = claimDateMs != null ? {
+            subject: (b.subject as string) || '',
+            from: account.email,
+            to: toList,
+            dateMs: claimDateMs,
+            size: null,
+            messageId: claim.plannedMessageId,
+          } : undefined;
+          const already = await findAlreadySent(engine, accountId, claim.plannedMessageId, reclaimFp, { requireSize: false });
           if (already) {
             try { completeSendKey(accountId, idemKey, already.localId, claim.plannedMessageId); } catch { /* ignore */ }
             deleteClaimedDraft();
@@ -1139,8 +1258,10 @@ export function messageRoutes(ctx: Ctx): express.Router {
           }
           // Audit #9 M7（选方案 a：文档化 + 标注，不做延迟再查）：
           // 查不到不等于没发过——不自动保存已发送副本的服务商在已发送
-          // 文件夹里永远查不到，且 engine.findSentByMessageId 默认只查
-          // 最近 100 个 UID；本次若重发可能重复。继续发送，但在成功
+          // 文件夹里永远查不到；审计 #13 HIGH 之后指纹分支已覆盖
+          // OquMail（服务器副本 Message-ID 被重写、但指纹相同仍能认出），
+          // 残留窗口只剩“服务商不自动保存、且同步还没把副本取回本地”
+          // 的情形。本次若重发可能重复。继续发送，但在成功
           // 响应里标 duplicateUnverified:true，供客户端/用户核对已发送。
           reclaimedUnverified = true;
         }
@@ -1176,8 +1297,11 @@ export function messageRoutes(ctx: Ctx): express.Router {
         subject: (b.subject as string) || '', text, html, attachments,
         // 回复 threading 头（审计 #2 缺口，后端半边）：前端回复时传原信
         // 的 Message-ID（inReplyTo）与 References 链；不传则不带头。
-        inReplyTo: b.inReplyTo as string | undefined,
-        references: b.references as string | string[] | undefined,
+        // Audit #11：从草稿发信且请求体没带时，用草稿存的 threading 字段兜底。
+        inReplyTo: (typeof b.inReplyTo === 'string' && b.inReplyTo.trim()
+          ? b.inReplyTo : (draftThreading?.inReplyTo || undefined)) as string | undefined,
+        references: (b.references !== undefined && b.references !== null && b.references !== ''
+          ? b.references : (draftThreading?.references || undefined)) as string | string[] | undefined,
       };
       // Audit #7 LOW-2：释放占位前先按本次 planned Message-ID 查一次
       // 已发送——SMTP 已接受、响应丢失时，查到了就按已发送完成认领
@@ -1187,9 +1311,24 @@ export function messageRoutes(ctx: Ctx): express.Router {
       // 不自动保存的服务商查不到，仍会释放后重发。Audit #9 M7 选方案 a：
       // 该残留窗口已文档化（见重认领处的 reclaimedUnverified 注释），
       // 重认领查不到时成功响应标 duplicateUnverified:true，不做延迟再查。
+      // Audit #13 HIGH：findAlreadySent 现已加指纹分支——OquMail 服务
+      // 器副本 Message-ID 被重写也能认出（主题/发件人/收件人/时间/
+      // 大小；刚发过时 size 取已编译的 raw 长度、日期锚点就是现在）。
+      // prebuilt 不存在说明编译都没过、SMTP 不可能发出过，跳过指纹分支。
       const completeIfAlreadySent = async (): Promise<{ localId: number | null } | null> => {
         if (!claimed || !effectiveMessageId) return null;
-        const already = await findAlreadySent(engine, accountId, effectiveMessageId);
+        let fp: SentFingerprint | undefined;
+        if (prebuilt) {
+          fp = {
+            subject: (b.subject as string) || '',
+            from: account.email,
+            to: toList,
+            dateMs: Date.now(),
+            size: prebuilt.raw.length,
+            messageId: effectiveMessageId,
+          };
+        }
+        const already = await findAlreadySent(engine, accountId, effectiveMessageId, fp);
         if (!already) return null;
         try { completeSendKey(accountId, idemKey, already.localId, effectiveMessageId); } catch { /* ignore */ }
         return already;
@@ -1312,6 +1451,22 @@ export function messageRoutes(ctx: Ctx): express.Router {
                 // OquMail 已发送未读 bug：合并后 surviving 的行必须保持已读
                 // （先到的那份可能是服务器自动存的无 \Seen 副本）。
                 db.prepare('UPDATE messages SET is_read=1 WHERE id=? AND is_read=0').run(dup.id);
+              } else {
+                // Audit #12 H1 兜底：OquMail 服务器副本（重写 Message-ID）
+                // 可能已先被同步插进来——按指纹（主题/发件人/收件人/
+                // 时间±10 秒/大小±1024 字节）找它，命中则复用那行，不再插第二行。
+                const fpDupId = engine.findSentFingerprintDuplicate(accountId, folder.id, {
+                  subject: (b.subject as string) || '',
+                  from: account.email,
+                  to: toList,
+                  dateMs: Date.now(),
+                  size: sent.raw.length,
+                  messageId: sent.messageId,
+                });
+                if (fpDupId != null) {
+                  localId = fpDupId;
+                  db.prepare('UPDATE messages SET is_read=1 WHERE id=? AND is_read=0').run(fpDupId);
+                }
               }
             }
             if (localId == null) {

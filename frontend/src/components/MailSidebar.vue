@@ -43,7 +43,7 @@
         </div>
         <div class="space-y-0.5 text-sm" id="account-list">
           <div v-for="(a, idx) in mail.accounts" :key="a.id" class="acct-item" :class="{ expanded: mail.expanded.has(a.id) }">
-            <!-- 点邮箱行：展开 + 切单邮箱收件箱（已展开时再点仍切收件箱、不折叠）；点 `>`：只展开/折叠 -->
+            <!-- 点邮箱行：已展开且正看该邮箱时再点折叠，否则展开 + 切单邮箱收件箱；点 `>`：只展开/折叠 -->
             <div class="acct-row group flex items-center gap-2 px-2 py-1.5 text-slate-700 hover:bg-blue-100/50 rounded cursor-pointer" @click="onAccountRow(a.id)">
               <i class="fa-solid fa-chevron-right w-3 text-[10px] text-slate-400 cursor-pointer" title="展开/折叠文件夹" @click.stop="onToggleExpand(a.id)"></i>
               <span class="w-5 shrink-0 text-right text-[11px] text-slate-400">{{ String(idx + 1).padStart(2, '0') }}</span>
@@ -73,7 +73,7 @@
                 <span class="truncate text-xs">{{ f.name }}</span>
                 <span v-if="mail.unreadOfFolder(a.id, f.id) > 0" class="text-red-500 font-bold text-[10px] ml-auto">({{ mail.unreadOfFolder(a.id, f.id) }})</span>
               </div>
-              <div v-if="mail.expanded.has(a.id) && !(mail.foldersByAccount[a.id] || []).length" class="px-2 py-1 text-[11px]" :class="foldersFailed.has(a.id) ? 'text-red-400 cursor-pointer' : 'text-slate-400'" @click="onFoldersHintClick(a.id)">{{ foldersFailed.has(a.id) ? '文件夹加载失败，点这里重试' : (mail.foldersByAccount[a.id] ? '暂无文件夹' : '文件夹同步中…') }}</div>
+              <div v-if="mail.expanded.has(a.id) && !(mail.foldersByAccount[a.id] || []).length" class="px-2 py-1 text-[11px]" :class="mail.foldersFailedIds.has(a.id) ? 'text-red-400 cursor-pointer' : 'text-slate-400'" @click="onFoldersHintClick(a.id)">{{ mail.foldersFailedIds.has(a.id) ? '文件夹加载失败，点这里重试' : (mail.foldersByAccount[a.id] ? '暂无文件夹' : '文件夹同步中…') }}</div>
             </div>
           </div>
         </div>
@@ -121,34 +121,29 @@ async function copyEmail(a: Account): Promise<void> {
   copiedTimer = setTimeout(() => { copiedId.value = null }, 1500)
 }
 
-// 文件夹加载失败标记：store 的 loadFolders 失败时不写缓存（foldersByAccount[id]
-// 仍是 undefined），成功（即使零个文件夹）也会写进一个数组；展开后用这个区分
-// “加载失败”和“确实无文件夹”，别让失败也一直显示“同步中…”。
-const foldersFailed = ref<Set<number>>(new Set())
-function setFoldersFailed(id: number, failed: boolean): void {
-  const next = new Set(foldersFailed.value)
-  if (failed) next.add(id)
-  else next.delete(id)
-  foldersFailed.value = next
-}
-function checkFoldersAfterLoad(id: number): void {
-  setFoldersFailed(id, mail.foldersByAccount[id] === undefined)
-}
+// 文件夹加载失败态在 store 层维护（mail.foldersFailedIds，审计 #11 L8/L16）：
+// loadFolders 成功时清除、失败时置上；侧栏只读它显示“文件夹加载失败，点这里重试”。
+// 旧的本地 foldersFailed 已删——本地标记会在重选已展开账号时被无条件清除（L16），
+// 且 init 补拉失败时进不了本地集合（L8），两处毛病都由 store 层统一管解决。
 async function onAccountRow(id: number): Promise<void> {
-  const wasExpanded = mail.expanded.has(id)
+  // 已展开、且当前正看这个邮箱时，再点一次就折叠（恢复审计 #10 之前
+  // 点邮箱行切换展开/折叠的老行为）；否则展开并切到该邮箱收件箱。
+  // 审计 #10 H1 曾把“再点折叠”改成“再点仍切收件箱”，但用户要的是点行折叠，
+  // 这里改回来。只改桌面端侧栏这一处：手机端点邮箱列表是进邮箱、不折叠，
+  // 仍走 selectAccount；行首 `>` 仍是纯展开/折叠，不切视图。
+  const viewingThisAccount = mail.view.accountId === id
+    && (mail.view.kind === 'folder' || mail.view.kind === 'all-unread')
+  if (mail.expanded.has(id) && viewingThisAccount) {
+    await mail.toggleAccountExpand(id)
+    return
+  }
   await mail.selectAccount(id)
-  if (!wasExpanded && mail.expanded.has(id)) checkFoldersAfterLoad(id)
-  else if (wasExpanded) setFoldersFailed(id, false)
 }
 async function onToggleExpand(id: number): Promise<void> {
-  const wasExpanded = mail.expanded.has(id)
   await mail.toggleAccountExpand(id)
-  if (!wasExpanded && mail.expanded.has(id)) checkFoldersAfterLoad(id)
-  else if (wasExpanded) setFoldersFailed(id, false)
 }
 async function retryFolders(id: number): Promise<void> {
   await mail.loadFolders(id, true)
-  checkFoldersAfterLoad(id)
 }
 function onFoldersHintClick(id: number): void {
   // 展开后没文件夹就点这里重试——不只限加载失败时：刷新恢复的展开态
@@ -164,7 +159,10 @@ function onAuthBadge(id: number): void {
 }
 
 function isAggregateActive(kind: string): boolean {
-  // 聚合视图激活态：当前是该聚合视图且未进入单邮箱
+  // 聚合视图激活态：当前是该聚合视图且未进入单邮箱；
+  // 审计 #11 M9：移动端“某账号的未读”（all-unread + accountId）也要让
+  // “所有未读”一行高亮（桌面刷新后左栏不再无高亮）。
+  if (kind === 'all-unread' && mail.view.kind === 'all-unread') return true
   return mail.view.kind === kind && mail.view.accountId == null
 }
 </script>

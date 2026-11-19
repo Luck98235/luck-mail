@@ -18,11 +18,11 @@
           <i class="fa-solid fa-share"></i>
         </button>
         <div class="w-px h-4 bg-blue-100 mx-1"></div>
-        <button :disabled="!mail.selectedMessage || mail.isDeletingHere" class="hover:text-red-500 hover:bg-red-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" :title="mail.isTrashView ? '彻底删除' : '删除'" @click="act('delete')">
+        <button :disabled="!mail.selectedMessage || mail.isDeletingHere" class="hover:text-red-500 hover:bg-red-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" :title="deleteTitle" @click="act('delete')">
           <i class="fa-regular fa-trash-can"></i>
         </button>
-        <button :disabled="!mail.selectedMessage || mail.isDeletingHere" class="hover:text-amber-500 hover:bg-amber-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" title="标记为垃圾邮件" @click="act('spam')">
-          <i class="fa-solid fa-ban"></i>
+        <button :disabled="!mail.selectedMessage || mail.isDeletingHere" class="hover:text-amber-500 hover:bg-amber-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" :title="isSpamMessage ? '移回收件箱' : '标记为垃圾邮件'" @click="act('spam')">
+          <i :class="isSpamMessage ? 'fa-solid fa-inbox' : 'fa-solid fa-ban'"></i>
         </button>
         <button :disabled="!mail.selectedMessage" class="hover:text-blue-500 hover:bg-blue-50 p-2 rounded transition-colors flex items-center gap-1.5 text-sm disabled:opacity-40" :title="mail.selectedMessage?.isRead ? '标为未读' : '标为已读'" @click="act('toggle-read')">
           <i :class="mail.selectedMessage?.isRead ? 'fa-regular fa-envelope' : 'fa-regular fa-envelope-open'"></i>
@@ -97,7 +97,7 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { useMailStore } from '../stores/mail'
 import { useThemeStore } from '../stores/theme'
-import { api } from '../api'
+import { api, ApiError } from '../api'
 import { attachSwipeBack } from '../utils/swipeBack'
 import { sanitizeBodyHtml } from '../utils/sanitize'
 import { fmtFullTime, initialOf, formatSize, copyText } from '../utils'
@@ -160,34 +160,33 @@ function escapeHtml(s: string): string {
 // 后端回 404，用户会在新标签页看到原始错误页、无应用内反馈。
 // 现在点下载先轻量探测：只读响应头就取消 body（不下完整附件），失败时
 // 在应用内 toast 说明原因；成功才触发下载。
-// 不用 HEAD：后端 GET 处理器收到 HEAD 也会照常跑 IMAP 取附件再丢弃，
-// 反而比 GET + 立即 cancel 更费事。
+// 审计 #12 L4：旧版先 GET 探头（读响应头后 cancel body），再用 <a> 真下载，
+// 后端每次都要从 IMAP 实时取附件，等于取两次。现在一次 fetch 取成 blob
+// 再触发下载：失败时按响应状态 toast（404 仍是“附件不存在或已失效”），
+// 成功只取一次。附件上限 25MB，blob 放内存可接受。
+// 审计 #15 LOW-3：改走 api.downloadAttachment（与备份/导出同一条 blob
+// 下载路径）——会话过期时跳登录页，而不是只 toast 401；401 本身不再
+// 另弹 toast（跳转就是反馈）。
 async function downloadAttachment(att: Attachment): Promise<void> {
   const m = mail.selectedMessage
   if (!m) return
-  const url = `/api/messages/${m.id}/attachments/${att.id}`
   try {
-    const res = await fetch(url, { credentials: 'include' })
-    if (!res.ok) {
-      mail.showToast(res.status === 404 ? '附件不存在或已失效' : `附件下载失败（HTTP ${res.status}）`)
-      try { await res.body?.cancel() } catch { /* 忽略 */ }
-      return
-    }
-    // 只探了响应头就取消 body：真正下载走下面临时 <a> 再取一次，
-    // 避免这次探测把整个附件下下来。
-    try { await res.body?.cancel() } catch { /* 忽略 */ }
-  } catch {
-    mail.showToast('附件下载失败，请检查网络后重试')
-    return
+    const { blob, filename } = await api.downloadAttachment(m.id, att.id, att.filename)
+    const objectUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = objectUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    // 浏览器接管下载需要一点时间，稍后再释放 object URL。
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 5000)
+  } catch (e) {
+    // 401 已跳登录，不再重复 toast；404 仍是“附件不存在或已失效”。
+    if (e instanceof ApiError && e.status === 401) return
+    if (e instanceof ApiError && e.status === 404) { mail.showToast('附件不存在或已失效'); return }
+    mail.showToast(e instanceof ApiError ? e.message : '附件下载失败，请检查网络后重试')
   }
-  const a = document.createElement('a')
-  a.href = url
-  a.download = att.filename
-  a.target = '_blank'
-  a.rel = 'noopener noreferrer'
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
 }
 
 const srcdocHtml = computed<string>(() => {
@@ -298,11 +297,35 @@ watch(() => mail.selectedMessage?.id, () => {
   void nextTick(setupFrame)
 })
 
+// 审计 #12 M3：正在读的信在垃圾邮件文件夹里时，同一个按钮改为
+// “移回收件箱”（调 moveToInbox）；不在垃圾里时仍是“标记为垃圾邮件”。
+// folderTypeOf 返回 null（文件夹未加载）时按“不在垃圾里”处理，不猜。
+const isSpamMessage = computed<boolean>(() => {
+  const m = mail.selectedMessage
+  if (!m) return false
+  return mail.folderTypeOf(m.accountId, m.folderId) === 'spam'
+})
+
+// 删除按钮文案（审计 #11 M4）：与 confirmDelete 同一判定——按正在读的信
+// 实际所在文件夹，文件夹未加载时按当前视图兜底。
+const deleteTitle = computed<string>(() => {
+  const m = mail.selectedMessage
+  const trashState = m ? mail.isTrashFolder(m.accountId, m.folderId) : null
+  const inTrash = trashState === null ? mail.isTrashView : trashState
+  return inTrash ? '彻底删除' : '删除'
+})
+
 // 单封删除先弹确认（批量删除已在 store 里走 requestConfirm；
 // 这里与 store 共用同一个 requestConfirm，走覆盖保护：上一个确认框
 // 没点就来了新的，旧的按“取消” resolve，不会卡住调用方）。
 async function confirmDelete(): Promise<boolean> {
-  const msg = mail.isTrashView
+  // 审计 #11 M4：彻底与否按正在读的信实际所在文件夹判定（文件夹未加载时
+  // isTrashFolder 返回 null，按当前视图兜底），不在已删除里打开的信也
+  // 可能实际在已删除文件夹（全局搜索结果），不能只看当前视图。
+  const m = mail.selectedMessage
+  const trashState = m ? mail.isTrashFolder(m.accountId, m.folderId) : null
+  const inTrash = trashState === null ? mail.isTrashView : trashState
+  const msg = inTrash
     ? '确定彻底删除这封邮件吗？彻底删除后不可恢复。'
     : '确定删除这封邮件吗？将移到已删除。'
   return mail.requestConfirm(msg, true)
@@ -314,7 +337,10 @@ function act(kind: 'reply' | 'forward' | 'delete' | 'spam' | 'toggle-read'): voi
   if (kind === 'delete') {
     void confirmDelete().then((ok) => { if (ok) void mail.deleteMessage(m.id) })
   }
-  else if (kind === 'spam') void mail.moveToSpam(m.id)
+  else if (kind === 'spam') {
+    if (isSpamMessage.value) void mail.moveToInbox(m.id)
+    else void mail.moveToSpam(m.id)
+  }
   else if (kind === 'toggle-read') void mail.setRead(m.id, !m.isRead)
   else if (kind === 'reply') emit('reply', m)
   else if (kind === 'forward') emit('forward', m)

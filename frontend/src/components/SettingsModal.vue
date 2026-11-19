@@ -24,9 +24,20 @@
           <div class="space-y-2">
             <!-- 诱饵用户名框：浏览器打开设置时要找个地方填用户名，没有它就会把用户名填进外面的搜索框 -->
             <input type="text" name="username" autocomplete="username" :value="auth.username" tabindex="-1" aria-hidden="true" class="absolute opacity-0 pointer-events-none h-0 w-0">
-            <input v-model="current" type="password" name="current-password" autocomplete="current-password" placeholder="当前密码" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
-            <input v-model="next" :type="showNext ? 'text' : 'password'" name="new-password" autocomplete="new-password" placeholder="新密码（至少 8 位）" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
-            <input v-model="confirm" :type="showNext ? 'text' : 'password'" name="new-password-confirm" autocomplete="new-password" placeholder="确认新密码" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
+            <!-- 三个密码框都禁止自动填入（用户 2026-11-19 要求：旧密码必须
+                 手动填写；同日补充：新密码、确认新密码也不许自动填充）：
+                 以前旧密码框写着 name/autocomplete="current-password"，新
+                 密码框写着 name/autocomplete="new-password"，又配了上面
+                 的隐藏用户名诱饵框，浏览器一打开设置就把已保存的登录密码
+                 填进来（黄底 + 圆点）；前端 ref 本来就是空的，从未主动回填。
+                 修复复用搜索框的防自动填充手法：未聚焦时 readonly（浏览器
+                 不往只读框里自动填），聚焦后才可编辑；同时去掉会招填充的
+                 name/autocomplete 信号（current-password / new-password）。
+                 隐藏用户名诱饵框保留不动——它防的是另一个老问题（没有它
+                 浏览器会把用户名填进外面的搜索框）。 -->
+            <input v-model="current" type="password" name="old-password" autocomplete="off" placeholder="当前密码" :readonly="!currentFocused" @focus="currentFocused = true" @blur="currentFocused = false" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
+            <input v-model="next" :type="showNext ? 'text' : 'password'" name="new-password-field" autocomplete="off" placeholder="新密码（至少 8 位）" :readonly="!nextFocused" @focus="nextFocused = true" @blur="nextFocused = false" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
+            <input v-model="confirm" :type="showNext ? 'text' : 'password'" name="new-password-confirm-field" autocomplete="off" placeholder="确认新密码" :readonly="!confirmFocused" @focus="confirmFocused = true" @blur="confirmFocused = false" class="w-full border border-slate-200 rounded-md px-3 py-2 outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400">
             <div class="flex items-center justify-between">
               <label class="flex items-center gap-2 text-xs text-slate-500 cursor-pointer"><input v-model="showNext" type="checkbox" class="accent-blue-500"> 显示新密码</label>
               <button class="px-4 py-1.5 rounded-md text-sm bg-blue-500 hover:bg-blue-600 text-white disabled:opacity-60" :disabled="pwBusy" @click="changePassword">{{ pwBusy ? '保存中…' : '修改密码' }}</button>
@@ -97,8 +108,11 @@ const nameBusy = ref<boolean>(false)
 const nameMsg = ref<string>('')
 const nameOk = ref<boolean>(false)
 const current = ref<string>('')
+const currentFocused = ref<boolean>(false) // 旧密码框防自动填充：聚焦前只读（同搜索框）
 const next = ref<string>('')
+const nextFocused = ref<boolean>(false) // 新密码框防自动填充：聚焦前只读（同旧密码框）
 const confirm = ref<string>('')
+const confirmFocused = ref<boolean>(false) // 确认新密码框防自动填充：聚焦前只读（同旧密码框）
 const showNext = ref<boolean>(false)
 const pwBusy = ref<boolean>(false)
 const pwMsg = ref<string>('')
@@ -126,8 +140,11 @@ watch(() => props.open, (v) => {
   nameMsg.value = ''
   nameOk.value = false
   current.value = ''
+  currentFocused.value = false
   next.value = ''
+  nextFocused.value = false
   confirm.value = ''
+  confirmFocused.value = false
   showNext.value = false
   pwMsg.value = ''
   pwOk.value = false
@@ -136,14 +153,17 @@ watch(() => props.open, (v) => {
   backupOk.value = false
   defaultAccountId.value = mail.settings.defaultAccountId ?? null
   signature.value = mail.settings.signature || ''
-  notifyOn.value = mail.notifyEnabled
+  // 审计 #11 L22：打开弹窗时若通知权限已被拒（denied），开关显示为关——
+  // 权限被拒时通知根本弹不出来，开关还显示开启是误导；开关本身已禁用（见模板）。
+  notifyOn.value = getNotifyPermission() === 'denied' ? false : mail.notifyEnabled
   notifySupported.value = isNotifySupported()
   notifyPermission.value = getNotifyPermission()
 })
 
 // 跨标签同步（审计 #10 安全 L6）：弹窗打开期间另一标签页改了通知开关，
 // 本地 notifyOn 只在打开时同步一次、会滞后；监听 store 的变化实时同步。
-watch(() => mail.notifyEnabled, (v) => { if (props.open) notifyOn.value = v })
+// 审计 #11 L22：权限被拒时同步值也按关显示（与打开时一致）。
+watch(() => mail.notifyEnabled, (v) => { if (props.open) notifyOn.value = getNotifyPermission() === 'denied' ? false : v })
 
 async function changeUsername(): Promise<void> {
   nameMsg.value = ''
@@ -168,6 +188,9 @@ async function changeUsername(): Promise<void> {
 async function changePassword(): Promise<void> {
   pwMsg.value = ''
   pwOk.value = false
+  // 审计 #19 LOW-2：旧密码必填须前端先拦——用户要求旧密码“必须手动填写”，
+  // 空着点“修改密码”不应发请求，只应提示（后端 400 只是兜底）。
+  if (!current.value) { pwMsg.value = '请填写当前密码。'; return }
   if (next.value.length < 8) { pwMsg.value = '新密码至少 8 位。'; return }
   if (next.value !== confirm.value) { pwMsg.value = '两次输入的新密码不一致。'; return }
   pwBusy.value = true

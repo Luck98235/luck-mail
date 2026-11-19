@@ -55,6 +55,9 @@ export interface MessageRow {
   // Audit #10 threading：原信 References 头（正文拉取时解析存入），
   // GET /api/messages/:id 返回给前端做回复/转发 threading 用。
   references?: string | null;
+  // Audit #11 threading：原信 Reply-To 头（解析存入），详情接口返回，
+  // 前端回复时优先发往 Reply-To。
+  reply_to?: string | null;
   subject: string;
   from_addr: string;
   from_name: string;
@@ -211,6 +214,7 @@ function initSchema(db: Db): void {
     uid INTEGER NOT NULL,
     message_id TEXT,
     "references" TEXT,
+    reply_to TEXT,
     subject TEXT NOT NULL DEFAULT '',
     from_addr TEXT NOT NULL DEFAULT '',
     from_name TEXT NOT NULL DEFAULT '',
@@ -280,12 +284,19 @@ function initSchema(db: Db): void {
   -- 不进 messages 表、不参与同步；删账号时级联删除（FK + foreign_keys=ON）。
   -- 列名用 to_addrs 而不用 to：to 是 SQLite 关键字，CREATE TABLE
   -- 直接报 near "to" 语法错误（2026-11-18 实测）；API 字段仍叫 to。
+  -- Audit #11 threading：草稿重开后 threading 不丢——回复/转发时
+  -- 原信的 Message-ID（in_reply_to）、References 链（references，
+  -- 空格拼成的字符串）与抄送（cc，JSON 数组字符串）随草稿存下来，
+  -- 发信时（请求体没带时）用草稿存的字段兜底。
   CREATE TABLE IF NOT EXISTS drafts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     to_addrs TEXT NOT NULL DEFAULT '',
     subject TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL DEFAULT '',
+    in_reply_to TEXT,
+    "references" TEXT,
+    cc TEXT,
     idempotency_key TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -362,6 +373,21 @@ function initSchema(db: Db): void {
   const msgCols2 = db.prepare('PRAGMA table_info(messages)').all() as { name: string }[];
   if (msgCols2.length && !msgCols2.map((c) => c.name).includes('references')) {
     db.exec('ALTER TABLE messages ADD COLUMN "references" TEXT');
+  }
+  // Audit #11 threading：messages.reply_to（原信 Reply-To 头）——
+  // 旧库加列（新库建表时已有）。无则加，有则跳过，重启自动生效。
+  const msgCols3 = db.prepare('PRAGMA table_info(messages)').all() as { name: string }[];
+  if (msgCols3.length && !msgCols3.map((c) => c.name).includes('reply_to')) {
+    db.exec('ALTER TABLE messages ADD COLUMN reply_to TEXT');
+  }
+  // Audit #11 threading：drafts 三列（in_reply_to / "references" / cc）——
+  // 旧库加列（新库建表时已有）。无则加，有则跳过，重启自动生效。
+  const draftCols = db.prepare('PRAGMA table_info(drafts)').all() as { name: string }[];
+  if (draftCols.length) {
+    const names = draftCols.map((c) => c.name);
+    if (!names.includes('in_reply_to')) db.exec('ALTER TABLE drafts ADD COLUMN in_reply_to TEXT');
+    if (!names.includes('references')) db.exec('ALTER TABLE drafts ADD COLUMN "references" TEXT');
+    if (!names.includes('cc')) db.exec('ALTER TABLE drafts ADD COLUMN cc TEXT');
   }
 
   // ---- OquMail 已发送未读 bug：存量回填（一次性，幂等） ----

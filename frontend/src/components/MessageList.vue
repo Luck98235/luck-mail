@@ -27,7 +27,7 @@
     <div class="flex items-center gap-2 px-3 py-1.5 border-b border-blue-50 bg-white text-xs text-slate-600">
       <label class="flex items-center gap-1.5 cursor-pointer select-none" :class="mail.isDeletingHere ? 'opacity-50 pointer-events-none' : ''">
         <input type="checkbox" :checked="mail.isAllChecked" :indeterminate="mail.isSomeChecked" class="accent-blue-500 w-3.5 h-3.5" :disabled="mail.isDeletingHere" @change="mail.toggleCheckAll()">
-        全选
+        全选本页
       </label>
       <span v-if="mail.checkedCount > 0" class="text-slate-400">已选 {{ mail.checkedCount }} 封</span>
       <div v-if="mail.checkedCount > 0 || mail.isDeletingHere" class="ml-auto flex items-center gap-2">
@@ -45,6 +45,12 @@
          由 store 里的 isDeletingHere 守卫挡住，只锁发起删除的那个视图，别的视图不受影响 -->
     <div ref="scrollEl" class="flex-1 min-h-0 overflow-y-auto" :class="mail.isDeletingHere ? 'opacity-60' : ''" @scroll="onScroll">
       <div v-if="mail.loading && !mail.mailList.length" class="p-6 text-center text-xs text-slate-400">加载中…</div>
+      <!-- 审计 #11 L10：空态分三种——加载失败（带内联重试）/搜索无结果/空文件夹 -->
+      <div v-else-if="!mail.mailList.length && mail.listError" class="p-6 text-center text-xs text-slate-400">
+        <p>{{ mail.listError }}</p>
+        <button class="mt-2 px-3 py-1 rounded-md border border-slate-200 bg-white hover:bg-blue-50 hover:text-blue-600" @click="mail.loadMessages({ keepChecked: true })">点这里重试</button>
+      </div>
+      <div v-else-if="!mail.mailList.length && mail.searchQuery.trim()" class="p-6 text-center text-xs text-slate-400">没有找到相关邮件</div>
       <div v-else-if="!mail.mailList.length" class="p-6 text-center text-xs text-slate-400">这里没有邮件</div>
       <template v-else>
         <div class="relative" :style="{ height: totalHeight + 'px' }">
@@ -126,15 +132,27 @@ const searchFocused = ref<boolean>(false)
 
 let timer: ReturnType<typeof setTimeout> | null = null
 watch(q, (v) => {
-  // 同步回写不触发搜索：桌面与移动两个 MessageList 实例同时挂载，
-  // 一个实例输入后 setSearch 改了 mail.searchQuery，另一实例的回写 watcher
-  // 把 q 设成同一值；若这里不跳过，防抖回调会再发一次搜索请求。
+  // 同步回写不触发搜索：桌面与移动两个 MessageList 实例同时挂载（CSS 隐藏，
+  // 非 v-if；审计 #11 L9：v-if 重构风险大，不做，两实例搜索状态一致由
+  // smoke 测试断言守着），一个实例输入后 setSearch 改了 mail.searchQuery，
+  // 另一实例的回写 watcher 把 q 设成同一值；若这里不跳过，防抖回调会再发
+  // 一次搜索请求。
   // 切视图时 store 会清 searchQuery，回写值与当前 q 一致时同样跳过，不重复加载。
   if (v === mail.searchQuery) return
   if (timer) clearTimeout(timer)
-  timer = setTimeout(() => mail.setSearch(v), 300) // 输入防抖 300ms，走 q（FTS5）
+  timer = setTimeout(() => {
+    // 审计 #11 M3：回调里再校验一次——q 已变（切视图/同步回写）就不发旧词搜索。
+    if (q.value !== v) return
+    mail.setSearch(v)
+  }, 300) // 输入防抖 300ms，走 q（FTS5）
 })
-watch(() => mail.searchQuery, (v) => { if (v !== q.value) q.value = v })
+watch(() => mail.searchQuery, (v) => {
+  // 审计 #11 M3：同步回写时先清掉本实例待触发的防抖定时器，否则切视图后
+  // 旧定时器复活旧搜索词、再发一次搜索。
+  if (timer) clearTimeout(timer)
+  timer = null
+  if (v !== q.value) q.value = v
+})
 
 // ---- 虚拟滚动（只给邮件列表用；账号树最多 50 个，直接 v-for） ----
 // 行高固定（桌面 76px / QQ 式 84px），只渲染可视窗口 + 上下各 5 行 overscan。

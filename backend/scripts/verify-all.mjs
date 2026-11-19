@@ -60,6 +60,7 @@ const { encryptSecret, decryptSecret } = await import('../dist/cryptoUtil.js');
 const { streamToParsed } = await import('../dist/mailStream.js');
 const { parseInWorker, spoolToTemp } = await import('../dist/streamParse.js');
 const { sanitizeBodyHtml } = await import('../dist/sanitize.js');
+const { collectAttachmentParts, matchAttachmentParts } = await import('../dist/mailUtil.js');
 
 let pass = 0;
 let fail = 0;
@@ -170,8 +171,29 @@ try {
   check('audit10 H-1: setup with wrong token -> 403', r.status === 403, `status=${r.status}`);
   r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'short', confirm: 'short', setupToken });
   check('setup rejects short password (400)', r.status === 400);
+  // Audit #14 LOW-2：表单校验失败不计入 IP 锁定——上面已有 1 次 token
+  // 猜错 + 1 次短密码；这里再补 6 次不同校验失败（空用户名、带 @、
+  // 超长用户名、短密码、密码不一致、超长密码），旧版累计 8 次 ≥ 5 次
+  // 阈值会锁 IP 15 分钟、合法 setup 变 429；新版只有 token 猜错计数。
+  const badForms = [
+    { username: '', password: 'testpass123', confirm: 'testpass123' },
+    { username: 'a@b.com', password: 'testpass123', confirm: 'testpass123' },
+    { username: 'x'.repeat(65), password: 'testpass123', confirm: 'testpass123' },
+    { username: 'tester', password: 'short', confirm: 'short' },
+    { username: 'tester', password: 'testpass123', confirm: 'different123' },
+    { username: 'tester', password: 'x'.repeat(129), confirm: 'x'.repeat(129) },
+  ];
+  let badFormAll400 = true;
+  for (const f of badForms) {
+    const rr = await api('POST', '/api/auth/setup', { ...f, setupToken });
+    if (rr.status !== 400) badFormAll400 = false;
+  }
+  check('audit14 LOW-2: setup validation failures return 400 (not counted toward IP lock)',
+    badFormAll400);
   r = await api('POST', '/api/auth/setup', { username: 'tester', password: 'testpass123', confirm: 'testpass123', setupToken });
   check('setup creates single user (201)', r.status === 201 && r.json?.ok === true);
+  check('audit14 LOW-2: 1 wrong token + 7 validation failures do not lock the IP (valid setup still 201)',
+    r.status === 201, `status=${r.status}`);
   check('audit10 H-1: setup token file deleted after first user', !fs.existsSync(setupTokenPath));
   r = await api('GET', '/api/auth/status');
   check('D6: setup creates a session (logged in immediately, no second login needed)', r.json?.loggedIn === true && r.json?.username === 'tester', JSON.stringify(r.json));
@@ -251,11 +273,40 @@ try {
   check('unknown domain falls back to imap./smtp.', r.json?.preset?.imapHost === 'imap.unknown-domain-xyz.com');
   r = await api('GET', '/api/accounts');
   check('accounts list empty', r.status === 200 && Array.isArray(r.json?.accounts) && r.json.accounts.length === 0);
-  r = await api('POST', '/api/accounts', { email: 'fakeuser@163.com', password: 'FAKE_AUTH_CODE_123' });
+  // 添加邮箱必填校验（用户 2026-11-19 要求）：缺服务器时直接 400，不再
+  // 走预设回落去测连通——下面这条须带齐服务器，否则到不了连通测试。
+  r = await api('POST', '/api/accounts', { email: 'fakeuser@163.com', password: 'FAKE_AUTH_CODE_123', imapHost: 'imap.163.com', imapPort: 993, imapSecure: 'SSL', smtpHost: 'smtp.163.com', smtpPort: 465, smtpSecure: 'SSL' });
   check('add fake account fails connectivity (400, clear step, no 500/stack)',
     r.status === 400 && typeof r.json?.error === 'string' && r.json.error.includes('IMAP') && !r.text.includes(' at ') && !r.text.includes('Error:'));
   r = await api('GET', '/api/accounts');
   check('fake account was NOT saved', r.json?.accounts?.length === 0);
+
+  // ---------- 2b. 添加邮箱必填与格式校验（用户 2026-11-19 要求） ----------
+  // 邮件帐号、密码、接收服务器、发送服务器四项均为必填，帐号须符合邮箱
+  // 格式；以下断言都在连通测试之前 400，不建账号、不发 IMAP 登录。
+  console.log('== add-account required & format ==');
+  const addBase = { email: 'addcheck@163.com', password: 'FAKE_AUTH_CODE_123', imapHost: 'imap.163.com', imapPort: 993, imapSecure: 'SSL', smtpHost: 'smtp.163.com', smtpPort: 465, smtpSecure: 'SSL' };
+  r = await api('POST', '/api/accounts', { ...addBase, email: '' });
+  check('添加邮箱：帐号为空 -> 400 邮箱地址格式不正确', r.status === 400 && /邮箱地址格式不正确/.test(r.json?.error || ''), `status=${r.status} error=${r.json?.error}`);
+  r = await api('POST', '/api/accounts', { ...addBase, email: 'not-an-email' });
+  check('添加邮箱：帐号格式非法 -> 400 邮箱地址格式不正确', r.status === 400 && /邮箱地址格式不正确/.test(r.json?.error || ''), `status=${r.status} error=${r.json?.error}`);
+  r = await api('POST', '/api/accounts', { ...addBase, email: 'a@b' });
+  check('添加邮箱：帐号无域名后缀 -> 400 邮箱地址格式不正确', r.status === 400 && /邮箱地址格式不正确/.test(r.json?.error || ''), `status=${r.status} error=${r.json?.error}`);
+  const { password: _pw, ...noPw } = addBase;
+  r = await api('POST', '/api/accounts', noPw);
+  check('添加邮箱：密码缺失 -> 400 密码/授权码必填', r.status === 400 && /密码\/授权码必填/.test(r.json?.error || ''), `status=${r.status} error=${r.json?.error}`);
+  const { imapHost: _ih, ...noImap } = addBase;
+  r = await api('POST', '/api/accounts', noImap);
+  check('添加邮箱：接收服务器缺失 -> 400 接收服务器（IMAP）必填', r.status === 400 && /接收服务器（IMAP）必填/.test(r.json?.error || ''), `status=${r.status} error=${r.json?.error}`);
+  r = await api('POST', '/api/accounts', { ...addBase, imapHost: '' });
+  check('添加邮箱：接收服务器为空字符串 -> 400 接收服务器（IMAP）必填', r.status === 400 && /接收服务器（IMAP）必填/.test(r.json?.error || ''), `status=${r.status} error=${r.json?.error}`);
+  const { smtpHost: _sh, ...noSmtp } = addBase;
+  r = await api('POST', '/api/accounts', noSmtp);
+  check('添加邮箱：发送服务器缺失 -> 400 发送服务器（SMTP）必填', r.status === 400 && /发送服务器（SMTP）必填/.test(r.json?.error || ''), `status=${r.status} error=${r.json?.error}`);
+  r = await api('POST', '/api/accounts', { ...addBase, smtpHost: '   ' });
+  check('添加邮箱：发送服务器全是空格 -> 400 发送服务器（SMTP）必填', r.status === 400 && /发送服务器（SMTP）必填/.test(r.json?.error || ''), `status=${r.status} error=${r.json?.error}`);
+  r = await api('GET', '/api/accounts');
+  check('添加邮箱：上述非法请求均未建账号', r.json?.accounts?.length === 0, `count=${r.json?.accounts?.length}`);
 
   // ---------- 3. encryption + key file ----------
   console.log('== crypto & key file ==');
@@ -328,6 +379,36 @@ try {
   check('FTS trigram finds 3+ char Chinese term', r.json?.messages?.some((m) => m.id === m1), `total=${r.json?.total}`);
   r = await api('GET', `/api/messages?q=${encodeURIComponent('项目')}`);
   check('2-char Chinese term hits via LIKE fallback', r.json?.messages?.some((m) => m.id === m2), `total=${r.json?.total}`);
+  // Audit #17 MED-1：搜索按视图限定——草稿/已发送/已删除/文件夹视图
+  // 按文件夹过滤搜索命中，收件箱/未读视图（及不带 view）保持全局。
+  // 种子一封草稿（与收件箱 m2 共享“报告”一词）；查询词特意不用
+  // “项目”（前面刚查过，500ms 搜索去重缓存会直接返回旧结果）。
+  const draftsFolderInfo = db.prepare(
+    "INSERT INTO folders (account_id, path, name, type) VALUES (?, '草稿箱', '草稿箱', 'drafts')",
+  ).run(accountId);
+  const draftsFolderId = Number(draftsFolderInfo.lastInsertRowid);
+  const m3 = Number(db.prepare(
+    `INSERT INTO messages (account_id, folder_id, uid, subject, from_addr, to_json, date,
+      snippet, body_path, is_read, has_attachments, size, flags_json)
+     VALUES (?,?,?,?,?,?,?,?,?,0,0,1234,'[]')`,
+  ).run(accountId, draftsFolderId, 3, '项目草稿报告', 'me@163.com', '[]', new Date().toISOString(), '项目草稿报告正文', null).lastInsertRowid);
+  db.prepare('INSERT INTO messages_fts(rowid, subject, from_addr, body_text) VALUES (?,?,?,?)')
+    .run(m3, '项目草稿报告', 'me@163.com', '项目草稿报告正文');
+  r = await api('GET', `/api/messages?q=${encodeURIComponent('报告')}&view=all-drafts`);
+  check('audit17 MED-1: q in all-drafts returns only draft-folder hits',
+    r.json?.total === 1 && r.json?.messages?.length === 1 && r.json.messages[0].id === m3, `total=${r.json?.total}`);
+  r = await api('GET', `/api/messages?q=${encodeURIComponent('报告')}&view=all-inbox`);
+  check('audit17 MED-1: q in all-inbox stays global (inbox + draft both hit)',
+    r.json?.total === 2 && r.json?.messages?.some((m) => m.id === m2) && r.json?.messages?.some((m) => m.id === m3), `total=${r.json?.total}`);
+  r = await api('GET', `/api/messages?q=${encodeURIComponent('报告')}`);
+  check('audit17 MED-1: q without view stays global (inbox + draft)',
+    r.json?.total === 2, `total=${r.json?.total}`);
+  r = await api('GET', `/api/messages?q=${encodeURIComponent('报告')}&view=folder&accountId=${accountId}&folderId=${draftsFolderId}`);
+  check('audit17 MED-1: q in folder view (drafts folder) returns only that folder',
+    r.json?.total === 1 && r.json?.messages?.[0]?.id === m3, `total=${r.json?.total}`);
+  r = await api('GET', `/api/messages?q=${encodeURIComponent('报告')}&view=folder&accountId=${accountId}&folderId=${folderId}`);
+  check('audit17 MED-1: q in folder view (inbox folder) returns only that folder',
+    r.json?.total === 1 && r.json?.messages?.[0]?.id === m2, `total=${r.json?.total}`);
   r = await api('GET', `/api/messages?view=all-inbox&limit=50`);
   check('all-inbox lists seeded messages', r.json?.total === 2);
   // Audit #10 前端约定：详情响应带原信 Message-ID 与 References（供回复/
@@ -337,8 +418,8 @@ try {
   r = await api('GET', `/api/messages/${m1}`);
   check('audit10 threading: detail returns messageId + references of the original mail',
     r.json?.message?.messageId === '<seed-m1@luck-mail.test>'
-    && r.json?.message?.references === '<seed-ref-0@luck-mail.test>',
-    `messageId=${r.json?.message?.messageId} references=${r.json?.message?.references}`);
+    && JSON.stringify(r.json?.message?.references) === JSON.stringify(['<seed-ref-0@luck-mail.test>']),
+    `messageId=${r.json?.message?.messageId} references=${JSON.stringify(r.json?.message?.references)}`);
   r = await api('GET', `/api/messages/${m1}`);
   check('detail returns body from disk files',
     r.json?.message?.bodyText?.includes('第一封中文测试邮件正文') && r.json?.message?.bodyHtml?.includes('第一封中文测试邮件正文'));
@@ -394,6 +475,26 @@ try {
   check('DOMPurify direct: onerror/js: stripped',
     !sanitizeBodyHtml('<img src=x onerror=alert(1)><a href="javascript:alert(1)">x</a>').includes('onerror')
     && !sanitizeBodyHtml('<a href="javascript:alert(1)">x</a>').includes('javascript:'));
+  // Audit #12 L1：后端钩子与前端对齐——补 opacity:0；宽/高样式按声明锚定，
+  // min-width:0 不再误伤正常图片。
+  check('audit12 L1: sanitize removes opacity:0 tracking pixel (backend aligned with frontend)',
+    !sanitizeBodyHtml('<img src="http://x.com/op.png" style="opacity:0">').includes('op.png'));
+  check('audit12 L1: sanitize keeps img with min-width:0/min-height:0 but normal width/height (anchored declarations)',
+    sanitizeBodyHtml('<img src="http://x.com/mw.png" style="min-width:0;min-height:0;width:100px;height:50px">').includes('mw.png'));
+  check('audit12 L1: sanitize still removes 1px-by-1px style pixel and 0x0 style pixel',
+    !sanitizeBodyHtml('<img src="http://x.com/px1.png" style="width:1px;height:1px">').includes('px1.png')
+    && !sanitizeBodyHtml('<img src="http://x.com/px0.png" style="width:0;height:0">').includes('px0.png'));
+  // Audit #16 LOW-3：小数零写法也要拦——opacity:.0、width:1.0px/height:1.0px；
+  // 非零值（opacity:0.5、width:1.5px）仍保留。
+  check('audit16 LOW-3: sanitize removes opacity:.0 and 1.0px style pixels',
+    !sanitizeBodyHtml('<img src="http://x.com/opd.png" style="opacity:.0">').includes('opd.png')
+    && !sanitizeBodyHtml('<img src="http://x.com/pxd.png" style="width:1.0px;height:1.0px">').includes('pxd.png'));
+  check('audit16 LOW-3: sanitize keeps non-zero opacity and 1.5px images',
+    sanitizeBodyHtml('<img src="http://x.com/op5.png" style="opacity:0.5">').includes('op5.png')
+    && sanitizeBodyHtml('<img src="http://x.com/px15.png" style="width:1.5px;height:1.5px">').includes('px15.png'));
+  // 审计 #16 跟进：0 尺寸的 0.0px 写法同样是合法 CSS 零值，须拦。
+  check('audit16 LOW-3 follow-up: sanitize removes 0.0px style pixels',
+    !sanitizeBodyHtml('<img src="http://x.com/px00.png" style="width:0.0px;height:0.0px">').includes('px00.png'));
 
   // ---------- 9. worker-thread parse + metadata-only attachments ----------
   console.log('== worker parse & metadata-only attachments ==');
@@ -435,6 +536,57 @@ try {
   const smallAtt = parsedSmall.attachments[0];
   check('<=10MB attachment also metadata-only (no file on disk)',
     smallAtt?.cached === false && smallAtt?.large === false && !fs.existsSync(path.join(DATA_DIR, 'attachments', '999003', '1-s.txt')));
+  // Audit #16 LOW-2：collectAttachmentParts 须与 mailparser 的
+  // isAttachment 同口径——非文本叶部件全收（无文件名记 null），文本叶
+  // 部件只在 disposition 为 attachment 时收。旧口径漏掉无 disposition、
+  // 无文件名的二进制部件，matchAttachmentParts 按索引配对时后续附件
+  // 的 part 号整体错位一位。
+  {
+    const bsEdges = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', disposition: 'inline', size: 5 },
+        { part: '2', type: 'text/plain', disposition: 'attachment', dispositionParameters: { filename: 'note.txt' }, size: 4 },
+        { part: '3', type: 'application/octet-stream', size: 3 },
+        { part: '4', type: 'image/png', disposition: 'inline', dispositionParameters: { filename: 'img.png' }, size: 10 },
+      ],
+    };
+    const edgeParts = collectAttachmentParts(bsEdges);
+    check('audit16 LOW-2: collectAttachmentParts mirrors mailparser (bare binary in, inline text out, text attachment in)',
+      edgeParts.length === 3 && edgeParts[0].part === '2' && edgeParts[0].filename === 'note.txt'
+      && edgeParts[1].part === '3' && edgeParts[1].filename === null
+      && edgeParts[2].part === '4' && edgeParts[2].filename === 'img.png',
+      JSON.stringify(edgeParts));
+    // 端到端：同一封原始邮件，mailparser 附件与 BODYSTRUCTURE 收集
+    // 按索引配对后 part 号不再错位。
+    const emlBare = Buffer.concat([
+      Buffer.from('From: a@163.com\r\nSubject: bare binary part\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nhello\r\n--B\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAw==\r\n--B\r\nContent-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename="doc.pdf"\r\n\r\nJVBERi0x\r\n--B--\r\n', 'utf8'),
+    ]);
+    const parsedBare = await streamToParsed(Readable.from([emlBare]), emlBare.length);
+    const bsBare = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', size: 5 },
+        { part: '2', type: 'application/octet-stream', size: 4 },
+        { part: '3', type: 'application/pdf', disposition: 'attachment', dispositionParameters: { filename: 'doc.pdf' }, size: 6 },
+      ],
+    };
+    const matchedBare = matchAttachmentParts(parsedBare.attachments, collectAttachmentParts(bsBare));
+    check('audit16 LOW-2: bare binary part and named attachment get the right part numbers (no off-by-one)',
+      matchedBare.length === 2 && matchedBare[0].part === '2' && matchedBare[0].filename === 'attachment-1'
+      && matchedBare[1].part === '3' && matchedBare[1].filename === 'doc.pdf',
+      JSON.stringify(matchedBare.map((a) => [a.filename, a.part])));
+    // Audit #17 LOW-2：单部件邮件（整个正文就是一个非文本部件）时
+    // BODYSTRUCTURE 根节点没有 part 号；RFC 3501 里单部件正文即
+    // part 1，根节点记 '1' 而不是 null，否则附件列得出、下载直接 404。
+    // 注：这里只覆盖 BODYSTRUCTURE 侧的 part 赋值；取回路径（IMAP
+    // download BODY[1]）本地无 live IMAP，需线上端到端验证。
+    const singleParts = collectAttachmentParts({ type: 'application/pdf', size: 9 });
+    check('audit17 LOW-2: single-part root attachment gets part 1 (not null)',
+      singleParts.length === 1 && singleParts[0].part === '1' && singleParts[0].filename === null
+      && singleParts[0].contentType === 'application/pdf',
+      JSON.stringify(singleParts));
+  }
 
   // ---------- 10. Socket.io ----------
   console.log('== socket.io ==');
@@ -692,6 +844,31 @@ try {
   check('audit8 LOW-3: send with empty subject/text/html -> 400 (no SMTP attempt)',
     r.status === 400 && typeof r.json?.error === 'string',
     `status=${r.status} error=${r.json?.error}`);
+  // 发信收件人格式校验（用户 2026-11-19 要求：收件人必填、格式不正确不得
+  // 发送；抄送同样校验）：缺收件人/非法收件人/非法抄送 -> 400，不走到 SMTP；
+  // 全角逗号分隔的合法地址应通过格式关（假账号 SMTP 502 即证明已走到发信）。
+  r = await api('POST', '/api/messages/send', {
+    accountId: idemAccountId, subject: 'no to', text: 'hi',
+  });
+  check('send validation: missing to -> 400 收件人必填',
+    r.status === 400 && r.json?.error === '收件人必填', `status=${r.status} error=${r.json?.error}`);
+  r = await api('POST', '/api/messages/send', {
+    accountId: idemAccountId, to: 'not-an-email', subject: 'x', text: 'hi',
+  });
+  check('send validation: invalid to -> 400 (not-an-email)',
+    r.status === 400 && typeof r.json?.error === 'string' && r.json.error.includes('not-an-email'),
+    `status=${r.status} error=${r.json?.error}`);
+  r = await api('POST', '/api/messages/send', {
+    accountId: idemAccountId, to: 'x@163.com', cc: 'bad-cc', subject: 'x', text: 'hi',
+  });
+  check('send validation: invalid cc -> 400 (bad-cc)',
+    r.status === 400 && typeof r.json?.error === 'string' && r.json.error.includes('bad-cc'),
+    `status=${r.status} error=${r.json?.error}`);
+  r = await api('POST', '/api/messages/send', {
+    accountId: idemAccountId, to: 'a@163.com，b@163.com', subject: 'x', text: 'hi',
+  });
+  check('send validation: full-width comma separated to passes format check (reaches SMTP 502)',
+    r.status === 502, `status=${r.status} error=${r.json?.error}`);
 
   // B13: 批量删除立即返回 taskId，后台跑完后 delete-status 可查（任务隔离）。
   {
@@ -1049,6 +1226,86 @@ try {
         `move=${JSON.stringify(calls.move)} deleted=${JSON.stringify(calls.deleted)} row=${JSON.stringify(rowAfter)}`);
       engine.states.delete(accountId);
     }
+    // Audit #12 H1：清扫按指纹补扫——OquMail 服务器副本 Message-ID 不同，
+    // 只按 Message-ID 扫找不到它；删已发送的信时指纹相同的副本 UID 也要删掉。
+    {
+      const MID_OWN = '<fp-own@luck-mail.local>';
+      const MID_SRV = '<fp-server@heavycrusher.com>';
+      const a = vdb.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run('sweep-fp@163.com', 'SF', encryptSecret('FAKE', key),
+        'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+      const accountId = Number(a.lastInsertRowid);
+      const sentF = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已发送', '已发送', 'sent')").run(accountId);
+      const sentId = Number(sentF.lastInsertRowid);
+      const trashF = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已删除', '已删除', 'trash')").run(accountId);
+      const trashId = Number(trashF.lastInsertRowid);
+      // 行的 date/size 与 mkEnv 的信封一致（2026-11-18T10:00:00Z / 100），
+      // 否则指纹比对不上。
+      const msgInfo = vdb.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+        from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
+        VALUES (?,?,?,?,?,?,?, ?,'2026-11-18T10:00:00Z','',1,0,100,'[]')`).run(
+        accountId, sentId, 100, MID_OWN, 'fp sweep', 'sweep-fp@163.com', 'SF', '[]');
+      const msgId = Number(msgInfo.lastInsertRowid);
+      const calls = { move: [], deleted: [] };
+      const fakeClient = {
+        usable: true,
+        mailbox: { path: '已发送' },
+        mailboxOpen: async (p) => { fakeClient.mailbox = { path: p }; return { uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: 2 }; },
+        search: async () => [100, 101],
+        fetch: async function* () { yield mkEnv(100, MID_OWN, 'fp sweep', 'sweep-fp@163.com'); yield mkEnv(101, MID_SRV, 'fp sweep', 'sweep-fp@163.com'); },
+        messageMove: async (uid, target) => { calls.move.push([uid, target]); return { uidMap: new Map([[100, 200]]) }; },
+        messageFlagsAdd: async (uid) => { /* sweep 用 */ },
+        messageDelete: async (uid) => { calls.deleted.push(uid); },
+      };
+      const engine = new SyncEngine(key);
+      engine.states.set(accountId, { client: fakeClient, queue: Promise.resolve(), opFailures: 0 });
+      const ok = await engine.deleteMessage(accountId, msgId);
+      const rowAfter = vdb.prepare('SELECT folder_id, uid FROM messages WHERE id=?').get(msgId);
+      check('audit12 H1: deleting a sent message also deletes the OquMail server twin (different Message-ID, same fingerprint uid 101)',
+        ok === true
+        && calls.move.length === 1 && calls.move[0][0] === '100' && calls.move[0][1] === '已删除'
+        && calls.deleted.length === 1 && calls.deleted[0] === '101'
+        && rowAfter.folder_id === trashId && rowAfter.uid === 200,
+        `move=${JSON.stringify(calls.move)} deleted=${JSON.stringify(calls.deleted)} row=${JSON.stringify(rowAfter)}`);
+      engine.states.delete(accountId);
+    }
+    // Audit #12 M1：垃圾邮件移回收件箱成功路径——engine.moveMessage 对
+    // 源/目标文件夹类型无限制（前端入口由前端线补）。
+    {
+      const a = vdb.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run('move-spam@163.com', 'MS', encryptSecret('FAKE', key),
+        'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+      const accountId = Number(a.lastInsertRowid);
+      const spamF = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '垃圾邮件', '垃圾邮件', 'spam')").run(accountId);
+      const spamId = Number(spamF.lastInsertRowid);
+      const inboxF = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, 'INBOX', '收件箱', 'inbox')").run(accountId);
+      const inboxId = Number(inboxF.lastInsertRowid);
+      const msgInfo = vdb.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+        from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
+        VALUES (?,?,?,?,?,?,?, ?,datetime('now'),'',0,0,100,'[]')`).run(
+        accountId, spamId, 50, '<spam-move@x>', 'spam to inbox', 'spam@163.com', 'SM', '[]');
+      const msgId = Number(msgInfo.lastInsertRowid);
+      const calls = { move: [] };
+      const fakeClient = {
+        usable: true,
+        mailbox: { path: '垃圾邮件' },
+        mailboxOpen: async (p) => { fakeClient.mailbox = { path: p }; return { uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: 1 }; },
+        messageMove: async (uid, target) => { calls.move.push([uid, target]); return { uidMap: new Map([[50, 60]]) }; },
+      };
+      const engine = new SyncEngine(key);
+      engine.states.set(accountId, { client: fakeClient, queue: Promise.resolve(), opFailures: 0 });
+      const moved = await engine.moveMessage(accountId, msgId, inboxId);
+      const rowAfter = vdb.prepare('SELECT folder_id, uid FROM messages WHERE id=?').get(msgId);
+      check('audit12 M1: move from spam to inbox succeeds (row folder+uid updated, IMAP move to INBOX)',
+        moved.folder_id === inboxId && rowAfter.folder_id === inboxId && rowAfter.uid === 60
+        && calls.move.length === 1 && calls.move[0][0] === '50' && calls.move[0][1] === 'INBOX',
+        `move=${JSON.stringify(calls.move)} row=${JSON.stringify(rowAfter)}`);
+      engine.states.delete(accountId);
+    }
   }
   // ---------- 15. audit #5 backend fixes ----------
   console.log('== audit #5 fixes ==');
@@ -1370,19 +1627,20 @@ try {
   r = await api('GET', '/api/messages?' + new URLSearchParams({ q: '"' }));
   check('D4: search with a single quote does not 500', r.status === 200 && Array.isArray(r.json?.messages), `status=${r.status}`);
 
-  // 依赖版本（5/6/7）：multer 2.0.1、nodemailer 10.6.0、imapflow 2.12.1。
+  // 依赖版本（5/6/7）：multer 2.5.0（审计 #11 L9 由 2.0.1 升级，CVE-2026-113872
+  // 修复版）、nodemailer 10.6.0、imapflow 2.12.1。
   {
     const pkg = JSON.parse(fs.readFileSync(path.join(BACKEND, 'package.json'), 'utf8'));
     const depVer = (name) => String(pkg.dependencies?.[name] || '').replace(/^\^/, '');
-    check('deps: multer 2.0.1 / nodemailer 10.6.0 / imapflow 2.12.1 in package.json',
-      depVer('multer') === '2.0.1'
+    check('deps: multer 2.5.0 / nodemailer 10.6.0 / imapflow 2.12.1 in package.json',
+      depVer('multer') === '2.5.0'
       && depVer('nodemailer') === '10.6.0'
       && depVer('imapflow') === '2.12.1',
       JSON.stringify({ m: depVer('multer'), n: depVer('nodemailer'), i: depVer('imapflow') }));
     const lock = JSON.parse(fs.readFileSync(path.join(BACKEND, 'package-lock.json'), 'utf8'));
     const lv = (name) => lock.packages?.[`node_modules/${name}`]?.version;
     check('deps: package-lock.json matches (multer/nodemailer/imapflow)',
-      lv('multer') === '2.0.1' && lv('nodemailer') === '10.6.0' && lv('imapflow') === '2.12.1',
+      lv('multer') === '2.5.0' && lv('nodemailer') === '10.6.0' && lv('imapflow') === '2.12.1',
       JSON.stringify({ m: lv('multer'), n: lv('nodemailer'), i: lv('imapflow') }));
   }
 
@@ -1476,6 +1734,39 @@ try {
   r = await api('GET', '/api/drafts');
   check('drafts: deleted draft is gone from the list',
     !(r.json?.drafts || []).some((d) => d.id === draft1.id) && (r.json?.drafts || []).some((d) => d.id === draft2.id));
+  // Audit #11 threading：草稿存 threading 字段（回复/转发重开后不丢）——
+  // POST 存 inReplyTo/references/cc，GET 原样返回（references 回数组）。
+  r = await api('POST', '/api/drafts', { accountId, to: 'c@163.com', subject: 're', text: 'hi',
+    inReplyTo: '<orig@163.com>', references: ['<a@x>', '<b@y>'], cc: ['cc@163.com'] });
+  const draft3 = r.json?.draft;
+  check('audit11 threading: POST /api/drafts stores inReplyTo/references/cc',
+    r.status === 201 && draft3?.inReplyTo === '<orig@163.com>'
+    && JSON.stringify(draft3?.references) === JSON.stringify(['<a@x>', '<b@y>'])
+    && JSON.stringify(draft3?.cc) === JSON.stringify(['cc@163.com']),
+    `status=${r.status} draft=${JSON.stringify(draft3)}`);
+  r = await api('PUT', `/api/drafts/${draft3.id}`, { subject: 're2' });
+  check('audit11 threading: PUT without threading fields keeps them',
+    r.status === 200 && r.json?.draft?.inReplyTo === '<orig@163.com>'
+    && JSON.stringify(r.json?.draft?.references) === JSON.stringify(['<a@x>', '<b@y>'])
+    && JSON.stringify(r.json?.draft?.cc) === JSON.stringify(['cc@163.com']),
+    `status=${r.status} draft=${JSON.stringify(r.json?.draft)}`);
+  r = await api('PUT', `/api/drafts/${draft3.id}`, { references: '<c@z>' });
+  check('audit11 threading: PUT accepts references as a plain string',
+    r.status === 200 && JSON.stringify(r.json?.draft?.references) === JSON.stringify(['<c@z>']),
+    `status=${r.status} draft=${JSON.stringify(r.json?.draft)}`);
+  await api('DELETE', `/api/drafts/${draft3.id}`);
+  // Audit #11 threading：详情接口返回 replyTo（字符串或 null）与数组
+  // 形式的 references（库里是空格拼成的字符串，这里切开返回）。
+  // 注意：第 6 节已给 m1 写过 message_id/references 种子值，这里只改
+  // reply_to 与 references，messageId 仍是第 6 节的种子值。
+  db.prepare('UPDATE messages SET reply_to=?, "references"=? WHERE id=?')
+    .run('replyto@163.com', '<a@x> <b@y>', m1);
+  r = await api('GET', `/api/messages/${m1}`);
+  check('audit11 threading: GET /api/messages/:id returns replyTo + references array',
+    r.status === 200 && r.json?.message?.replyTo === 'replyto@163.com'
+    && JSON.stringify(r.json?.message?.references) === JSON.stringify(['<a@x>', '<b@y>'])
+    && r.json?.message?.messageId === '<seed-m1@luck-mail.test>',
+    `status=${r.status} message=${JSON.stringify(r.json?.message)?.slice(0, 300)}`);
 
   // 发信删草稿：本地假 SMTP（nodemailer 10.x + MailComposer 真实走一遍）。
   // 假 SMTP 只认 PLAIN/LOGIN + MAIL/RCPT/DATA/QUIT；不通告 STARTTLS，
@@ -1635,6 +1926,27 @@ try {
     r.status === 409, `status=${r.status} body=${JSON.stringify(r.json)}`);
   r = await api('DELETE', '/api/messages/424242?idempotencyKey=' + 'x'.repeat(129));
   check('L1: over-long idempotencyKey -> 400', r.status === 400, `status=${r.status}`);
+  // Audit #11 L1：移动路由也把 409 映射出来（与单删同款）——同一封信
+  // 移动与移动并发时，第二路应报 409“正在处理中”，而不是 502“移动失败”。
+  // 注意：种子账号原本没有 trash 文件夹（后续 MED-1 并发删信测试依赖
+  // “执行路因无 trash 文件夹而快速 502”），这里临时建一个、测完即删，
+  // 不污染共享种子状态。
+  const mMove = mkMsg(4, '移动冲突测试', 'move@163.com', '移动 409 测试');
+  const trashInfo = db.prepare(
+    "INSERT INTO folders (account_id, path, name, type) VALUES (?, 'Trash', '已删除', 'trash')",
+  ).run(accountId);
+  const trashFolderId = Number(trashInfo.lastInsertRowid);
+  {
+    const [v1, v2] = await Promise.all([
+      api('POST', `/api/messages/${mMove}/move`, { folderId: trashFolderId }),
+      api('POST', `/api/messages/${mMove}/move`, { folderId: trashFolderId }),
+    ]);
+    const conflict = [v1, v2].filter((x) => x.status === 409 && /正在处理中/.test(x.json?.error || '')).length;
+    const other = [v1, v2].filter((x) => x.status !== 409).length;
+    check('audit11 L1: concurrent moves of the same message -> one 409 in-flight, one non-409',
+      conflict === 1 && other === 1, `v1=${v1.status}/${JSON.stringify(v1.json)} v2=${v2.status}/${JSON.stringify(v2.json)}`);
+  }
+  db.prepare('DELETE FROM folders WHERE id=?').run(trashFolderId);
   // Audit #7 MED-1：并发同 key 单删——先占位后删除。两路并发 DELETE 带
   // 同一 key 时，只有一路真正执行删除（这里因种子账号无 trash 文件夹
   // 而 502），另一路不执行第二次删除。
@@ -2093,11 +2405,54 @@ try {
   // ALLOW_PRIVATE_MAIL_HOSTS，拒绝路径如实触发）+ testConnectivity
   // 直接调用（不触网、文案统一）。
   {
-    const { isPrivateOrLoopbackHost, testConnectivity } = await import('../dist/imapUtil.js');
+    const { isPrivateOrLoopbackHost, hostsResolveToPrivate, testConnectivity } = await import('../dist/imapUtil.js');
     check('audit10 M-2: isPrivateOrLoopbackHost rejects loopback/private/link-local/metadata',
       isPrivateOrLoopbackHost('127.0.0.1') && isPrivateOrLoopbackHost('10.0.0.5')
       && isPrivateOrLoopbackHost('192.168.1.1') && isPrivateOrLoopbackHost('169.254.169.254')
       && isPrivateOrLoopbackHost('::1') && isPrivateOrLoopbackHost('172.16.0.1'));
+    // Audit #11 L7：非常规写法也解析成 127.0.0.1（Node dns.lookup 实测），
+    // 归一化后必须同样拦截；::ffff:7f00:0001 是 IPv4 映射 IPv6 的十六进制写法。
+    check('audit11 L7: isPrivateOrLoopbackHost blocks non-standard loopback spellings',
+      isPrivateOrLoopbackHost('2130706433') && isPrivateOrLoopbackHost('0x7f.0.0.1')
+      && isPrivateOrLoopbackHost('0177.0.0.1') && isPrivateOrLoopbackHost('0x7f000001')
+      && isPrivateOrLoopbackHost('::ffff:127.0.0.1') && isPrivateOrLoopbackHost('::ffff:7f00:0001')
+      && isPrivateOrLoopbackHost('::ffff:7f00:1'));
+    // Audit #16 LOW-1：IPv4 映射 IPv6 的十六进制写法不止 2 段——
+    // ::ffff:0:7f00:0001、::ffff:0:0:7f00:0001 都是 127.0.0.1，
+    // 旧版只认恰好 2 段；公网映射地址（::ffff:0:808:0808 = 8.8.8.8）
+    // 仍放行；解析层（dns.lookup 原样返回该字面量）也须拦住。
+    check('audit16 LOW-1: isPrivateOrLoopbackHost blocks multi-segment ::ffff: hex loopback spellings',
+      isPrivateOrLoopbackHost('::ffff:0:7f00:0001') && isPrivateOrLoopbackHost('::ffff:0:0:7f00:0001')
+      && isPrivateOrLoopbackHost('::ffff:0:0:0:0:0:7f00:1')
+      && !isPrivateOrLoopbackHost('::ffff:0:808:0808') && !isPrivateOrLoopbackHost('::ffff:808:808'));
+    check('audit16 LOW-1: hostsResolveToPrivate flags a multi-segment ::ffff: loopback literal',
+      (await hostsResolveToPrivate(['::ffff:0:7f00:0001'])) === true);
+    // Audit #17 LOW-1：IPv4 映射/兼容写法不止 ::ffff: 前缀——未压缩的
+    // 0:0:0:0:0:ffff:7f00:1 与兼容形式 ::7f00:1、0:0:0:0:0:0:7f00:1
+    // 都是 127.0.0.1；公网对照 0:0:0:0:0:ffff:0808:0808、::0808:0808
+    //（= 8.8.8.8）与前段非零的 2001:db8::7f00:1 仍放行。
+    check('audit17 LOW-1: isPrivateOrLoopbackHost blocks uncompressed mapped + IPv4-compatible loopback spellings',
+      isPrivateOrLoopbackHost('0:0:0:0:0:ffff:7f00:1') && isPrivateOrLoopbackHost('::7f00:1')
+      && isPrivateOrLoopbackHost('0:0:0:0:0:0:7f00:1')
+      && !isPrivateOrLoopbackHost('0:0:0:0:0:ffff:0808:0808') && !isPrivateOrLoopbackHost('::0808:0808')
+      && !isPrivateOrLoopbackHost('2001:db8::7f00:1'));
+    check('audit17 LOW-1: hostsResolveToPrivate flags an IPv4-compatible loopback literal',
+      (await hostsResolveToPrivate(['::7f00:1'])) === true);
+    check('audit11 L7: isPrivateOrLoopbackHost still allows public hosts in odd forms',
+      !isPrivateOrLoopbackHost('8.8.8.8') && !isPrivateOrLoopbackHost('134744072'));
+    // Audit #12 L4：解析到私有地址的主机名也被拦——ip6-localhost 经本地
+    // 解析得 ::1（无需联网），字面量检查放过它（不是字面 IP），DNS
+    // 校验必须拦住；8.8.8.8 解析后仍是公网地址，放行。
+    check('audit12 L4: hostsResolveToPrivate flags a hostname resolving to loopback',
+      (await hostsResolveToPrivate(['ip6-localhost'])) === true);
+    check('audit12 L4: hostsResolveToPrivate allows a public literal IP',
+      (await hostsResolveToPrivate(['8.8.8.8'])) === false);
+    const dnsPriv = await testConnectivity(
+      { email: 'x@y.z', password: 'p', imapHost: 'ip6-localhost', imapPort: 993, imapSecure: 'SSL', smtpHost: 'ip6-localhost', smtpPort: 465, smtpSecure: 'SSL' },
+      'p',
+    );
+    check('audit12 L4: testConnectivity rejects a hostname resolving to loopback with the unified message',
+      dnsPriv.imapOk === false && dnsPriv.error === '连接失败（服务器地址不合法）', JSON.stringify(dnsPriv));
     check('audit10 M-2: isPrivateOrLoopbackHost allows public hosts',
       !isPrivateOrLoopbackHost('imap.163.com') && !isPrivateOrLoopbackHost('8.8.8.8')
       && !isPrivateOrLoopbackHost('1.1.1.1'));
@@ -2134,6 +2489,13 @@ try {
     const dbSrc = fs.readFileSync(path.join(BACKEND, 'src/db.ts'), 'utf8');
     check('audit10 M-9: translate deadline is wired into AbortSignal',
       msgRoutesSrc.includes('AbortSignal.any'));
+    // Audit #11 L2：翻译 deadline 到时不再静默 return——循环内三处与
+    // catch 里共四处 aborted 检查都应在客户端还连着时回 504（行为断言
+    // 要等满 25 秒总预算，不稳定；此处用源码回归标记，见同款做法）。
+    check('audit11 L2: no silent `if (controller.signal.aborted) return;` left in translate route',
+      !msgRoutesSrc.includes('if (controller.signal.aborted) return;'));
+    check('audit11 L2: translate aborted branches answer 504 when the client is still connected',
+      msgRoutesSrc.includes("if (!req.destroyed) res.status(504).json({ ok: false, error: '翻译超时（超过 25 秒），请缩短正文后重试' })"));
     check('audit10 M-14: batch delete shares one withClient session (deleteMessagesBatch)',
       engineSrc.includes('deleteMessagesBatch'));
     check('audit10 M-13: full-envelope fetch is paged (ENVELOPE_PAGE_SIZE)',
@@ -2174,7 +2536,9 @@ try {
         'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
     }
     const atCap = (db.prepare('SELECT COUNT(*) c FROM accounts').get()).c;
-    r = await api('POST', '/api/accounts', { email: 'cap51@163.com', password: 'x' });
+    // 添加邮箱必填校验（用户 2026-11-19 要求）：须带齐服务器，否则在
+    // 上限检查之前就因缺服务器 400，到不了“已达上限”的断言。
+    r = await api('POST', '/api/accounts', { email: 'cap51@163.com', password: 'x', imapHost: 'imap.163.com', imapPort: 993, imapSecure: 'SSL', smtpHost: 'smtp.163.com', smtpPort: 465, smtpSecure: 'SSL' });
     check('audit10 D5: POST /api/accounts at 50 accounts -> 400 (limit)',
       atCap === 50 && r.status === 400 && /已达上限/.test(r.json?.error || ''),
       `count=${atCap} status=${r.status} error=${r.json?.error}`);
@@ -2285,6 +2649,47 @@ try {
     const mergedCount = vdb.prepare('SELECT COUNT(*) c FROM messages WHERE message_id=?').get('<oq-merge@x>').c;
     check('oqumail: dedup merge keeps the surviving sent row read (still 1 row, is_read=1)',
       mergedCount === 1 && mergedRead === 1, `count=${mergedCount} is_read=${mergedRead}`);
+    // Audit #12 H1：OquMail 服务器副本（Message-ID 被重写）按指纹兜底去重——
+    // 同一封信的两个副本（不同 Message-ID、同主题/发件人、时间差 4 秒、
+    // 大小差 50 字节）只留一行；时间差 60 秒或大小差 5000 字节的则不合并。
+    // search 须返回文件夹全部本地 UID（11、21 + 种子 31），否则增量分支
+    // 的删除对账会把它们当“服务器已删”删掉（见 (3) 注释）。
+    {
+      const fpBase = new Date();
+      const fpDateIso = fpBase.toISOString();
+      const seedFp = vdb.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+        to_json, date, snippet, is_read, has_attachments, size, flags_json)
+        VALUES (?,?,?,?,?,?,?, ?,?,1,0,900,'[]')`).run(
+        oquAccId, sentFId, 31, '<fp-own@luck-mail.local>', 'fp dedup', 'oqu@163.com', '[]', fpDateIso, '');
+      const seedFpId = Number(seedFp.lastInsertRowid);
+      const fpMsg = (uid, mid, size, dateMs) => ({
+        uid, flags: [],
+        envelope: { messageId: mid, subject: 'fp dedup', from: [{ address: 'oqu@163.com', name: '' }], to: [{ address: 'a@163.com' }], date: new Date(dateMs) },
+        bodyStructure: null, size, internalDate: new Date(dateMs),
+      });
+      const fpClient = (uids, msgs) => ({
+        mailboxOpen: async () => ({ uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: uids.length }),
+        search: async () => uids,
+        fetch: async function* () { for (const m of msgs) yield m; },
+      });
+      const fpCount = () => vdb.prepare('SELECT COUNT(*) c FROM messages WHERE folder_id=? AND subject=?').get(sentFId, 'fp dedup').c;
+      // 服务器副本：不同 Message-ID，时间 +4 秒、大小 850（差 50）→ 合并，不插新行。
+      await engineOq._syncFolder(fpClient([11, 21, 31, 32], [fpMsg(32, '<fp-server@heavycrusher.com>', 850, fpBase.getTime() + 4000)]), oquAccId, folderRow(sentFId));
+      check('audit12 H1: OquMail server copy (different Message-ID, same fingerprint) merges into the existing sent row',
+        fpCount() === 1, `count=${fpCount()}`);
+      // 对照组 1：时间差 60 秒 → 不合并，插新行。
+      await engineOq._syncFolder(fpClient([11, 21, 31, 32, 33], [fpMsg(33, '<fp-other@x>', 900, fpBase.getTime() + 60000)]), oquAccId, folderRow(sentFId));
+      check('audit12 H1: same subject/from but 60s apart does NOT merge (control)',
+        fpCount() === 2, `count=${fpCount()}`);
+      // 对照组 2：时间差 4 秒、大小差 5000 → 不合并，插新行。
+      await engineOq._syncFolder(fpClient([11, 21, 31, 32, 33, 34], [fpMsg(34, '<fp-other2@x>', 5900, fpBase.getTime() + 4000)]), oquAccId, folderRow(sentFId));
+      check('audit12 H1: same subject/from/date but size 5000 apart does NOT merge (control)',
+        fpCount() === 3, `count=${fpCount()}`);
+      // 合并后 surviving 的仍是种子行（luck-mail 自己 APPEND 的那份）。
+      const survivor = vdb.prepare('SELECT id, message_id FROM messages WHERE folder_id=? AND subject=? ORDER BY id ASC LIMIT 1').get(sentFId, 'fp dedup');
+      check('audit12 H1: fingerprint merge keeps the original (luck-mail) row as survivor',
+        survivor.id === seedFpId && survivor.message_id === '<fp-own@luck-mail.local>', JSON.stringify(survivor));
+    }
   }
   // (4) 存量回填：两个子进程共享一个临时 DATA_DIR——子进程 1 建库并预置
   // 未读 sent 行（对照组：未读 inbox 行）；子进程 2 全新 openDb（迁移
@@ -2334,6 +2739,1144 @@ try {
       !!bf && bf.sentRead === 1 && bf.inboxRead === 0 && bf.sentUnread === 0 && bf.sentTotal === 1 && bf.inboxUnread === 1,
       JSON.stringify(bf));
     fs.rmSync(backfillDir, { recursive: true, force: true });
+  }
+
+  // ---------- 21. audit #13 fixes ----------
+  console.log('== audit #13 fixes ==');
+  // HIGH：崩溃窗口重认领加指纹分支——OquMail 服务器副本 Message-ID 被
+  // 重写，Message-ID 两路查不到；指纹（主题/发件人/收件人/时间，日期
+  // 锚点是旧占位行的首次认领时间）才能认出它。用本机假 SMTP（第 18 节
+  // 同款最小实现）+ 本地已同步的服务器副本行模拟。
+  let fakeSmtp21 = null;
+  let fakePort21 = 0;
+  let smtpDataCount21 = 0;
+  let lastRaw21 = '';
+  try {
+    fakeSmtp21 = await new Promise((resolve, reject) => {
+      const sockets = new Set();
+      const srv = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+        let buf = '';
+        let dataMode = false;
+        let authStep = 0;
+        socket.write('220 localhost fake SMTP\r\n');
+        socket.on('data', (chunk) => {
+          buf += chunk.toString('utf8');
+          let idx;
+          while ((idx = buf.indexOf('\r\n')) >= 0) {
+            const line = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            if (dataMode) {
+              if (line === '.') { dataMode = false; smtpDataCount21 += 1; socket.write('250 OK: queued\r\n'); }
+              else lastRaw21 += line + '\r\n';
+              continue;
+            }
+            const up = line.toUpperCase();
+            if (up.startsWith('EHLO') || up.startsWith('HELO')) socket.write('250-localhost\r\n250 AUTH LOGIN PLAIN\r\n');
+            else if (up.startsWith('AUTH PLAIN')) { authStep = 0; socket.write('235 OK\r\n'); }
+            else if (up.startsWith('AUTH LOGIN')) { authStep = 1; socket.write('334 VXNlcm5hbWU6\r\n'); }
+            else if (authStep === 1) { authStep = 2; socket.write('334 UGFzc3dvcmQ6\r\n'); }
+            else if (authStep === 2) { authStep = 0; socket.write('235 OK\r\n'); }
+            else if (up.startsWith('MAIL FROM:')) socket.write('250 OK\r\n');
+            else if (up.startsWith('RCPT TO:')) socket.write('250 OK\r\n');
+            else if (up === 'DATA') { dataMode = true; lastRaw21 = ''; socket.write('354 Go ahead\r\n'); }
+            else if (up === 'RSET' || up === 'NOOP') socket.write('250 OK\r\n');
+            else if (up === 'QUIT') { socket.write('221 Bye\r\n'); socket.end(); }
+            else socket.write('250 OK\r\n');
+          }
+        });
+      });
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => { srv._sockets = sockets; resolve(srv); });
+    });
+    fakePort21 = fakeSmtp21.address().port;
+    const mkAcc21 = (email) => {
+      const info = db.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run(email, 'A13', encryptSecret('FAKEPASS', key),
+        '127.0.0.1', 9999, 'SSL', '127.0.0.1', fakePort21, 'STARTTLS', 1);
+      const accountId = Number(info.lastInsertRowid);
+      const f = db.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已发送', '已发送', 'sent')").run(accountId);
+      return { accountId, sentId: Number(f.lastInsertRowid) };
+    };
+    // 场景 A：OquMail 服务器副本（Message-ID 不同、指纹相同）已同步到
+    // 本地 → 同一幂等键重认领不再重发（DATA 次数不变、duplicate:true）。
+    {
+      const { accountId, sentId } = mkAcc21('a13a@163.com');
+      const sendBody = { accountId, to: 'r@163.com', subject: 'audit13 reclaim', text: 'hello reclaim', idempotencyKey: 'a13-reclaim-a' };
+      const before = smtpDataCount21;
+      const r1 = await api('POST', '/api/messages/send', sendBody);
+      check('audit13 HIGH: first send succeeds via fake SMTP (201)',
+        r1.status === 201 && r1.json?.ok === true, `status=${r1.status} body=${JSON.stringify(r1.json)?.slice(0, 160)}`);
+      check('audit13 HIGH: first send did one SMTP DATA', smtpDataCount21 === before + 1, `count=${smtpDataCount21}`);
+      // 模拟崩溃：占位行 message_id 清空（SMTP 已接受、回填前崩溃）、
+      // created_at 推到 11 分钟前（F6 过期 → 重认领路径）。
+      db.prepare("UPDATE sent_idempotency SET message_id=NULL, created_at=datetime('now','-11 minutes') WHERE account_id=? AND idempotency_key=?").run(accountId, 'a13-reclaim-a');
+      const createdAt = db.prepare('SELECT created_at FROM sent_idempotency WHERE account_id=? AND idempotency_key=?').get(accountId, 'a13-reclaim-a').created_at;
+      const copyDateIso = String(createdAt).replace(' ', 'T') + 'Z';
+      // 同步已把 OquMail 服务器副本取回本地：Message-ID 是重写后的，
+      // 主题/发件人/收件人/时间与原发送一致。
+      db.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+        from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
+        VALUES (?,?,?,?,?,?,?,?,?,'',1,0,?,'[]')`).run(
+        accountId, sentId, 500, '<rewritten-a@oqumail.example>', 'audit13 reclaim', 'a13a@163.com',
+        'A13', '["r@163.com"]', copyDateIso, lastRaw21.length);
+      const r2 = await api('POST', '/api/messages/send', sendBody);
+      check('audit13 HIGH: OquMail server copy (different Message-ID, same fingerprint) re-claim returns duplicate, no resend',
+        r2.status === 200 && r2.json?.duplicate === true && smtpDataCount21 === before + 1,
+        `status=${r2.status} body=${JSON.stringify(r2.json)?.slice(0, 160)} dataCount=${smtpDataCount21}`);
+    }
+    // 场景 B：对照——服务器副本收件人不同 → 指纹不命中，重发正常进行。
+    {
+      const { accountId, sentId } = mkAcc21('a13b@163.com');
+      const sendBody = { accountId, to: 'r@163.com', subject: 'audit13 reclaim', text: 'hello reclaim b', idempotencyKey: 'a13-reclaim-b' };
+      const before = smtpDataCount21;
+      const r1 = await api('POST', '/api/messages/send', sendBody);
+      check('audit13 HIGH control setup: first send succeeds (201)', r1.status === 201 && r1.json?.ok === true, `status=${r1.status}`);
+      db.prepare("UPDATE sent_idempotency SET message_id=NULL, created_at=datetime('now','-11 minutes') WHERE account_id=? AND idempotency_key=?").run(accountId, 'a13-reclaim-b');
+      const createdAt = db.prepare('SELECT created_at FROM sent_idempotency WHERE account_id=? AND idempotency_key=?').get(accountId, 'a13-reclaim-b').created_at;
+      const copyDateIso = String(createdAt).replace(' ', 'T') + 'Z';
+      db.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+        from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
+        VALUES (?,?,?,?,?,?,?,?,?,'',1,0,?,'[]')`).run(
+        accountId, sentId, 501, '<rewritten-b@oqumail.example>', 'audit13 reclaim', 'a13b@163.com',
+        'A13', '["other@163.com"]', copyDateIso, lastRaw21.length);
+      const r2 = await api('POST', '/api/messages/send', sendBody);
+      check('audit13 HIGH control: server copy with different recipient does NOT match fingerprint — re-claim resends',
+        r2.status === 201 && r2.json?.duplicate !== true && smtpDataCount21 === before + 2,
+        `status=${r2.status} body=${JSON.stringify(r2.json)?.slice(0, 160)} dataCount=${smtpDataCount21}`);
+    }
+  } finally {
+    if (fakeSmtp21) { try { for (const s of fakeSmtp21._sockets || []) s.destroy(); fakeSmtp21.close(); } catch { /* ignore */ } }
+  }
+
+  // L2/L1/L3/L4 的引擎级断言（假 IMAP 客户端，不触网）。
+  {
+    const { SyncEngine, sentFingerprintMatches } = await import('../dist/engine.js');
+    const { openDb } = await import('../dist/db.js');
+    const vdb = openDb();
+    const T13 = new Date('2026-11-19T10:00:00Z').getTime();
+    const isoT13 = new Date(T13).toISOString();
+    // L2：指纹加收件人——同主题/同发件人/5 秒内/大小相近、收件人不同
+    // 的两封信不再合并；收件人相同（大小写/顺序不同）仍合并；任一边
+    // 缺收件人信息时跳过该项（旧行 to_json 为空时不误判）。
+    const fpBase = { subject: 'fp to', from: 'a@163.com', dateMs: T13, size: 1000, messageId: '<own@luck-mail.local>', to: ['r@163.com'] };
+    check('audit13 L2: fingerprint matches same recipient (case/order-insensitive)',
+      sentFingerprintMatches(fpBase, { ...fpBase, to: ['R@163.com'] }));
+    check('audit13 L2: fingerprint rejects different recipient',
+      !sentFingerprintMatches(fpBase, { ...fpBase, dateMs: T13 + 5000, to: ['other@163.com'] }));
+    check('audit13 L2: fingerprint skips recipient check when one side has none',
+      sentFingerprintMatches(fpBase, { ...fpBase, to: [] }));
+    const mkSentAcc13 = (email) => {
+      const a = vdb.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run(email, 'A13', encryptSecret('FAKE', key),
+        'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+      const accountId = Number(a.lastInsertRowid);
+      const f = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已发送', '已发送', 'sent')").run(accountId);
+      return { accountId, sentId: Number(f.lastInsertRowid) };
+    };
+    const { accountId: fpAcc, sentId: fpSent } = mkSentAcc13('fp-to@163.com');
+    const fpSeed = vdb.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+      from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
+      VALUES (?,?,?,?,?,?,?,?,?,'',1,0,1000,'[]')`).run(
+      fpAcc, fpSent, 31, '<fp-own@luck-mail.local>', 'fp to', 'a@163.com', 'A', '["r@163.com"]', isoT13);
+    const fpSeedId = Number(fpSeed.lastInsertRowid);
+    const engine13 = new SyncEngine(key);
+    check('audit13 L2: findSentFingerprintDuplicate matches same recipient 5s apart',
+      engine13.findSentFingerprintDuplicate(fpAcc, fpSent, { subject: 'fp to', from: 'a@163.com', to: ['r@163.com'], dateMs: T13 + 5000, size: 1000, messageId: '<other@x>' }) === fpSeedId);
+    check('audit13 L2: findSentFingerprintDuplicate does NOT merge same subject/from 5s apart with different recipient',
+      engine13.findSentFingerprintDuplicate(fpAcc, fpSent, { subject: 'fp to', from: 'a@163.com', to: ['other@163.com'], dateMs: T13 + 5000, size: 1000, messageId: '<other@x>' }) === null);
+    // HIGH 服务器分支：findSentByFingerprint 在服务器已发送里按指纹
+    // 找到 OquMail 副本；收件人不同时找不到。
+    {
+      const fakeClient = {
+        usable: true,
+        mailbox: { path: '已发送' },
+        mailboxOpen: async (p) => { fakeClient.mailbox = { path: p }; return { uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: 2 }; },
+        search: async () => [100, 101],
+        fetch: async function* () {
+          yield { uid: 100, envelope: { messageId: '<fp-own@luck-mail.local>', subject: 'fp to', from: [{ address: 'a@163.com' }], to: [{ address: 'r@163.com' }], date: new Date(T13) }, size: 1000 };
+          yield { uid: 101, envelope: { messageId: '<fp-srv@oqumail>', subject: 'fp to', from: [{ address: 'a@163.com' }], to: [{ address: 'r@163.com' }], date: new Date(T13 + 4000) }, size: 1000 };
+        },
+      };
+      engine13.states.set(fpAcc, { client: fakeClient, queue: Promise.resolve(), opFailures: 0 });
+      const hit = await engine13.findSentByFingerprint(fpAcc, { subject: 'fp to', from: 'a@163.com', to: ['r@163.com'], dateMs: T13, size: 1000, messageId: '<own@luck-mail.local>' });
+      check('audit13 HIGH: findSentByFingerprint finds the OquMail server copy by fingerprint',
+        hit?.uid === 101 && hit?.folderId === fpSent, JSON.stringify(hit));
+      const miss = await engine13.findSentByFingerprint(fpAcc, { subject: 'fp to', from: 'a@163.com', to: ['nobody@163.com'], dateMs: T13, size: 1000, messageId: '<own@luck-mail.local>' });
+      check('audit13 HIGH: findSentByFingerprint with different recipient finds nothing', miss === null, JSON.stringify(miss));
+      engine13.states.delete(fpAcc);
+    }
+    // 按 range 回放信封的假 IMAP 客户端（供 L1/L3 清扫测试）：fetch 只
+    // 回放落在请求 range 内的信封——窗口修没修、扫没扫到才测得出来。
+    const mkRangeClient = (byPath) => {
+      const c = {
+        usable: true,
+        mailbox: { path: '' },
+        _moved: [], _deleted: [],
+        mailboxOpen: async (p) => { c.mailbox = { path: p }; return { uidValidity: undefined, uidNext: undefined, highestModseq: null, exists: 1 }; },
+        search: async () => [...(byPath[c.mailbox.path]?.uids || [])],
+        fetch: async function* (range) {
+          const spec = String(range);
+          const envs = byPath[c.mailbox.path]?.envs || [];
+          if (spec.includes(',')) {
+            const want = new Set(spec.split(',').map(Number));
+            for (const env of envs) if (want.has(env.uid)) yield env;
+            return;
+          }
+          const m = spec.match(/^(\d+)(?::(\d+))?$/);
+          const lo = Number(m[1]);
+          const hi = m[2] ? Number(m[2]) : lo;
+          for (const env of envs) if (env.uid >= lo && env.uid <= hi) yield env;
+        },
+        messageMove: async (uid, target) => { c._moved.push([String(uid), target]); return { uidMap: new Map([[Number(uid), 200]]) }; },
+        messageFlagsAdd: async (uid) => { /* sweep 用 */ },
+        messageDelete: async (uid) => { c._deleted.push(String(uid)); },
+      };
+      return c;
+    };
+    const mkTrashAcc13 = (email) => {
+      const a = vdb.prepare(
+        `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+          smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+      ).run(email, 'A13', encryptSecret('FAKE', key),
+        'imap.163.com', 993, 'SSL', 'smtp.163.com', 465, 'SSL', 0);
+      const accountId = Number(a.lastInsertRowid);
+      const sentF = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已发送', '已发送', 'sent')").run(accountId);
+      const trashF = vdb.prepare("INSERT INTO folders (account_id, path, name, type) VALUES (?, '已删除', '已删除', 'trash')").run(accountId);
+      return { accountId, sentId: Number(sentF.lastInsertRowid), trashId: Number(trashF.lastInsertRowid) };
+    };
+    // L1(a)+L3：彻底删除已删除文件夹里的信时，第二遍清扫（已发送）用
+    // 全量窗口——双生副本 UID 5 落在最后 100 名之外（已发送共 150 封），
+    // 旧版只取最后 100 个扫不到；清扫删掉的双生副本 Message-ID 写进墓碑。
+    {
+      const { accountId, sentId, trashId } = mkTrashAcc13('sweep-full@163.com');
+      const msgInfo = vdb.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+        from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
+        VALUES (?,?,?,?,?,?,?,?,?,'',1,0,500,'[]')`).run(
+        accountId, trashId, 900, '<old-own@luck-mail.local>', 'old twin', 'c@163.com', 'C', '[]', '2026-01-01T10:00:00Z');
+      const msgId = Number(msgInfo.lastInsertRowid);
+      const sentUids = Array.from({ length: 150 }, (_, i) => i + 1);
+      const fakeClient = mkRangeClient({
+        '已删除': {
+          uids: [900, 901],
+          envs: [
+            { uid: 900, envelope: { messageId: '<old-own@luck-mail.local>', subject: 'old twin', from: [{ address: 'c@163.com' }], to: [], date: new Date('2026-01-01T10:00:00Z') }, size: 500 },
+            { uid: 901, envelope: { messageId: '<other@x>', subject: 'unrelated', from: [{ address: 'd@163.com' }], to: [], date: new Date('2026-01-02T10:00:00Z') }, size: 700 },
+          ],
+        },
+        '已发送': {
+          uids: sentUids,
+          envs: [
+            { uid: 5, envelope: { messageId: '<old-srv@oqumail>', subject: 'old twin', from: [{ address: 'c@163.com' }], to: [], date: new Date('2026-01-01T10:00:00Z') }, size: 520 },
+            { uid: 100, envelope: { messageId: '<sent-other@x>', subject: 'other sent', from: [{ address: 'e@163.com' }], to: [], date: new Date('2026-01-03T10:00:00Z') }, size: 800 },
+          ],
+        },
+      });
+      const engine = new SyncEngine(key);
+      engine.states.set(accountId, { client: fakeClient, queue: Promise.resolve(), opFailures: 0 });
+      const ok = await engine.deleteMessage(accountId, msgId);
+      check('audit13 L1(a): permanent delete sweeps the old OquMail twin in Sent outside the last-100 window (uid 5 of 150)',
+        ok === true && fakeClient._deleted.includes('900') && fakeClient._deleted.includes('5'),
+        `deleted=${JSON.stringify(fakeClient._deleted)}`);
+      const tombs = vdb.prepare('SELECT message_id FROM deleted_messages WHERE account_id=? ORDER BY message_id').all(accountId).map((r) => r.message_id);
+      check('audit13 L3: tombstone records both the deleted message and its swept twin Message-ID',
+        tombs.includes('<old-own@luck-mail.local>') && tombs.includes('<old-srv@oqumail>'),
+        JSON.stringify(tombs));
+      engine.states.delete(accountId);
+    }
+    // L1(b)：message_id 为 null 的信也走指纹清扫——从已发送删信（移入
+    // 已删除）时，无 Message-ID 的双生副本同样被清掉。
+    {
+      const { accountId, sentId, trashId } = mkTrashAcc13('sweep-null@163.com');
+      const msgInfo = vdb.prepare(`INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+        from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
+        VALUES (?,?,?,?,?,?,?,?,?,'',1,0,400,'[]')`).run(
+        accountId, sentId, 100, null, 'null mid', 'n@163.com', 'N', '[]', '2026-11-19T10:00:00Z');
+      const msgId = Number(msgInfo.lastInsertRowid);
+      const fakeClient = mkRangeClient({
+        '已发送': {
+          uids: [77, 100],
+          envs: [
+            { uid: 77, envelope: { messageId: '<null-twin@x>', subject: 'null mid', from: [{ address: 'n@163.com' }], to: [], date: new Date('2026-11-19T10:00:00Z') }, size: 410 },
+            { uid: 100, envelope: { messageId: null, subject: 'null mid', from: [{ address: 'n@163.com' }], to: [], date: new Date('2026-11-19T10:00:00Z') }, size: 400 },
+          ],
+        },
+      });
+      const engine = new SyncEngine(key);
+      engine.states.set(accountId, { client: fakeClient, queue: Promise.resolve(), opFailures: 0 });
+      const ok = await engine.deleteMessage(accountId, msgId);
+      const rowAfter = vdb.prepare('SELECT folder_id, uid FROM messages WHERE id=?').get(msgId);
+      check('audit13 L1(b): deleting a sent message with null Message-ID still sweeps its fingerprint twin (uid 77)',
+        ok === true && fakeClient._moved.length === 1 && fakeClient._moved[0][0] === '100'
+        && fakeClient._deleted.includes('77')
+        && rowAfter.folder_id === trashId && rowAfter.uid === 200,
+        `moved=${JSON.stringify(fakeClient._moved)} deleted=${JSON.stringify(fakeClient._deleted)} row=${JSON.stringify(rowAfter)}`);
+      engine.states.delete(accountId);
+    }
+    // L4：同步建连前的解析校验（缓存版）——本测试进程未设
+    // ALLOW_PRIVATE_MAIL_HOSTS，拒绝路径如实触发；公网地址放行。
+    {
+      const { assertHostsSafe } = await import('../dist/imapUtil.js');
+      let threwLoopback = false;
+      try { await assertHostsSafe(['ip6-localhost']); } catch { threwLoopback = true; }
+      check('audit13 L4: assertHostsSafe rejects a hostname resolving to loopback', threwLoopback);
+      let threwLiteral = false;
+      try { await assertHostsSafe(['127.0.0.1']); } catch { threwLiteral = true; }
+      check('audit13 L4: assertHostsSafe rejects a loopback literal without DNS', threwLiteral);
+      let threwPublic = false;
+      try { await assertHostsSafe(['8.8.8.8']); } catch { threwPublic = true; }
+      check('audit13 L4: assertHostsSafe allows a public literal IP', !threwPublic);
+    }
+  }
+
+  // ---------- 22. audit #14 fixes ----------
+  console.log('== audit #14 fixes ==');
+  {
+    // Audit #14 LOW-1：发信幂等占位“无行认领”竞态——claimSendKey 在
+    // INSERT 冲突后两次都读不到行时，旧版谎报 claimed（库里无占位行，
+    // 本次发送失去幂等保护）；新版 fail closed 返回 in-progress（409）。
+    // 该竞态是微秒级窗口：双 worker 线程模拟曾试过，但紧循环抢同一
+    // WAL 写锁时单条语句的 busy 等待把测试拖到分钟级，已放弃；这里用
+    // claimSendKey 的测试用注入参数（第 4 参，默认 findSendKey）确定
+    // 性覆盖：先插一行让 INSERT 冲突，再让查找恒返回 undefined，模拟
+    // “行在两次读之间被并发删除”。F6 重认领 catch 分支是同款一行修
+    // 改（对称处理，未单独覆盖——要触发它还需 DELETE 与重插之间再有
+    // 一次并发插入，同样测不到）。
+    const { claimSendKey, findSendKey } = await import('../dist/idempotency.js');
+    const { openDb } = await import('../dist/db.js');
+    const vdb22 = openDb();
+    const raceAccount = 424244;
+    const raceKey = 'phantom-k-14';
+    vdb22.prepare(
+      `INSERT INTO sent_idempotency (account_id, idempotency_key, message_db_id, message_id, planned_message_id, created_at)
+       VALUES (?, ?, NULL, NULL, '<phantom-planned@x>', datetime('now'))`,
+    ).run(raceAccount, raceKey);
+    const phantom = claimSendKey(raceAccount, raceKey, null, () => undefined);
+    check('audit14 LOW-1: claim with row vanishing after UNIQUE conflict fails closed (in-progress, row null)',
+      phantom.status === 'in-progress' && phantom.row === null,
+      JSON.stringify(phantom));
+    const stillThere = findSendKey(raceAccount, raceKey);
+    check('audit14 LOW-1: phantom claim leaves the existing row untouched',
+      !!stillThere && stillThere.planned_message_id === '<phantom-planned@x>',
+      JSON.stringify(stillThere?.planned_message_id));
+    // 对照组：真实查找下同一行应返回 in-progress 且带回该行（未过期、
+    // message_id 为空 → 首发进行中），证明注入参数没改正常路径。
+    const real = claimSendKey(raceAccount, raceKey);
+    check('audit14 LOW-1 control: real lookup on the same row returns in-progress with the row',
+      real.status === 'in-progress' && real.row?.planned_message_id === '<phantom-planned@x>',
+      JSON.stringify(real.status));
+    vdb22.prepare('DELETE FROM sent_idempotency WHERE account_id=? AND idempotency_key=?').run(raceAccount, raceKey);
+    // Audit #15 L1：F6 重认领 catch 分支原来是裸 catch——重插失败不是
+    // UNIQUE 冲突（例如 SQLITE_BUSY、磁盘满）时也被吞掉，调用方按重读
+    // 结果返回 in-progress（409），真实错误无日志。新版与 :100-107
+    // 的另一重试分支同款：非 UNIQUE 错误重新抛出。
+    // 触发手段：先建一行过期占位（created_at 推到 11 分钟前），再在
+    // 表上建一个只对本 key 生效的临时触发器，让重插以自定义错误失败
+    // （不是 UNIQUE 冲突）；断言 claimSendKey 把该错误抛出来，而不是
+    // 返回 in-progress。触发器用完即删，不影响后续测试。
+    const f6Account = 424245;
+    const f6Key = 'f6-boom-k-15';
+    vdb22.prepare(
+      `INSERT INTO sent_idempotency (account_id, idempotency_key, message_db_id, message_id, planned_message_id, created_at)
+       VALUES (?, ?, NULL, NULL, '<f6-planned@x>', datetime('now','-11 minutes'))`,
+    ).run(f6Account, f6Key);
+    vdb22.prepare(
+      `CREATE TRIGGER verify_f6_boom AFTER INSERT ON sent_idempotency
+       WHEN NEW.idempotency_key='f6-boom-k-15'
+       BEGIN SELECT RAISE(ABORT, 'simulated disk full'); END`,
+    ).run();
+    let boomErr = null;
+    try {
+      claimSendKey(f6Account, f6Key);
+    } catch (e) {
+      boomErr = e;
+    }
+    check('audit15 L1: non-UNIQUE error on F6 re-claim re-INSERT is rethrown, not swallowed into in-progress',
+      boomErr != null && /simulated disk full/i.test(String(boomErr?.message || boomErr)),
+      String(boomErr?.message || boomErr));
+    vdb22.prepare('DROP TRIGGER IF EXISTS verify_f6_boom').run();
+    vdb22.prepare('DELETE FROM sent_idempotency WHERE account_id=? AND idempotency_key=?').run(f6Account, f6Key);
+  }
+
+  // ---------- 23. audit #18 fixes ----------
+  console.log('== audit #18 fixes ==');
+  {
+    // Audit #18 LOW-1：stopAccount 先摘掉 error 监听再异步登出——对方在
+    // 登出握手完成前 RST 连接时，无监听的 'error' 事件直接打死进程
+    // （verify-all import18b 节末 3 次运行崩 2 次即此路径）。确定性复现：
+    // 假 IMAP 服务器收到 LOGOUT 故意不回（登出握手必然挂住），DELETE 账号
+    // 后立即对服务端 socket 调 resetAndDestroy() 发 RST——logout 必定还
+    // 在进行中，客户端 socket 收到 ECONNRESET；修好后保留的 error 监听
+    // 接住并记日志，子进程存活。修之前跑这一节会直接 abort 整个 verify-all
+    // （子进程死、health 不通）。
+    // 注意：假 IMAP 必须走明文（imapSecure STARTTLS、CAPABILITY 不报
+    // STARTTLS，imapflow 降级明文继续）——TLS socket 没有 resetAndDestroy
+    //（调它抛 ERR_INVALID_HANDLE_TYPE），只有明文 TCP socket 才能确定
+    // 发 RST；普通 destroy() 在无待发数据时只发 FIN、客户端只会干净
+    // 'close'，复现不到 error 事件。
+    {
+      let fakeImap18 = null;
+      let fakeSmtp18 = null;
+      let logoutAccId = 0;
+      let logoutHeld = false;
+      try {
+        fakeSmtp18 = await new Promise((resolve, reject) => {
+          const sockets = new Set();
+          const srv = net.createServer((socket) => {
+            sockets.add(socket);
+            socket.on('close', () => sockets.delete(socket));
+            let buf = '';
+            let authStep = 0;
+            let dataMode = false;
+            socket.write('220 localhost fake SMTP\r\n');
+            socket.on('data', (chunk) => {
+              buf += chunk.toString('utf8');
+              let idx;
+              while ((idx = buf.indexOf('\r\n')) >= 0) {
+                const line = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                if (dataMode) {
+                  if (line === '.') { dataMode = false; socket.write('250 OK: queued\r\n'); }
+                  continue;
+                }
+                const up = line.toUpperCase();
+                if (up.startsWith('EHLO') || up.startsWith('HELO')) socket.write('250-localhost\r\n250 AUTH LOGIN PLAIN\r\n');
+                else if (up.startsWith('AUTH PLAIN')) { authStep = 0; socket.write('235 OK\r\n'); }
+                else if (up.startsWith('AUTH LOGIN')) { authStep = 1; socket.write('334 VXNlcm5hbWU6\r\n'); }
+                else if (authStep === 1) { authStep = 2; socket.write('334 UGFzc3dvcmQ6\r\n'); }
+                else if (authStep === 2) { authStep = 0; socket.write('235 OK\r\n'); }
+                else if (up === 'QUIT') { socket.write('221 Bye\r\n'); socket.end(); }
+                else socket.write('250 OK\r\n');
+              }
+            });
+          });
+          srv.on('error', reject);
+          srv.listen(0, '127.0.0.1', () => { srv._sockets = sockets; resolve(srv); });
+        });
+        const fakeSmtpPort18 = fakeSmtp18.address().port;
+        fakeImap18 = await new Promise((resolve, reject) => {
+          const sockets = new Set();
+          // 明文假 IMAP（见节首注释：只有明文 socket 才能 resetAndDestroy
+          // 确定发 RST）。CAPABILITY 故意不报 STARTTLS，imapflow 明文继续。
+          const srv = net.createServer((socket) => {
+            sockets.add(socket);
+            socket.on('close', () => sockets.delete(socket));
+            let buf = '';
+            let idleTag = null;
+            socket.write('* OK fake IMAP ready\r\n');
+            socket.on('data', (chunk) => {
+              buf += chunk.toString('utf8');
+              let idx;
+              while ((idx = buf.indexOf('\r\n')) >= 0) {
+                const line = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                if (idleTag) {
+                  if (line.toUpperCase() === 'DONE') { socket.write(`${idleTag} OK IDLE completed\r\n`); idleTag = null; }
+                  continue;
+                }
+                const m = line.match(/^(\S+)\s+(\S+)(?:\s+(.*))?$/);
+                if (!m) continue;
+                const [, tag, cmdRaw, rest] = m;
+                const cmd = cmdRaw.toUpperCase();
+                if (cmd === 'CAPABILITY') socket.write(`* CAPABILITY IMAP4rev1 IDLE UIDPLUS\r\n${tag} OK CAPABILITY completed\r\n`);
+                else if (cmd === 'LOGIN') {
+                  const parts = (rest || '').split(/\s+/);
+                  const pass = (parts[1] || '').replace(/^"|"$/g, '');
+                  if (pass === 'GOODPASS') socket.write(`${tag} OK LOGIN completed\r\n`);
+                  else socket.write(`${tag} NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n`);
+                } else if (cmd === 'LOGOUT') {
+                  // 关键：故意不回 LOGOUT——登出握手挂住，DELETE 后立即毁
+                  // socket 时 logout 必定还在进行中，复现才确定。
+                  logoutHeld = true;
+                } else if (cmd === 'LIST') socket.write(`* LIST (\\HasNoChildren) "/" INBOX\r\n${tag} OK LIST completed\r\n`);
+                else if (cmd === 'SELECT') socket.write(`* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted\r\n* 0 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n* OK [UIDNEXT 1] Predicted next UID\r\n${tag} OK [READ-WRITE] SELECT completed\r\n`);
+                else if (cmd === 'SEARCH') socket.write(`* SEARCH\r\n${tag} OK SEARCH completed\r\n`);
+                else if (cmd === 'IDLE') { idleTag = tag; socket.write('+ idling\r\n'); }
+                else socket.write(`${tag} OK ${cmd} completed\r\n`);
+              }
+            });
+          });
+          srv.on('error', reject);
+          srv.listen(0, '127.0.0.1', () => { srv._sockets = sockets; resolve(srv); });
+        });
+        const fakeImapPort18 = fakeImap18.address().port;
+        // 注意：不用 CSV 导入接口——它限流 5 次/分钟，前面小节已用完额度
+        // （曾因此 429）；单个添加 POST /api/accounts 不限流，同样先测
+        // 连通再入库、同样启动引擎。
+        const addRes18 = await api('POST', '/api/accounts', {
+          email: 'goodlogout@gmail.com',
+          password: 'GOODPASS',
+          imapHost: '127.0.0.1',
+          imapPort: fakeImapPort18,
+          imapSecure: 'STARTTLS',
+          smtpHost: '127.0.0.1',
+          smtpPort: fakeSmtpPort18,
+          smtpSecure: 'STARTTLS',
+        });
+        const row18 = db.prepare('SELECT * FROM accounts WHERE email=?').get('goodlogout@gmail.com');
+        logoutAccId = row18 ? Number(row18.id) : 0;
+        check('audit18 LOW-1: good account imported for logout-race test', !!row18 && addRes18.status === 201,
+          `status=${addRes18.status} error=${JSON.stringify(addRes18.json?.error)} row=${!!row18}`);
+        let online18 = false;
+        for (let i = 0; i < 20; i++) {
+          const l = await api('GET', '/api/accounts');
+          const g = (l.json?.accounts || []).find((a) => a.email === 'goodlogout@gmail.com');
+          if (g?.status === 'online') { online18 = true; break; }
+          await new Promise((r2) => setTimeout(r2, 500));
+        }
+        check('audit18 LOW-1: account online before DELETE (live IDLE connection exists)', online18);
+        if (online18 && logoutAccId) {
+          const logBefore18 = serverLog.length;
+          await api('DELETE', `/api/accounts/${logoutAccId}`);
+          // 假服务器根本没回 LOGOUT，登出握手此时必然还在进行中；立即毁
+          // 掉全部服务端 socket，客户端 socket 收到 ECONNRESET。
+          // 注意：必须用 resetAndDestroy() 发 RST——普通 destroy() 在无
+          // 待发数据时只发 FIN，客户端只会看到干净 EOF（'close' 事件，
+          // 不触发 'error'）；import18b 之所以 3 次崩 2 次，正是毁 socket
+          // 时服务端刚写了 LOGOUT 回包、待发数据未 flush 干净才发了 RST。
+          // resetAndDestroy 显式发 RST，复现才确定，与待发数据无关。
+          check('audit18 LOW-1: fake server held LOGOUT (logout was in flight at DELETE)', logoutHeld);
+          try { for (const s of fakeImap18._sockets || []) (typeof s.resetAndDestroy === 'function' ? s.resetAndDestroy() : s.destroy()); } catch { /* ignore */ }
+          await new Promise((r2) => setTimeout(r2, 1500));
+          let healthOk18 = false;
+          try {
+            const hr = await api('GET', '/api/health');
+            healthOk18 = hr.status === 200 && hr.json?.ok === true;
+          } catch { healthOk18 = false; }
+          check('audit18 LOW-1: server survives socket error during logout (health 200, no abort)', healthOk18);
+          let apiOk18 = false;
+          try {
+            const lr = await api('GET', '/api/accounts');
+            apiOk18 = lr.status === 200 && Array.isArray(lr.json?.accounts);
+          } catch { apiOk18 = false; }
+          check('audit18 LOW-1: API still responsive after the race', apiOk18);
+          const newLog18 = serverLog.slice(logBefore18);
+          check('audit18 LOW-1: retained error listener logged the socket error (race actually exercised)',
+            newLog18.includes(`imap account ${logoutAccId} error`),
+            newLog18.slice(-300));
+        }
+      } finally {
+        if (fakeImap18) {
+          try { for (const s of fakeImap18._sockets || []) s.destroy(); } catch { /* ignore */ }
+          await new Promise((resolve) => fakeImap18.close(resolve));
+        }
+        if (fakeSmtp18) {
+          try { for (const s of fakeSmtp18._sockets || []) s.destroy(); } catch { /* ignore */ }
+          await new Promise((resolve) => fakeSmtp18.close(resolve));
+        }
+      }
+    }
+  }
+
+  // ---------- 24. audit #19 fixes ----------
+  console.log('== audit #19 fixes ==');
+  {
+    // Audit #19 HIGH-1：自发邮件的收件箱副本与已发送副本共享同一
+    // Message-ID，先后移入已删除时旧版在本地 UPDATE 上撞唯一索引
+    // idx_messages_account_folder_mid（db.ts:429），服务器移动已不可逆、
+    // 本地行永久 stale，重试仍报 UNIQUE。修法：_moveMessage 移动前预查
+    // 目标文件夹同 Message-ID 行、有则合并（服务器端删源副本、本地删
+    // 源行、目标里已有行作代表）；UPDATE 抛错时补偿（有代表行则删源行，
+    // 否则移回服务器副本再抛原错）。以下用真实编译产物 + 模拟 IMAP
+    // 客户端直测引擎（审计员 /tmp/audit19-repro.cjs 同款，UIDPLUS 与
+    // 非 UIDPLUS 两个变体；enabled=0，活服务器的引擎不会碰这些假账号）。
+    const { openDb } = await import('../dist/db.js');
+    const { SyncEngine } = await import('../dist/engine.js');
+    const vdb24 = openDb();
+    const MID24 = '<self19@x>';
+    const mkAcc24 = (email) => Number(vdb24.prepare(
+      `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+        smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+    ).run(email, '', encryptSecret('FAKE', key), '127.0.0.1', 9999, 'SSL', '127.0.0.1', 9999, 'STARTTLS', 0).lastInsertRowid);
+    const mkFolders24 = (accId) => {
+      const mk = (p, name, type) => Number(vdb24.prepare(
+        'INSERT INTO folders (account_id, path, name, type) VALUES (?,?,?,?)',
+      ).run(accId, p, name, type).lastInsertRowid);
+      return { inboxId: mk('INBOX', 'INBOX', 'inbox'), sentId: mk('Sent', 'Sent', 'sent'), trashId: mk('Trash', 'Trash', 'trash') };
+    };
+    const seedTwin24 = (accId, inboxId, sentId) => {
+      const now = new Date().toISOString();
+      const mk = (folderId, uid) => Number(vdb24.prepare(
+        `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date, size, is_read)
+         VALUES (?,?,?,?,?,?,?,?,?,1)`,
+      ).run(accId, folderId, uid, MID24, 'self mail', 'self@163.com', JSON.stringify(['self@163.com']), now, 100).lastInsertRowid);
+      return { inboxRowId: mk(inboxId, 10), sentRowId: mk(sentId, 20) };
+    };
+    const countIn24 = (accId, folderId) => vdb24.prepare(
+      'SELECT COUNT(*) c FROM messages WHERE account_id=? AND folder_id=?',
+    ).get(accId, folderId).c;
+    const makeServer24 = () => ({
+      INBOX: new Map([[10, { messageId: MID24 }]]),
+      Sent: new Map([[20, { messageId: MID24 }]]),
+      Trash: new Map(),
+      nextUid: { INBOX: 11, Sent: 21, Trash: 1 },
+    });
+    let server24 = makeServer24();
+    let uidplus24 = true;
+    let onMove24 = null; // 补偿分支测试用：在 messageMove 期间插双生行
+    const makeClient24 = () => {
+      let selected = null;
+      const client = {
+        mailbox: null,
+        on() {}, removeAllListeners() {}, logout: async () => {},
+        async mailboxOpen(p) {
+          selected = p;
+          client.mailbox = { path: p };
+          const box = server24[p];
+          return { exists: box ? box.size : 0, uidValidity: 1, uidNext: server24.nextUid[p] || 1 };
+        },
+        async messageMove(uidStr, target) {
+          const uid = Number(uidStr);
+          const src = server24[selected];
+          if (onMove24) onMove24(selected, uid, target);
+          if (!src || !src.has(uid)) return {};
+          const msg = src.get(uid);
+          src.delete(uid);
+          const nu = server24.nextUid[target]++;
+          server24[target].set(nu, msg);
+          if (uidplus24) return { uidMap: new Map([[uid, nu]]) };
+          return {};
+        },
+        async search() {
+          const box = server24[selected];
+          return box ? [...box.keys()] : [];
+        },
+        async *fetch(range) {
+          const box = server24[selected];
+          if (!box) return;
+          const [a, b] = String(range).split(':').map(Number);
+          const lo = Math.min(a, b), hi = Math.max(a, b);
+          for (const [uid, m] of [...box.entries()].sort((x, y) => x[0] - y[0])) {
+            if (uid >= lo && uid <= hi) {
+              yield { uid, envelope: { messageId: m.messageId, subject: 'self mail', from: [{ address: 'self@163.com' }] }, size: 100 };
+            }
+          }
+        },
+        async messageFlagsAdd() {},
+        async messageDelete(uidStr) {
+          const box = server24[selected];
+          if (box) box.delete(Number(uidStr));
+        },
+      };
+      return client;
+    };
+    const engine24 = new SyncEngine(key);
+    engine24.withClient = async (accountId, fn) => fn(makeClient24());
+
+    // A. 主序列（UIDPLUS）：先删已发送副本、再删收件箱副本。
+    server24 = makeServer24();
+    uidplus24 = true;
+    onMove24 = null;
+    const accA = mkAcc24('self19a@163.com');
+    const fA = mkFolders24(accA);
+    const rowsA = seedTwin24(accA, fA.inboxId, fA.sentId);
+    let errA1 = null; let errA2 = null;
+    try { await engine24.deleteMessage(accA, rowsA.sentRowId); } catch (e) { errA1 = e; }
+    try { await engine24.deleteMessage(accA, rowsA.inboxRowId); } catch (e) { errA2 = e; }
+    check('audit19 HIGH-1: delete sent copy then inbox copy both succeed (no UNIQUE)',
+      errA1 === null && errA2 === null, `err1=${errA1?.message} err2=${errA2?.message}`);
+    check('audit19 HIGH-1: trash holds exactly one merged row, inbox/sent empty, no stale row',
+      countIn24(accA, fA.trashId) === 1 && countIn24(accA, fA.inboxId) === 0 && countIn24(accA, fA.sentId) === 0,
+      `trash=${countIn24(accA, fA.trashId)} inbox=${countIn24(accA, fA.inboxId)} sent=${countIn24(accA, fA.sentId)}`);
+    check('audit19 HIGH-1: server INBOX/Sent empty, Trash has exactly one copy',
+      server24.INBOX.size === 0 && server24.Sent.size === 0 && server24.Trash.size === 1,
+      `INBOX=${[...server24.INBOX.keys()]} Sent=${[...server24.Sent.keys()]} Trash=${[...server24.Trash.keys()]}`);
+    let errA3 = null;
+    try { await engine24.deleteMessage(accA, rowsA.inboxRowId); } catch (e) { errA3 = e; }
+    check('audit19 HIGH-1: retrying the merged-away inbox copy reports "邮件不存在", not UNIQUE',
+      errA3 != null && /邮件不存在/.test(errA3.message) && !/UNIQUE/i.test(errA3.message),
+      String(errA3?.message));
+
+    // B. 反向顺序：先删收件箱副本、再删已发送副本。
+    server24 = makeServer24();
+    const accB = mkAcc24('self19b@163.com');
+    const fB = mkFolders24(accB);
+    const rowsB = seedTwin24(accB, fB.inboxId, fB.sentId);
+    let errB = null;
+    try {
+      await engine24.deleteMessage(accB, rowsB.inboxRowId);
+      await engine24.deleteMessage(accB, rowsB.sentRowId);
+    } catch (e) { errB = e; }
+    check('audit19 HIGH-1 reverse: delete inbox copy then sent copy both succeed',
+      errB === null, String(errB?.message));
+    check('audit19 HIGH-1 reverse: trash holds exactly one merged row',
+      countIn24(accB, fB.trashId) === 1 && countIn24(accB, fB.inboxId) === 0 && countIn24(accB, fB.sentId) === 0,
+      `trash=${countIn24(accB, fB.trashId)} inbox=${countIn24(accB, fB.inboxId)} sent=${countIn24(accB, fB.sentId)}`);
+
+    // C. 非 UIDPLUS 变体：无 uidMap 时走 Message-ID 反查，合并仍生效。
+    server24 = makeServer24();
+    uidplus24 = false;
+    const accC = mkAcc24('self19c@163.com');
+    const fC = mkFolders24(accC);
+    const rowsC = seedTwin24(accC, fC.inboxId, fC.sentId);
+    let errC = null;
+    try {
+      await engine24.deleteMessage(accC, rowsC.sentRowId);
+      await engine24.deleteMessage(accC, rowsC.inboxRowId);
+    } catch (e) { errC = e; }
+    check('audit19 HIGH-1 no-UIDPLUS: both deletes succeed, trash holds one merged row',
+      errC === null && countIn24(accC, fC.trashId) === 1 && countIn24(accC, fC.inboxId) === 0,
+      `err=${errC?.message} trash=${countIn24(accC, fC.trashId)} inbox=${countIn24(accC, fC.inboxId)}`);
+    uidplus24 = true;
+
+    // D. 补偿分支：移动期间目标文件夹出现同 Message-ID 行（模拟预查与
+    // UPDATE 之间的并发插入），UPDATE 撞唯一索引时补偿生效——删掉本地
+    // 源行、返回代表行，不留 stale 行。插进来的双生行 uid 是任意值
+    // （只模拟并发插入），断言只看行数、不看 uid 是否与服务器一致。
+    server24 = makeServer24();
+    const accD = mkAcc24('self19d@163.com');
+    const fD = mkFolders24(accD);
+    const rowsD = seedTwin24(accD, fD.inboxId, fD.sentId);
+    await engine24.deleteMessage(accD, rowsD.sentRowId); // 已发送副本先入已删除（代表行）
+    vdb24.prepare('DELETE FROM messages WHERE account_id=? AND folder_id=?').run(accD, fD.trashId);
+    onMove24 = () => {
+      vdb24.prepare(
+        `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date, size, is_read)
+         VALUES (?,?,?,?,?,?,?,?,?,1)`,
+      ).run(accD, fD.trashId, 999, MID24, 'self mail', 'self@163.com', JSON.stringify(['self@163.com']), new Date().toISOString(), 100);
+    };
+    let errD = null;
+    try { await engine24.deleteMessage(accD, rowsD.inboxRowId); } catch (e) { errD = e; }
+    onMove24 = null;
+    check('audit19 HIGH-1 compensation: twin inserted mid-move, delete still succeeds (UPDATE error compensated)',
+      errD === null, String(errD?.message));
+    check('audit19 HIGH-1 compensation: no stale inbox row, trash holds exactly the injected twin',
+      countIn24(accD, fD.inboxId) === 0 && countIn24(accD, fD.trashId) === 1,
+      `inbox=${countIn24(accD, fD.inboxId)} trash=${countIn24(accD, fD.trashId)}`);
+
+    // E. Audit #19 LOW-1：反查助手 mailboxOpen 后核对实际选中的邮箱，
+    // 错选时抛错、不再静默返回空；一致时正常返回。
+    {
+      const lyingClient = {
+        mailbox: { path: 'INBOX' }, // mailboxOpen 不切换，仍停留 INBOX
+        mailboxOpen: async () => ({ uidValidity: 1, uidNext: 1, highestModseq: null, exists: 1 }),
+        search: async () => [10],
+        fetch: async function* () {
+          yield { uid: 10, envelope: { messageId: MID24, subject: 'self mail', from: [{ address: 'self@163.com' }] }, size: 100 };
+        },
+      };
+      let errE = null;
+      try { await engine24._findUidByMessageId(lyingClient, 'Trash', MID24); } catch (e) { errE = e; }
+      check('audit19 LOW-1: Message-ID lookup throws on mailbox.path mismatch instead of silently returning empty',
+        errE != null && /mailbox open mismatch/.test(errE.message), String(errE?.message));
+      const honestClient = {
+        mailbox: { path: 'Trash' },
+        mailboxOpen: async function (p) { this.mailbox = { path: p }; return { uidValidity: 1, uidNext: 1, highestModseq: null, exists: 1 }; },
+        search: async () => [1],
+        fetch: async function* () {
+          yield { uid: 1, envelope: { messageId: MID24, subject: 'self mail', from: [{ address: 'self@163.com' }] }, size: 100 };
+        },
+      };
+      const uidE = await engine24._findUidByMessageId(honestClient, 'Trash', MID24);
+      check('audit19 LOW-1 control: lookup with matching mailbox still returns the UID',
+        uidE === 1, `uid=${uidE}`);
+    }
+  }
+
+  // ---------- 25. audit #20 fixes ----------
+  console.log('== audit #20 fixes ==');
+  {
+    // Audit #20 LOW-1：_findUidsByFingerprint 缺 F2 邮箱核对——指纹口径
+    // 比 Message-ID 粗（主题/发件人/时间±10 秒/大小±1024 字节/收件人），
+    // 若 mailboxOpen 静默停留在错误文件夹，清扫会读错文件夹的信封、命
+    // 中双生副本的 UID，随后按该 UID 在目标文件夹里删信可能删掉完全不
+    // 相干的另一封信。修法：助手内加同款 F2 核对（路径不符抛错）；
+    // _deleteOtherCopiesInFolder 的 sweep 把指纹调用单独包 try/catch，
+    // 抛错时只跳过指纹分支、Message-ID 分支已收集的目标照删。
+    const MID25 = '<self20@x>';
+    const now25 = new Date().toISOString();
+    const fp25 = { subject: 'self mail', from: 'self@163.com', dateMs: Date.now(), size: 100, messageId: '<planned@luck-mail.local>', to: ['self@163.com'] };
+    // engine24 是第 24 节块内的局部变量，这里自建实例（只调纯客户端
+    // 助手与清扫，不建真实连接）。
+    const { SyncEngine: SyncEngine25 } = await import('../dist/engine.js');
+    const engine25 = new SyncEngine25(key);
+
+    // A. 指纹反查：mailbox 错指时抛错、不再静默返回空。
+    {
+      const lyingClient = {
+        mailbox: { path: 'INBOX' }, // mailboxOpen 不切换，仍停留 INBOX
+        mailboxOpen: async () => ({ uidValidity: 1, uidNext: 1, highestModseq: null, exists: 1 }),
+        search: async () => [10],
+        fetch: async function* () {
+          yield { uid: 10, envelope: { messageId: MID25, subject: 'self mail', from: [{ address: 'self@163.com' }], to: [{ address: 'self@163.com' }], date: new Date() }, size: 100 };
+        },
+      };
+      let errA = null;
+      try { await engine25._findUidsByFingerprint(lyingClient, 'Trash', fp25); } catch (e) { errA = e; }
+      check('audit20 LOW-1: fingerprint lookup throws on mailbox.path mismatch instead of silently returning hits',
+        errA != null && /mailbox open mismatch/.test(errA.message), String(errA?.message));
+      const honestClient = {
+        mailbox: { path: 'Trash' },
+        mailboxOpen: async function (p) { this.mailbox = { path: p }; return { uidValidity: 1, uidNext: 1, highestModseq: null, exists: 1 }; },
+        search: async () => [1],
+        fetch: async function* () {
+          yield { uid: 1, envelope: { messageId: MID25, subject: 'self mail', from: [{ address: 'self@163.com' }], to: [{ address: 'self@163.com' }], date: new Date() }, size: 100 };
+        },
+      };
+      const hitsA = await engine25._findUidsByFingerprint(honestClient, 'Trash', fp25);
+      check('audit20 LOW-1 control: fingerprint lookup with matching mailbox still returns the UID',
+        Array.isArray(hitsA) && hitsA.length === 1 && hitsA[0] === 1, `hits=${JSON.stringify(hitsA)}`);
+    }
+
+    // B/C. 清扫 sweep：指纹分支抛错时跳过、Message-ID 双生照删；对照组
+    // 指纹分支正常工作（messageId 为 null 时只靠指纹也能清掉双生）。
+    const folder25 = { id: 1, account_id: 1, path: 'Trash', name: 'Trash', type: 'trash' };
+    const makeServer25 = () => ({
+      Trash: new Map([
+        [5, { messageId: MID25, subject: 'self mail', from: 'self@163.com', date: now25, size: 100, to: ['self@163.com'] }],
+        [9, { messageId: '<other@x>', subject: 'other mail', from: 'other@x', date: now25, size: 500, to: ['other@x'] }],
+      ]),
+      INBOX: new Map(),
+    });
+    let server25 = makeServer25();
+    const makeSweepClient25 = (stuckOnSecond) => {
+      let selected = null;
+      let opens = 0;
+      const client = {
+        mailbox: null,
+        async mailboxOpen(p) {
+          opens++;
+          selected = p;
+          // 第二次打开（指纹反查那次）卡住不动，模拟 \Noselect 命名空间
+          // 上 mailboxOpen 不报错、实际仍停留在上一个文件夹。
+          if (stuckOnSecond && opens === 2) { client.mailbox = { path: 'INBOX' }; }
+          else { client.mailbox = { path: p }; }
+          return { exists: 1, uidValidity: 1, uidNext: 100 };
+        },
+        async search() { return [...(server25[selected]?.keys() || [])]; },
+        async *fetch(range) {
+          const box = server25[selected];
+          if (!box) return;
+          // 真实 imapflow 的 fetch 接受单个 UID（'5'）与区间（'5:9'）两种
+          // 写法；单值时不要按区间解析，否则 NaN 会把全部候选滤掉。
+          const parts = String(range).split(':').map(Number);
+          const lo = parts.length === 1 ? parts[0] : Math.min(parts[0], parts[1]);
+          const hi = parts.length === 1 ? parts[0] : Math.max(parts[0], parts[1]);
+          for (const [uid, m] of [...box.entries()].sort((x, y) => x[0] - y[0])) {
+            if (uid >= lo && uid <= hi) {
+              yield { uid, envelope: { messageId: m.messageId, subject: m.subject, from: [{ address: m.from }], to: (m.to || []).map((x) => ({ address: x })), date: new Date(m.date) }, size: m.size };
+            }
+          }
+        },
+        async messageFlagsAdd() {},
+        async messageDelete(uidStr) { const box = server25[selected]; if (box) box.delete(Number(uidStr)); },
+      };
+      return client;
+    };
+    // B. 指纹分支抛错：Message-ID 双生（uid 5）照删，无关信（uid 9）不动。
+    server25 = makeServer25();
+    const twinsB = await engine25._deleteOtherCopiesInFolder(1, folder25, MID25, null, undefined, makeSweepClient25(true), fp25);
+    check('audit20 LOW-1: sweep with failing fingerprint branch still deletes the Message-ID twin',
+      !server25.Trash.has(5) && server25.Trash.has(9) && twinsB.twinIds.includes(MID25),
+      `Trash=${[...server25.Trash.keys()]} twins=${JSON.stringify(twinsB)}`);
+    // C. 对照组：指纹分支正常，messageId 为 null 时只靠指纹清掉双生。
+    server25 = makeServer25();
+    const twinsC = await engine25._deleteOtherCopiesInFolder(1, folder25, null, null, undefined, makeSweepClient25(false), fp25);
+    check('audit20 LOW-1 control: sweep with working fingerprint branch deletes the twin by fingerprint alone',
+      !server25.Trash.has(5) && server25.Trash.has(9) && twinsC.twinIds.includes(MID25),
+      `Trash=${[...server25.Trash.keys()]} twins=${JSON.stringify(twinsC)}`);
+  }
+
+  // ---------- 26. audit #21 fixes ----------
+  console.log('== audit #21 fixes ==');
+  {
+    // Audit #21 LOW-1：清扫删掉服务器副本后，被清副本的本地行一直留
+    // 到下一次同步对账才消失。修法：sweep 返回确认删掉的服务器 UID
+    // （sweptUids），调用方（彻底删除分支的同文件夹/已发送清扫、从
+    // 已发送移走时的同文件夹清扫）同步按 (folder_id, uid) 删本地行
+    // （FTS + 正文文件同款清理），不等同步对账。直接测 _deleteMessage，
+    // 不跑同步——断言行“立即”消失。
+    const { openDb: openDb26 } = await import('../dist/db.js');
+    const { SyncEngine: SyncEngine26 } = await import('../dist/engine.js');
+    const vdb26 = openDb26();
+    const MID26 = '<self21@x>';
+    const mkAcc26 = (email) => Number(vdb26.prepare(
+      `INSERT INTO accounts (email, display_name, password_enc, imap_host, imap_port, imap_secure,
+        smtp_host, smtp_port, smtp_secure, enabled, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'offline')`,
+    ).run(email, '', encryptSecret('FAKE', key), '127.0.0.1', 9999, 'SSL', '127.0.0.1', 9999, 'STARTTLS', 0).lastInsertRowid);
+    const mkFolders26 = (accId) => {
+      const mk = (p, name, type) => Number(vdb26.prepare(
+        'INSERT INTO folders (account_id, path, name, type) VALUES (?,?,?,?)',
+      ).run(accId, p, name, type).lastInsertRowid);
+      return { inboxId: mk('INBOX', 'INBOX', 'inbox'), sentId: mk('Sent', 'Sent', 'sent'), trashId: mk('Trash', 'Trash', 'trash') };
+    };
+    const seedRow26 = (accId, folderId, uid, mid = MID26) => Number(vdb26.prepare(
+      `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr, to_json, date, size, is_read)
+       VALUES (?,?,?,?,?,?,?,?,?,1)`,
+    ).run(accId, folderId, uid, mid, 'self mail', 'self@163.com', JSON.stringify(['self@163.com']), new Date().toISOString(), 100).lastInsertRowid);
+    const countIn26 = (accId, folderId) => vdb26.prepare(
+      'SELECT COUNT(*) c FROM messages WHERE account_id=? AND folder_id=?',
+    ).get(accId, folderId).c;
+    const makeServer26 = () => ({
+      INBOX: new Map([[10, { messageId: MID26 }]]),
+      Sent: new Map([[20, { messageId: MID26 }]]),
+      Trash: new Map(),
+      nextUid: { INBOX: 11, Sent: 21, Trash: 1 },
+    });
+    let server26 = makeServer26();
+    const makeClient26 = () => {
+      let selected = null;
+      const client = {
+        mailbox: null,
+        on() {}, removeAllListeners() {}, logout: async () => {},
+        async mailboxOpen(p) {
+          selected = p;
+          client.mailbox = { path: p };
+          const box = server26[p];
+          return { exists: box ? box.size : 0, uidValidity: 1, uidNext: server26.nextUid[p] || 1 };
+        },
+        async messageMove(uidStr, target) {
+          const uid = Number(uidStr);
+          const src = server26[selected];
+          if (!src || !src.has(uid)) return {};
+          const msg = src.get(uid);
+          src.delete(uid);
+          const nu = server26.nextUid[target]++;
+          server26[target].set(nu, msg);
+          return { uidMap: new Map([[uid, nu]]) };
+        },
+        async search() {
+          const box = server26[selected];
+          return box ? [...box.keys()] : [];
+        },
+        async *fetch(range) {
+          const box = server26[selected];
+          if (!box) return;
+          const [a, b] = String(range).split(':').map(Number);
+          const lo = Math.min(a, b), hi = Math.max(a, b);
+          for (const [uid, m] of [...box.entries()].sort((x, y) => x[0] - y[0])) {
+            if (uid >= lo && uid <= hi) {
+              yield { uid, envelope: { messageId: m.messageId, subject: 'self mail', from: [{ address: 'self@163.com' }], date: new Date() }, size: 100 };
+            }
+          }
+        },
+        async messageFlagsAdd() {},
+        async messageDelete(uidStr) {
+          const box = server26[selected];
+          if (box) box.delete(Number(uidStr));
+        },
+      };
+      return client;
+    };
+    const engine26 = new SyncEngine26(key);
+    engine26.withClient = async (accountId, fn) => fn(makeClient26());
+
+    // A. 主序列：收件箱副本移入已删除、再彻底删除——不等同步，已发送
+    // 本地行立即消失，服务器已发送文件夹也无该副本。
+    server26 = makeServer26();
+    const accA26 = mkAcc26('self21a@163.com');
+    const fA26 = mkFolders26(accA26);
+    const inboxRowA = seedRow26(accA26, fA26.inboxId, 10);
+    seedRow26(accA26, fA26.sentId, 20);
+    let errA26 = null;
+    try {
+      await engine26.deleteMessage(accA26, inboxRowA); // 移入已删除
+      await engine26.deleteMessage(accA26, inboxRowA); // 彻底删除（同行已在已删除）
+    } catch (e) { errA26 = e; }
+    check('audit21 LOW-1: permanent delete of inbox copy removes the sent local row immediately (no sync)',
+      errA26 === null && countIn26(accA26, fA26.sentId) === 0 && countIn26(accA26, fA26.trashId) === 0 && countIn26(accA26, fA26.inboxId) === 0,
+      `err=${errA26?.message} sent=${countIn26(accA26, fA26.sentId)} trash=${countIn26(accA26, fA26.trashId)} inbox=${countIn26(accA26, fA26.inboxId)}`);
+    check('audit21 LOW-1: server Sent folder has no copy left after permanent delete',
+      server26.Sent.size === 0 && server26.INBOX.size === 0 && server26.Trash.size === 0,
+      `INBOX=${[...server26.INBOX.keys()]} Sent=${[...server26.Sent.keys()]} Trash=${[...server26.Trash.keys()]}`);
+
+    // B. 对照组：仅移入已删除、不彻底删除——已发送副本仍在（本地行
+    // 与服务器副本都不动，清扫只发生在彻底删除时）。
+    server26 = makeServer26();
+    const accB26 = mkAcc26('self21b@163.com');
+    const fB26 = mkFolders26(accB26);
+    const inboxRowB = seedRow26(accB26, fB26.inboxId, 10);
+    seedRow26(accB26, fB26.sentId, 20);
+    let errB26 = null;
+    try { await engine26.deleteMessage(accB26, inboxRowB); } catch (e) { errB26 = e; }
+    check('audit21 LOW-1 control: move-to-trash only leaves the sent copy untouched',
+      errB26 === null && countIn26(accB26, fB26.sentId) === 1 && countIn26(accB26, fB26.trashId) === 1 && server26.Sent.size === 1,
+      `err=${errB26?.message} sent=${countIn26(accB26, fB26.sentId)} trash=${countIn26(accB26, fB26.trashId)} serverSent=${server26.Sent.size}`);
+
+    // C. 从已发送删信（:1988 调用点）：已发送里有同一封信的两份副本——
+    // luck-mail APPEND 的那份（planned Message-ID）与服务器自动保存
+    // 的那份（Message-ID 被重写，指纹相同）。同文件夹同 Message-ID
+    // 的两行在库里不可能存在（唯一索引），所以双生只能是指纹双生。
+    // 删其中一份移走后，另一份的服务器副本被指纹清扫、本地行同步消失。
+    server26 = makeServer26();
+    server26.Sent.set(21, { messageId: '<server21@163.com>' });
+    server26.nextUid.Sent = 22;
+    const accC26 = mkAcc26('self21c@163.com');
+    const fC26 = mkFolders26(accC26);
+    seedRow26(accC26, fC26.inboxId, 10);
+    const sentRowC1 = seedRow26(accC26, fC26.sentId, 20, '<planned21@luck-mail.local>');
+    seedRow26(accC26, fC26.sentId, 21, '<server21@163.com>');
+    let errC26 = null;
+    try { await engine26.deleteMessage(accC26, sentRowC1); } catch (e) { errC26 = e; }
+    check('audit21 LOW-1: deleting one sent copy sweeps the fingerprint twin locally too (no sync)',
+      errC26 === null && countIn26(accC26, fC26.sentId) === 0 && countIn26(accC26, fC26.trashId) === 1,
+      `err=${errC26?.message} sent=${countIn26(accC26, fC26.sentId)} trash=${countIn26(accC26, fC26.trashId)}`);
+    check('audit21 LOW-1: server Sent folder empty after the sent-copy sweep',
+      server26.Sent.size === 0,
+      `Sent=${[...server26.Sent.keys()]}`);
+  }
+
+  // ---------- 27. audit #23 fixes ----------
+  console.log('== audit #23: duplicate-add race ==');
+  {
+    // Audit #23 LOW-1：并发重复提交第二路撞 email 唯一约束时返回 409
+    // 而不是 500；CSV 导入撞唯一约束时该行进 failed、批次继续。
+    // 两路请求的前置查重都在连通测试（await）之前跑完——Node 同步段不
+    // 可交错，所以两路一定都通过查重、第二路必走新加的 UNIQUE 兜底。
+    // 假 IMAP/SMTP 与第 18 节同款（GOODPASS 才放行登录）。
+    let fakeImap23 = null;
+    let fakeSmtp23 = null;
+    const raceIds = [];
+    try {
+      fakeSmtp23 = await new Promise((resolve, reject) => {
+        const sockets = new Set();
+        const srv = net.createServer((socket) => {
+          sockets.add(socket);
+          socket.on('close', () => sockets.delete(socket));
+          let buf = '';
+          let dataMode = false;
+          let authStep = 0;
+          socket.write('220 localhost fake SMTP\r\n');
+          socket.on('data', (chunk) => {
+            buf += chunk.toString('utf8');
+            let idx;
+            while ((idx = buf.indexOf('\r\n')) >= 0) {
+              const line = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              if (dataMode) {
+                if (line === '.') { dataMode = false; socket.write('250 OK: queued\r\n'); }
+                continue;
+              }
+              const up = line.toUpperCase();
+              if (up.startsWith('EHLO') || up.startsWith('HELO')) socket.write('250-localhost\r\n250 AUTH LOGIN PLAIN\r\n');
+              else if (up.startsWith('AUTH PLAIN')) { authStep = 0; socket.write('235 OK\r\n'); }
+              else if (up.startsWith('AUTH LOGIN')) { authStep = 1; socket.write('334 VXNlcm5hbWU6\r\n'); }
+              else if (authStep === 1) { authStep = 2; socket.write('334 UGFzc3dvcmQ6\r\n'); }
+              else if (authStep === 2) { authStep = 0; socket.write('235 OK\r\n'); }
+              else if (up === 'QUIT') { socket.write('221 Bye\r\n'); socket.end(); }
+              else socket.write('250 OK\r\n');
+            }
+          });
+        });
+        srv.on('error', reject);
+        srv.listen(0, '127.0.0.1', () => { srv._sockets = sockets; resolve(srv); });
+      });
+      const fakeSmtpPort23 = fakeSmtp23.address().port;
+      fakeImap23 = await new Promise((resolve, reject) => {
+        const sockets = new Set();
+        const srv = tls.createServer({ cert: fs.readFileSync(tlsCertPath), key: fs.readFileSync(tlsKeyPath) }, (socket) => {
+          sockets.add(socket);
+          socket.on('close', () => sockets.delete(socket));
+          let buf = '';
+          let idleTag = null;
+          socket.write('* OK fake IMAP ready\r\n');
+          socket.on('data', (chunk) => {
+            buf += chunk.toString('utf8');
+            let idx;
+            while ((idx = buf.indexOf('\r\n')) >= 0) {
+              const line = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              if (idleTag) {
+                if (line.toUpperCase() === 'DONE') { socket.write(`${idleTag} OK IDLE completed\r\n`); idleTag = null; }
+                continue;
+              }
+              const m = line.match(/^(\S+)\s+(\S+)(?:\s+(.*))?$/);
+              if (!m) continue;
+              const [, tag, cmdRaw, rest] = m;
+              const cmd = cmdRaw.toUpperCase();
+              if (cmd === 'CAPABILITY') socket.write(`* CAPABILITY IMAP4rev1 IDLE UIDPLUS\r\n${tag} OK CAPABILITY completed\r\n`);
+              else if (cmd === 'LOGIN') {
+                const parts = (rest || '').split(/\s+/);
+                const pass = (parts[1] || '').replace(/^"|"$/g, '');
+                if (pass === 'GOODPASS') socket.write(`${tag} OK LOGIN completed\r\n`);
+                else socket.write(`${tag} NO [AUTHENTICATIONFAILED] LOGIN Login error: invalid user or password\r\n`);
+              } else if (cmd === 'LOGOUT') { socket.write(`* BYE Logging out\r\n${tag} OK LOGOUT completed\r\n`); socket.end(); }
+              else if (cmd === 'LIST') socket.write(`* LIST (\\HasNoChildren) "/" INBOX\r\n${tag} OK LIST completed\r\n`);
+              else if (cmd === 'SELECT') socket.write(`* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Flags permitted\r\n* 0 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n* OK [UIDNEXT 1] Predicted next UID\r\n${tag} OK [READ-WRITE] SELECT completed\r\n`);
+              else if (cmd === 'SEARCH') socket.write(`* SEARCH\r\n${tag} OK SEARCH completed\r\n`);
+              else if (cmd === 'IDLE') { idleTag = tag; socket.write('+ idling\r\n'); }
+              else socket.write(`${tag} OK ${cmd} completed\r\n`);
+            }
+          });
+        });
+        srv.on('error', reject);
+        srv.listen(0, '127.0.0.1', () => { srv._sockets = sockets; resolve(srv); });
+      });
+      const fakeImapPort23 = fakeImap23.address().port;
+      const raceBody = {
+        email: 'race23@gmail.com', password: 'GOODPASS',
+        imapHost: '127.0.0.1', imapPort: fakeImapPort23, imapSecure: 'SSL',
+        smtpHost: '127.0.0.1', smtpPort: fakeSmtpPort23, smtpSecure: 'STARTTLS',
+      };
+      const [raceA, raceB] = await Promise.all([
+        api('POST', '/api/accounts', raceBody),
+        api('POST', '/api/accounts', raceBody),
+      ]);
+      const raceStatuses = [raceA.status, raceB.status].sort();
+      check('audit23 LOW-1: concurrent duplicate adds -> one 201 + one 409, no 500',
+        raceStatuses[0] === 201 && raceStatuses[1] === 409,
+        `statuses=${raceA.status},${raceB.status} errA=${raceA.json?.error} errB=${raceB.json?.error}`);
+      const loser = raceA.status === 409 ? raceA : raceB;
+      check('audit23 LOW-1: losing request reports "该邮箱已添加过" (409, not a 500 stack)',
+        /该邮箱已添加过/.test(loser.json?.error || '') && !loser.text.includes(' at '),
+        `status=${loser.status} error=${loser.json?.error}`);
+      const raceRows = db.prepare('SELECT id FROM accounts WHERE email=?').all('race23@gmail.com');
+      check('audit23 LOW-1: exactly one race account in DB',
+        raceRows.length === 1, `rows=${raceRows.length}`);
+      if (raceRows.length === 1) raceIds.push(Number(raceRows[0].id));
+      // 清理第一路的账号（停引擎），再测导入竞态。
+      for (const id of raceIds.splice(0)) { try { await api('DELETE', `/api/accounts/${id}`); } catch { /* ignore */ } }
+
+      // CSV 导入竞态：两份各一行的 CSV 同时导入同一邮箱——快照都在
+      // INSERT 之前，两路都通过判重；一路 added=1，另一路该行进 failed
+      // （原因“该邮箱已添加过”），批次继续、两个响应都是 200。
+      const impCsv = '序号,邮箱名,授权码,接收服务器（IMAP）,IMAP端口,发送服务器（SMTP）,SMTP端口,备注\r\n'
+        + `1,race23import@gmail.com,GOODPASS,127.0.0.1,${fakeImapPort23},127.0.0.1,${fakeSmtpPort23},race\r\n`;
+      const importOne = () => {
+        const form = new FormData();
+        form.append('file', new Blob([impCsv], { type: 'text/csv' }), 'import.csv');
+        return fetch(BASE + '/api/accounts/import', { method: 'POST', headers: { Cookie: cookie, Origin: BASE }, body: form })
+          .then(async (res) => ({ status: res.status, json: await res.json().catch(() => null) }));
+      };
+      // 导入限流（60 秒窗口、每 IP 5 次）：前面章节的导入可能已占满桶，
+      // 两路同发会 429；此时先清掉首轮可能已建的账号（否则重试时该邮箱
+      // 会在快照里被判重跳过），等 65 秒窗口排空后重试一次。
+      let impA, impB;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        [impA, impB] = await Promise.all([importOne(), importOne()]);
+        if (impA.status !== 429 && impB.status !== 429) break;
+        const listR = await api('GET', '/api/accounts');
+        const dup = (listR.json?.accounts || []).find((a) => a.email === 'race23import@gmail.com');
+        if (dup) { try { await api('DELETE', `/api/accounts/${dup.id}`); } catch { /* ignore */ } }
+        if (attempt === 0) await new Promise((r2) => setTimeout(r2, 65000));
+      }
+      const totalAdded = (impA.json?.added || 0) + (impB.json?.added || 0);
+      const failedRows = [...(impA.json?.failed || []), ...(impB.json?.failed || [])];
+      check('audit23 LOW-1: concurrent duplicate imports -> one added, other row failed, both 200',
+        impA.status === 200 && impB.status === 200 && totalAdded === 1
+        && failedRows.length === 1 && failedRows[0].email === 'race23import@gmail.com'
+        && failedRows[0].reason === '该邮箱已添加过',
+        `statuses=${impA.status},${impB.status} added=${impA.json?.added},${impB.json?.added} failed=${JSON.stringify(failedRows)}`);
+      const impRows = db.prepare('SELECT id FROM accounts WHERE email=?').all('race23import@gmail.com');
+      check('audit23 LOW-1: exactly one import account in DB',
+        impRows.length === 1, `rows=${impRows.length}`);
+      if (impRows.length === 1) raceIds.push(Number(impRows[0].id));
+    } finally {
+      for (const id of raceIds) { try { await api('DELETE', `/api/accounts/${id}`); } catch { /* ignore */ } }
+      if (fakeImap23) {
+        try { for (const s of fakeImap23._sockets || []) s.destroy(); } catch { /* ignore */ }
+        await new Promise((resolve) => fakeImap23.close(resolve));
+      }
+      if (fakeSmtp23) {
+        try { for (const s of fakeSmtp23._sockets || []) s.destroy(); } catch { /* ignore */ }
+        await new Promise((resolve) => fakeSmtp23.close(resolve));
+      }
+    }
   }
 
 } catch (e) {

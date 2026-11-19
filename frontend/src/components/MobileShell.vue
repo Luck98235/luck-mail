@@ -73,7 +73,9 @@
           <span v-if="mail.unreadOfAccount(a.id) > 0" class="text-sm text-slate-400">{{ mail.unreadOfAccount(a.id) }}</span>
           <i class="fa-solid fa-chevron-right text-xs text-slate-300"></i>
         </button>
-        <div v-if="!mail.accounts.length" class="px-3 py-3 text-sm text-slate-400">还没有邮箱，请在电脑端添加。</div>
+        <!-- 审计 #11 L11：账号加载失败时不误导为“没有邮箱”，给可点重试 -->
+        <div v-if="!mail.accounts.length && mail.accountsError" class="px-3 py-3 text-sm text-red-400 cursor-pointer" @click="mail.loadAccounts()">账号加载失败，点刷新重试</div>
+        <div v-else-if="!mail.accounts.length" class="px-3 py-3 text-sm text-slate-400">还没有邮箱，请在电脑端添加。</div>
       </div>
     </div>
 
@@ -146,7 +148,9 @@
             <span class="flex-1">{{ f.name }}</span>
             <span v-if="unreadOfMobileFolder(f.id) > 0" class="text-xs bg-red-500 text-white rounded-full min-w-5 h-5 px-1 flex items-center justify-center">{{ unreadOfMobileFolder(f.id) }}</span>
           </div>
-          <div v-if="!mobileFolders.length" class="px-5 py-3 text-sm text-slate-400">文件夹同步中…</div>
+          <!-- 审计 #11 L7：抽屉文件夹加载失败时显示可点击重试文案（与桌面侧栏一致） -->
+          <div v-if="!mobileFolders.length && drawerFoldersFailed" class="px-5 py-3 text-sm text-red-400 cursor-pointer" @click="retryDrawerFolders">文件夹加载失败，点这里重试</div>
+          <div v-else-if="!mobileFolders.length" class="px-5 py-3 text-sm text-slate-400">文件夹同步中…</div>
         </template>
         <template v-else>
           <div
@@ -208,6 +212,12 @@ const mobileFolders = computed<Folder[]>(() => {
   if (mail.mobileAccountId == null) return []
   return mail.foldersByAccount[mail.mobileAccountId] || []
 })
+// 审计 #11 L7：抽屉文件夹是否加载失败（store 层 foldersFailedIds），失败时
+// 抽屉显示可点击重试文案，不再一直显示“同步中…”。
+const drawerFoldersFailed = computed<boolean>(() => mail.mobileAccountId != null && mail.foldersFailedIds.has(mail.mobileAccountId))
+function retryDrawerFolders(): void {
+  if (mail.mobileAccountId != null) void mail.loadFolders(mail.mobileAccountId, true)
+}
 function unreadOfMobileFolder(folderId: number): number {
   if (mail.mobileAccountId == null) return 0
   return mail.unreadOfFolder(mail.mobileAccountId, folderId)
@@ -266,7 +276,13 @@ async function enterAccount(id: number): Promise<void> {
   await mail.loadFolders(id)
   const fid = mail.inboxFolderId(id)
   const inbox = (mail.foldersByAccount[id] || []).find((f) => f.id === fid) || null
-  if (!inbox) { mail.showToast('文件夹同步中，请稍后再试'); return }
+  // 审计 #17 LOW-3：folders 接口失败的账号（foldersFailedIds 里有它），
+  // inbox 找不到不是“还在同步”，是加载失败——别让用户一直等一个
+  // 永远不会完成的“同步中”，按桌面侧栏同款口径报加载失败。
+  if (!inbox) {
+    if (mail.foldersFailedIds.has(id)) { mail.showToast('文件夹加载失败，请稍后再试'); return }
+    mail.showToast('文件夹同步中，请稍后再试'); return
+  }
   await mail.setFolderView(id, inbox)
 }
 

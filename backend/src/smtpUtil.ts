@@ -77,8 +77,10 @@ function smtpKey(a: { smtpHost: string; smtpPort: number; smtpSecure: string }):
 
 function splitAddrs(v: string | string[] | undefined): string[] {
   if (!v) return [];
-  if (Array.isArray(v)) return v.map(String).map((s) => s.trim()).filter(Boolean);
-  return String(v).split(',').map((s) => s.trim()).filter(Boolean);
+  // 半角/全角逗号都认（与发信路由 splitAddrList 一致）：直调 buildRawMail/
+  // sendMail 的调用方也可能传全角逗号分隔的整串。
+  if (Array.isArray(v)) return v.flatMap((s) => String(s).split(/[,，]/)).map((s) => s.trim()).filter(Boolean);
+  return String(v).split(/[,，]/).map((s) => s.trim()).filter(Boolean);
 }
 
 // Build the nodemailer mail options (from / to / cc / bcc / subject /

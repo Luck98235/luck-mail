@@ -70,6 +70,8 @@ export interface MessageDetail extends MessageEnvelope {
   messageId?: string
   /** 原信 References 链（同上；回复/转发时作 References 基础） */
   references?: string | string[]
+  /** 原信 Reply-To（审计 #11 L23：后端 GET /api/messages/:id 返回；回复时优先发给它） */
+  replyTo?: string
 }
 
 export interface Preset {
@@ -107,6 +109,15 @@ export interface Draft {
   updatedAt: string
   /** 发信幂等键：创建时传或服务端生成；PUT 不改它 */
   idempotencyKey?: string
+  /** 回复/转发 threading（审计 #11 H1）：原信 Message-ID，作 In-Reply-To */
+  inReplyTo?: string
+  /** 回复/转发 threading（同上）：References 链——后端 GET /api/drafts
+   * 返回 string[]（无则 null，见 API_CONTRACT 草稿节；审计 #12 B1：
+   * 此处曾错声明为 string，前端按空格串 split 直接在数组上抛错，
+   * 回复草稿打不开）。POST/PUT 接受字符串或数组。 */
+  references?: string | string[]
+  /** 抄送（审计 #11 L15）：与发信接口一致的 string 数组 */
+  cc?: string[]
 }
 
 /** Socket.io 服务端 → 客户端事件（契约） */

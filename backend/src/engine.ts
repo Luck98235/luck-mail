@@ -7,7 +7,7 @@ import {
 } from './db.js';
 import type { AccountRow, FolderRow, MessageRow, AttachmentRow } from './db.js';
 import { decryptSecret } from './cryptoUtil.js';
-import { makeImapClient, accountToImap, logError, isAuthError, isThrottleError } from './imapUtil.js';
+import { makeImapClient, accountToImap, logError, isAuthError, isThrottleError, assertHostsSafe } from './imapUtil.js';
 import {
   detectFolderType, displayNameOf, collectAttachmentParts, matchAttachmentParts,
   isNonSelectable, toIsoDate,
@@ -61,6 +61,48 @@ const ENVELOPE_PAGE_SIZE = 500;
 // B11: 短命共享连接的闲置保持窗口——队列里连续的 withClient 调用共用
 // 一个连接；最后一个调用完成后闲置这么久无人用就登出。
 const SHARED_IDLE_MS = 2000;
+
+// Audit #12 H1：OquMail 发信去重兜底——服务器会在 SMTP 提交后整封重写
+// （新 Message-ID + 剥离 In-Reply-To/References，父级实测：planned
+// Message-ID 用真实域名也照样重写），于是同一封信的两个副本
+// Message-ID 不同，F1 按 Message-ID 去重失效。指纹 = 主题 + 发件人 +
+// 收件人（审计 #13 L2）+ 时间（±10 秒）+ 大小（±1024 字节），全中才算
+// 同一封：线上实测一对 OquMail 双行 date 差 3.9 秒、size 差 116 字节；
+// 主题相同但时间或大小差得远的正常邮件不会被误并。只用于已发送文件夹。
+// requireSize=false 的放宽分支只用于崩溃窗口重认领（审计 #13 HIGH）：
+// 检查点在编译 raw 之前、size 未知，且日期锚点是占位行的首次认领时间
+// （见 messageRoutes.findAlreadySent）——该分支只在同一幂等键重认领时
+// 才跑，误并需要另一封同主题/同发件人/同收件人、且在原认领 ±10 秒内
+// 发出的信，单用户下极窄；size 校验在同步、发信缓存、清扫三处仍在。
+const SENT_DUP_DATE_WINDOW_MS = 10_000;
+const SENT_DUP_SIZE_TOLERANCE = 1024;
+export interface SentFingerprint { subject: string; from: string; dateMs: number | null; size: number | null; messageId?: string | null; to?: string[] | null; }
+export function sentFingerprintMatches(a: SentFingerprint, b: SentFingerprint, opts: { requireSize?: boolean } = {}): boolean {
+  if (a.subject.trim() !== b.subject.trim()) return false;
+  if (a.from.toLowerCase() !== b.from.toLowerCase()) return false;
+  // Audit #13 L2：收件人也参与比对——双生副本收件人必然相同；两封不同
+  // 的信（同主题/同发件人/10 秒内/大小相近）收件人通常不同。任一边
+  // 缺收件人信息（旧行 to_json 为空、信封取不到）时跳过该项、不误判。
+  if (a.to && a.to.length && b.to && b.to.length) {
+    const norm = (xs: string[]): string[] => xs.map((x) => x.toLowerCase().trim()).filter(Boolean).sort();
+    const ta = norm(a.to);
+    const tb = norm(b.to);
+    if (ta.length !== tb.length || ta.some((x, i) => x !== tb[i])) return false;
+  }
+  // 至少一边是 luck-mail 的 planned Message-ID（@luck-mail.local）：两封
+  // 都不是本客户端发出的信绝不能仅凭指纹合并——主题/发件人/时间/大小
+  // 全同也可能是两封不同的信（审计 #4 F1c 对照组正是这种情况）。
+  // OquMail 双行里总有一边是 luck-mail 自己 APPEND/缓存的那份
+  // （planned ID），所以该守卫不影响真正的去重。
+  const isPlanned = (m: string | null | undefined): boolean =>
+    typeof m === 'string' && m.toLowerCase().endsWith('@luck-mail.local>');
+  if (a.messageId != null && b.messageId != null && !isPlanned(a.messageId) && !isPlanned(b.messageId)) return false;
+  if (a.dateMs == null || b.dateMs == null || Math.abs(a.dateMs - b.dateMs) > SENT_DUP_DATE_WINDOW_MS) return false;
+  if (opts.requireSize === false) return true;
+  if (a.size == null || a.size <= 0 || b.size == null || b.size <= 0
+    || Math.abs(a.size - b.size) > SENT_DUP_SIZE_TOLERANCE) return false;
+  return true;
+}
 
 // 标准文件夹前台统一显示中文名（QQ 等服务器返回英文名，163 返回中文名，
 // 映射后两边一致；服务器英文名只做分类依据，不直接显示）。
@@ -223,14 +265,27 @@ export class SyncEngine {
     const client = state.client;
     state.client = null;
     if (client) {
-      client.removeAllListeners();
+      // Audit #18 LOW-1：logout 是异步的，对方在登出握手完成前 RST 连接时
+      // socket 出错会触发 client 的 'error' 事件；旧版先 removeAllListeners()
+      // 把 :368 的 error 监听也摘掉再异步 logout，无监听时 Node 直接抛错、
+      // 进程 abort（verify-all import18b 节末 3 次运行崩 2 次即此路径；
+      // 生产侧每次删账号/停用账号与停机 stopAll 都走同一路径）。只摘
+      // exists/expunge/close，保留 error 监听（记日志），logout 完成前
+      // 都有兜底。
+      client.removeAllListeners('exists');
+      client.removeAllListeners('expunge');
+      client.removeAllListeners('close');
       client.logout().catch(() => {});
     }
     // B11: 短命共享连接随账号一起关闭，不留闲置连接。
     const shared = state.sharedClient;
     state.sharedClient = null;
     if (shared) {
+      // Audit #18 LOW-1：共享连接从来没有挂过 error 监听（_withSharedClient
+      // 建连时没挂）；removeAllListeners 后立即补一个记日志的 error 兜底
+      // 再异步 logout——两步同属一个同步块，中间插不进事件，同款防护。
       shared.removeAllListeners();
+      shared.on('error', (err: Error) => logError(`imap shared account ${accountId} error:`, err?.message || err));
       shared.logout().catch(() => {});
     }
     if (!silent) {
@@ -306,6 +361,9 @@ export class SyncEngine {
         return;
       }
       // R1: 网易系禁用 auto-IDLE（服务器约 206 秒静默断线，IDLE 无效）。
+      // Audit #13 L4：建连前校验主机解析结果（缓存 5 分钟）——DNS 事后
+      // 被改指私有地址时不再照连；抛错走通用 catch（退避重连）。
+      await assertHostsSafe([state.account.imap_host]);
       const client = makeImapClient(accountToImap(state.account), password, { disableAutoIdle: state.pollOnly });
       state.client = client;
       client.on('exists', () => this._onExists(accountId));
@@ -595,7 +653,14 @@ export class SyncEngine {
         const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(accountId) as AccountRow | undefined;
         if (!account) throw new Error('账号不存在');
         const password = this._decryptAccountPassword(account);
+        // Audit #13 L4：建连前校验主机解析结果（缓存 5 分钟）。
+        await assertHostsSafe([account.imap_host]);
         const client = makeImapClient(accountToImap(account), password, { disableAutoIdle: true });
+        // Audit #18 LOW-1 纵深防御：共享连接闲置 SHARED_IDLE_MS 后才登出，
+        // 2 秒窗口内服务器 RST 即触发 'error' 事件；旧版从没挂过 error 监听，
+        // 无监听时 Node 直接抛错、进程 abort。建连后立即挂记日志的监听，
+        // 与连接循环 :368 同款；闲置登出与 stopAccount 都不再摘它。
+        client.on('error', (err: Error) => logError(`imap shared account ${accountId} error:`, err?.message || err));
         await client.connect();
         state.sharedClient = client;
       }
@@ -636,7 +701,12 @@ export class SyncEngine {
     const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(accountId) as AccountRow | undefined;
     if (!account) throw new Error('账号不存在');
     const password = this._decryptAccountPassword(account);
+    // Audit #13 L4：建连前校验主机解析结果（缓存 5 分钟）。
+    await assertHostsSafe([account.imap_host]);
     const client = makeImapClient(accountToImap(account), password, { disableAutoIdle: true });
+    // Audit #18 LOW-1 纵深防御：回退分支的短命连接也没有 error 监听，
+    // 建连后立即挂记日志的监听，与连接循环 :368 同款。
+    client.on('error', (err: Error) => logError(`imap account ${accountId} error:`, err?.message || err));
     try {
       await client.connect();
       return await fn(client);
@@ -1076,6 +1146,16 @@ export class SyncEngine {
     opts: { centerUid?: number; window?: number; verify?: { subject: string; from: string } } = {},
   ): Promise<number[]> {
     await client.mailboxOpen(folderPath, { readOnly: true });
+    // Audit #19 LOW-1：与 _syncFolder 同款 F2 防御——mailboxOpen 后核对实际
+    // 选中的邮箱。QQ 的 \Noselect 父级命名空间上它不报错、实际仍停留在
+    // 上一个文件夹，之后 SEARCH/FETCH 读到的就是错邮箱的信，反查会静默
+    // 返回空、_moveMessage 报“移动后无法确认新位置”。client.mailbox 是
+    // 已选中的邮箱对象时才核对（假客户端可能不设该属性，跳过）；路径不
+    // 等就抛错，不再静默返回空。findSentByMessageId 复用同一助手，一并受益。
+    const openedMailbox = client.mailbox;
+    if (openedMailbox && typeof openedMailbox === 'object' && openedMailbox.path !== folderPath) {
+      throw new Error(`mailbox open mismatch: requested ${folderPath}, got ${openedMailbox.path}`);
+    }
     const window = opts.window ?? 100;
     let allUids: number[];
     try {
@@ -1127,6 +1207,118 @@ export class SyncEngine {
     return hits[hits.length - 1];
   }
 
+  // Audit #12 H1：在已发送文件夹里按指纹找已有的行（OquMail 服务器副本
+  // 与客户端 APPEND 的那份 Message-ID 不同，F1 查不到）。date 用 ISO
+  // 文本做 ±10 秒窗口先缩小候选集，再逐行按指纹全项比对；date 解析
+  // 不出或 size 缺失时不匹配（宁可漏并、不误并）。发信缓存入库
+  // （messageRoutes）也调同一方法。
+  findSentFingerprintDuplicate(accountId: number, folderId: number, fp: SentFingerprint, opts: { requireSize?: boolean } = {}): number | null {
+    if (fp.dateMs == null) return null;
+    const from = new Date(fp.dateMs - SENT_DUP_DATE_WINDOW_MS).toISOString();
+    const to = new Date(fp.dateMs + SENT_DUP_DATE_WINDOW_MS).toISOString();
+    const rows = getDb().prepare(
+      `SELECT id, subject, from_addr, to_json, date, size, message_id FROM messages
+       WHERE account_id=? AND folder_id=? AND date >= ? AND date <= ?`,
+    ).all(accountId, folderId, from, to) as { id: number; subject: string; from_addr: string; to_json: string | null; date: string; size: number; message_id: string | null }[];
+    for (const r of rows) {
+      const d = Date.parse(r.date || '');
+      let rowTo: string[] | null = null;
+      try { rowTo = JSON.parse(r.to_json || '[]') as string[]; } catch { rowTo = null; }
+      if (sentFingerprintMatches(fp, {
+        subject: r.subject || '', from: r.from_addr || '',
+        dateMs: Number.isNaN(d) ? null : d, size: r.size || null, messageId: r.message_id,
+        to: rowTo,
+      }, opts)) return r.id;
+    }
+    return null;
+  }
+
+  // Audit #12 H1：服务器端按指纹找副本 UID（与 _findUidsByMessageId
+  // 同款窗口策略：keepUid 附近 ±100 个 UID，没给 keepUid 时取最后
+  // 100 个）。信封的 date/size 都参与比对；取不到时返回空数组。
+  // Audit #13 L1(a)：彻底删除时第二遍清扫（已发送文件夹）不传
+  // centerUid 时窗口改全文件夹扫描——被删行在已删除文件夹，它的 UID
+  // 与已发送文件夹的 UID 序列无关，以它为中心毫无意义；双生副本可能
+  // 是几个月前的旧信、落在最后 100 名之外。单用户已发送文件夹规模
+  // 有限、清扫又是低频操作，一次全量信封拉取可接受。
+  private async _findUidsByFingerprint(
+    client: ImapFlow, folderPath: string, fp: SentFingerprint,
+    opts: { centerUid?: number; window?: number; requireSize?: boolean } = {},
+  ): Promise<number[]> {
+    await client.mailboxOpen(folderPath, { readOnly: true });
+    // Audit #20 LOW-1：与 _findUidsByMessageId（审计 #19 LOW-1）同款 F2
+    // 防御——mailboxOpen 后核对实际选中的邮箱。QQ 的 \Noselect 父级命名
+    // 空间上它不报错、实际仍停留在上一个文件夹；指纹口径比 Message-ID
+    // 粗（主题/发件人/时间/大小/收件人全同即命中，如自发邮件的两份副
+    // 本），读错文件夹会命中双生副本的 UID，随后 sweep 按该 UID 在目标
+    // 文件夹里删信可能删掉完全不相干的另一封信。路径不符就抛错，不再
+    // 静默返回空；调用方 _deleteOtherCopiesInFolder 的 sweep 与
+    // findSentByFingerprint 各自接住（清扫 best-effort、重认领 try/catch）。
+    const openedMailbox = client.mailbox;
+    if (openedMailbox && typeof openedMailbox === 'object' && openedMailbox.path !== folderPath) {
+      throw new Error(`mailbox open mismatch: requested ${folderPath}, got ${openedMailbox.path}`);
+    }
+    const window = opts.window ?? 100;
+    let allUids: number[];
+    try {
+      const all = await client.search({ all: true }, { uid: true });
+      if (!Array.isArray(all) || !all.length) return [];
+      allUids = all.map((u) => Number(u)).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+    } catch (e) {
+      logError(`uid search for fingerprint lookup failed folder ${folderPath}:`, (e as Error)?.message || e);
+      return [];
+    }
+    let candidates: number[];
+    const centerUid = opts.centerUid;
+    if (centerUid != null) {
+      candidates = allUids.filter((u) => u >= centerUid - window && u <= centerUid + window);
+    } else if (window === Number.POSITIVE_INFINITY) {
+      candidates = allUids;
+    } else {
+      candidates = allUids.slice(-window);
+    }
+    if (!candidates.length) return [];
+    let min = candidates[0];
+    let max = candidates[0];
+    for (const u of candidates) { if (u < min) min = u; if (u > max) max = u; }
+    const hits: number[] = [];
+    for await (const msg of client.fetch(`${min}:${max}`, { envelope: true, size: true, uid: true }, { uid: true })) {
+      const env = msg.envelope || {};
+      const d = (env as { date?: Date | string }).date;
+      const ms = d ? new Date(d).getTime() : NaN;
+      if (typeof msg.uid !== 'number') continue;
+      if (sentFingerprintMatches(fp, {
+        subject: env.subject || '',
+        from: env.from?.[0]?.address || '',
+        dateMs: Number.isNaN(ms) ? null : ms,
+        size: typeof msg.size === 'number' ? msg.size : null,
+        messageId: env.messageId || null,
+        to: (env.to || []).map((a) => a.address).filter(Boolean) as string[],
+      }, { requireSize: opts.requireSize })) hits.push(Number(msg.uid));
+    }
+    return hits.sort((a, b) => a - b);
+  }
+
+  // Audit #13 HIGH：服务器端按指纹在已发送文件夹里找一封信（仿
+  // findSentByMessageId）——崩溃窗口重认领时，OquMail 服务器副本的
+  // Message-ID 已被重写，只能按指纹认。返回最新命中的一个 UID。
+  // 窗口默认取全文件夹（重认领可能发生在原发送 10 分钟之后、已发送
+  // 里又进了不少新信；重认领是低频路径，一次全量信封拉取可接受）。
+  async findSentByFingerprint(accountId: number, fp: SentFingerprint, opts: { requireSize?: boolean; window?: number } = {}): Promise<{ folderId: number; uid: number } | null> {
+    const sent = this._folderByType(accountId, 'sent');
+    if (!sent) return null;
+    try {
+      const hits = await this.withClient(accountId, (client) => this._findUidsByFingerprint(
+        client, sent.path, fp, { window: opts.window ?? Number.POSITIVE_INFINITY, requireSize: opts.requireSize },
+      ));
+      if (!hits.length) return null;
+      return { folderId: sent.id, uid: hits[hits.length - 1] };
+    } catch (e) {
+      logError(`find sent by fingerprint failed account ${accountId}:`, (e as Error)?.message || e);
+      return null;
+    }
+  }
+
   // F1 附带：删掉同文件夹内同一 Message-ID 的其他服务器副本。
   // 163/QQ 发信后会自动再往已发送存一份（与客户端 APPEND 的那份同一
   // Message-ID、不同 UID）；原件移走/删掉后另一份还留在原文件夹，
@@ -1137,31 +1329,114 @@ export class SyncEngine {
   // 各走一次 withClient（各建各的连接、各登一次）；现在无 client 时
   // 也只开一次 withClient、里面先找后删；批量删除传共享 client 进来，
   // 全批共用一个会话。
-  private async _deleteOtherCopiesInFolder(accountId: number, folder: FolderRow, messageId: string, keepUid: number | null, verify?: { subject: string; from: string }, client?: ImapFlow): Promise<void> {
-    const sweep = async (c: ImapFlow): Promise<void> => {
-      const others = await this._findUidsByMessageId(
-        c, folder.path, messageId,
-        keepUid != null ? { centerUid: keepUid, verify } : { verify },
-      );
-      const targets = keepUid != null ? others.filter((u) => u !== keepUid) : others;
-      if (!targets.length) return;
+  // Audit #12 H1：fingerprint 传了时再按指纹补扫一遍——OquMail 服务器
+  // 副本 Message-ID 不同，单靠 Message-ID 找不到它；不传时只按
+  // Message-ID 扫（旧行为不变）。
+  // Audit #13 L1(b)：messageId 可为 null（无 Message-ID 的信）——此时
+  // 跳过 Message-ID 查找、只按指纹扫，之前整段清扫都被 if (row.message_id)
+  // 挡在门外。L3：返回实际删掉的双生副本 Message-ID 列表（删前先按
+  // UID 取信封），调用方（彻底删除）一并写进墓碑，防双生副本复活。
+  // fpCenterUid / fpWindow：指纹查找的窗口参数；不传时默认 keepUid
+  // 附近 ±100。彻底删除时第二遍清扫（已发送文件夹）keepUid 为 null，
+  // 须由调用方显式传 fpWindow: Infinity（全量扫描）——被删行在已删除
+  // 文件夹，它的 UID 与已发送文件夹的 UID 序列无关，无法定中心。
+  private async _deleteOtherCopiesInFolder(accountId: number, folder: FolderRow, messageId: string | null, keepUid: number | null, verify?: { subject: string; from: string }, client?: ImapFlow, fingerprint?: SentFingerprint, opts: { fpCenterUid?: number; fpWindow?: number } = {}): Promise<{ twinIds: string[]; sweptUids: number[] }> {
+    const sweep = async (c: ImapFlow): Promise<{ twinIds: string[]; sweptUids: number[] }> => {
+      const targets: number[] = [];
+      if (messageId) {
+        const others = await this._findUidsByMessageId(
+          c, folder.path, messageId,
+          keepUid != null ? { centerUid: keepUid, verify } : { verify },
+        );
+        for (const u of (keepUid != null ? others.filter((x) => x !== keepUid) : others)) {
+          if (!targets.includes(u)) targets.push(u);
+        }
+      }
+      if (fingerprint) {
+        // Audit #20 LOW-1：指纹调用单独包 try/catch——_findUidsByFingerprint
+        // 内的 F2 核对抛错时只跳过指纹分支、继续删 Message-ID 分支已收集
+        // 的目标；否则 throw 会丢掉前面已收集的目标、退化整个清扫。
+        try {
+          const fpHits = await this._findUidsByFingerprint(
+            c, folder.path, fingerprint,
+            (opts.fpCenterUid ?? keepUid) != null
+              ? { centerUid: opts.fpCenterUid ?? keepUid as number, window: opts.fpWindow }
+              : { window: opts.fpWindow },
+          );
+          for (const u of fpHits) {
+            if (u !== keepUid && !targets.includes(u)) targets.push(u);
+          }
+        } catch (e) {
+          logError(`fingerprint lookup skipped in duplicate sweep account ${accountId} folder ${folder.path}:`, (e as Error)?.message || e);
+        }
+      }
+      if (!targets.length) return { twinIds: [], sweptUids: [] };
+      // 删前先取各目标的 Message-ID（L3：调用方写墓碑用）；取不到时
+      // 只记日志、不阻断删除（墓碑缺口退回旧行为，不让清扫失败）。
+      const twinIds: string[] = [];
+      try {
+        await c.mailboxOpen(folder.path);
+        for await (const msg of c.fetch(targets.join(','), { envelope: true, uid: true }, { uid: true })) {
+          const mid = (msg.envelope as { messageId?: unknown } | undefined)?.messageId;
+          if (typeof mid === 'string' && mid && !twinIds.includes(mid)) twinIds.push(mid);
+        }
+      } catch (e) {
+        logError(`read duplicate copy Message-IDs failed account ${accountId} folder ${folder.path}:`, (e as Error)?.message || e);
+      }
       await c.mailboxOpen(folder.path);
+      // Audit #21 LOW-1：只记真正删掉服务器副本的 UID（单封失败记日志、
+      // 继续删下一封）；调用方按 sweptUids 同步删本地行——UID 在同一
+      // 文件夹内唯一，与本地行一一对应。
+      const deletedUids: number[] = [];
       for (const u of targets) {
         try {
           await c.messageFlagsAdd(String(u), ['\\Deleted'], { uid: true });
           await c.messageDelete(String(u), { uid: true });
+          deletedUids.push(u);
         } catch (e) {
           logError(`delete duplicate copy failed account ${accountId} folder ${folder.path} uid ${u}:`, (e as Error)?.message || e);
         }
       }
-      log(`deleted ${targets.length} duplicate server ${targets.length > 1 ? 'copies' : 'copy'} of Message-ID ${messageId} in folder ${folder.path}`);
+      log(`deleted ${deletedUids.length} duplicate server ${deletedUids.length > 1 ? 'copies' : 'copy'} of Message-ID ${messageId ?? '(none, fingerprint only)'} in folder ${folder.path}`);
+      return { twinIds, sweptUids: deletedUids };
     };
     try {
-      if (client) await sweep(client);
-      else await this.withClient(accountId, sweep);
+      if (client) return await sweep(client);
+      return await this.withClient(accountId, sweep);
     } catch (e) {
       logError(`delete duplicate copies failed account ${accountId} folder ${folder.path}:`, (e as Error)?.message || e);
+      return { twinIds: [], sweptUids: [] };
     }
+  }
+
+  // Audit #21 LOW-1：清扫删掉服务器副本后，同步删掉被清副本的本地行。
+  // 之前 sweep 只删服务器端、本地行一直留到下一次同步对账才消失——
+  // 窗口内列表里还显示已删的信，点开取件失败、再删报 502。按
+  // (account_id, folder_id, uid) 匹配被清的 UID；只删 sweep 确认已
+  // 删掉服务器副本的 UID，取不到 Message-ID 的指纹命中同样覆盖。
+  // 清理口径与同步对账同款（FTS + 行删进事务，正文文件与
+  // mail-deleted 事件在事务外），计数顺带刷新。
+  private _deleteSweptLocalRows(accountId: number, folderId: number, uids: number[]): void {
+    if (!uids.length) return;
+    const db = getDb();
+    const deletedIds: number[] = [];
+    const tx = db.transaction(() => {
+      for (const uid of uids) {
+        const row = db.prepare(
+          'SELECT id FROM messages WHERE account_id=? AND folder_id=? AND uid=?',
+        ).get(accountId, folderId, uid) as { id: number } | undefined;
+        if (!row) continue;
+        removeMessageFts(row.id);
+        db.prepare('DELETE FROM messages WHERE id=?').run(row.id);
+        deletedIds.push(row.id);
+      }
+    });
+    tx();
+    for (const id of deletedIds) {
+      removeBodyFiles(id);
+      emit('mail-deleted', { messageId: id });
+    }
+    if (deletedIds.length) refreshFolderCounts(folderId);
   }
 
   private async _fetchEnvelopes(
@@ -1204,9 +1479,15 @@ export class SyncEngine {
       snippet = decodeSnippet(textPart, textPartEncoding(msg.bodyStructure));
     }
     const existing = db.prepare(
-      'SELECT id, is_read, snippet, flags_json FROM messages WHERE account_id=? AND folder_id=? AND uid=?',
-    ).get(accountId, folder.id, msg.uid) as { id: number; is_read: number; snippet: string; flags_json: string } | undefined;
+      'SELECT id, is_read, snippet, flags_json, reply_to FROM messages WHERE account_id=? AND folder_id=? AND uid=?',
+    ).get(accountId, folder.id, msg.uid) as { id: number; is_read: number; snippet: string; flags_json: string; reply_to: string | null } | undefined;
     if (existing) {
+      // Audit #11 threading：旧行缺 reply_to 时顺手回填（IMAP ENVELOPE 自带
+      // reply-to；不碰 updated_at，不续期 5 分钟已读守卫）。
+      const envReplyTo = env.replyTo?.[0]?.address || null;
+      if (!existing.reply_to && envReplyTo) {
+        db.prepare('UPDATE messages SET reply_to=? WHERE id=?').run(envReplyTo, existing.id);
+      }
       // 已读状态以本地为准：isNewCandidate=true 是“新 UID 范围取回”（可能含已存邮件），
       // 此时不要用服务器 flags 覆盖本地 is_read，否则用户刚标的已读一刷新就变回未读
       // （163 的 flags 回读可能滞后）。只有 MODSEQ 标记变化（isNewCandidate=false）时
@@ -1297,13 +1578,43 @@ export class SyncEngine {
         return dup.id;
       }
     }
+    // Audit #12 H1 兜底：已发送文件夹里 Message-ID 不同但指纹相同的行——
+    // OquMail 服务器自动保存的副本（重写 Message-ID）与客户端 APPEND
+    // 的那份。只在 sent 文件夹查，命中时与 F1 同款处理：记下被跳过的
+    // 服务器副本 UID（下次同步直接跳过）、surviving 行保持已读。
+    if (folder.type === 'sent') {
+      const msgDateIso = toIsoDate(env.date) ?? toIsoDate(msg.internalDate);
+      const msgDateMs = msgDateIso ? Date.parse(msgDateIso) : NaN;
+      const fpDup = this.findSentFingerprintDuplicate(accountId, folder.id, {
+        subject: env.subject || '',
+        from: from.address || '',
+        dateMs: Number.isNaN(msgDateMs) ? null : msgDateMs,
+        size: typeof msg.size === 'number' ? msg.size : null,
+        messageId: env.messageId || null,
+        to,
+      });
+      if (fpDup != null) {
+        let skipped = this.skippedDupeUids.get(folder.id);
+        if (!skipped) {
+          skipped = new Set<number>();
+          this.skippedDupeUids.set(folder.id, skipped);
+        }
+        skipped.add(msg.uid);
+        if (forceRead) {
+          db.prepare('UPDATE messages SET is_read=1 WHERE id=? AND is_read=0').run(fpDup);
+        }
+        return fpDup;
+      }
+    }
     const info = db.prepare(
-      `INSERT INTO messages (account_id, folder_id, uid, message_id, subject, from_addr,
+      `INSERT INTO messages (account_id, folder_id, uid, message_id, "references", reply_to, subject, from_addr,
         from_name, to_json, date, snippet, is_read, has_attachments, size, flags_json)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       accountId, folder.id, msg.uid,
       env.messageId || null,
+      null, // references：信封路径没有 References 头，全文拉取时再补（见 _fetchFullMessage）
+      env.replyTo?.[0]?.address || null,
       env.subject || '',
       from.address || '',
       from.name || '',
@@ -1412,9 +1723,9 @@ export class SyncEngine {
     const tx = db.transaction(() => {
       db.prepare('DELETE FROM attachments WHERE message_id=?').run(row.id);
       db.prepare(`UPDATE messages SET body_path=?, snippet=?, subject=?,
-                  has_attachments=?, "references"=?, updated_at=datetime('now') WHERE id=?`)
+                  has_attachments=?, "references"=?, reply_to=COALESCE(?, reply_to), updated_at=datetime('now') WHERE id=?`)
         .run(bodyPath, parsed.snippet, parsed.envelope.subject || row.subject,
-          parsed.hasAttachments ? 1 : 0, parsed.envelope.references || null, row.id);
+          parsed.hasAttachments ? 1 : 0, parsed.envelope.references || null, parsed.envelope.replyTo || null, row.id);
       for (const a of parsed.attachments) {
         db.prepare('INSERT INTO attachments (message_id, filename, content_type, size, path, cached, part) VALUES (?,?,?,?,?,?,?)')
           .run(row.id, a.filename, a.contentType, a.size, a.path, a.cached ? 1 : 0, a.part || null);
@@ -1499,6 +1810,33 @@ export class SyncEngine {
     // Audit #8 LOW-1：无 Message-ID 的信还有一层兜底——移动前后目标文件
     // 夹 EXISTS +1 时，取目标文件夹的最大 UID（刚移入的信一定是最新那封）。
     // Audit #10 M-14：client 由批量删除传进来时共用该会话，不另开连接。
+    // Audit #19 HIGH-1：同一 Message-ID 的两份副本（典型是自发邮件的收件箱
+    // 副本与已发送副本）不能先后移入同一文件夹——db.ts:429 的唯一索引
+    // idx_messages_account_folder_mid 要求每文件夹每 Message-ID 至多一行。
+    // 旧版先在服务器端 messageMove、再写本地 UPDATE，UPDATE 撞唯一索引
+    // 时服务器移动已不可逆、本地行永久 stale（指向源文件夹里已不存在的
+    // UID），重试仍报 UNIQUE。移动前先查目标文件夹是否已有同一
+    // Message-ID 的行：有则不移动，改为合并——服务器端直接删掉源文件夹
+    // 里这份（与彻底删除分支同款 \Deleted + expunge），本地删掉源行，
+    // 目标文件夹里已有的那份就是这封信的代表行。message_id 为 null 的行
+    // 不会撞唯一索引（SQLite 唯一索引里 NULL 互不相等），跳过本检查。
+    // 合并后已删除里只剩一行是既定行为（F1 去重语义），不另写墓碑——
+    // 代表行还在已删除里，墓碑只在彻底删除时写。
+    if (row.message_id) {
+      const twin = db.prepare(
+        'SELECT * FROM messages WHERE account_id=? AND folder_id=? AND message_id=?',
+      ).get(accountId, target.id, row.message_id) as MessageRow | undefined;
+      if (twin && twin.id !== messageId) {
+        await this._deleteServerCopy(accountId, row, source, client);
+        removeMessageFts(messageId);
+        removeBodyFiles(messageId);
+        db.prepare('DELETE FROM messages WHERE id=?').run(messageId);
+        refreshFolderCounts(source.id);
+        refreshFolderCounts(target.id);
+        emit('mail-deleted', { messageId });
+        return twin;
+      }
+    }
     let newUid: number | null;
     if (client) newUid = await this._doMove(client, row, target, source);
     else newUid = await this.withClient(accountId, (c) => this._doMove(c, row, target, source));
@@ -1517,14 +1855,71 @@ export class SyncEngine {
     if (newUid == null) {
       throw new Error('移动后无法确认新位置（目标文件夹里找不到这封邮件），本地未更新');
     }
-    db.prepare('UPDATE messages SET folder_id=?, uid=?, updated_at=datetime(\'now\') WHERE id=?')
-      .run(target.id, newUid, messageId);
+    try {
+      db.prepare('UPDATE messages SET folder_id=?, uid=?, updated_at=datetime(\'now\') WHERE id=?')
+        .run(target.id, newUid, messageId);
+    } catch (e) {
+      // Audit #19 HIGH-1 纵深防御：移动 + 本地 UPDATE 视为一个逻辑操作。
+      // 预查与 UPDATE 之间若有另一路把同 Message-ID 的行插进目标文件夹，
+      // UPDATE 会撞唯一索引。绝不能留下一个指向源文件夹里已不存在 UID
+      // 的 stale 行：目标文件夹里已有代表行时，删掉本地源行（邮件不丢，
+      // 已在目标文件夹里有代表行）；否则尝试把服务器副本移回源文件夹、
+      // 恢复本地一致性（uid 改回移回后的新 UID），再重新抛出原错——调用
+      // 方按失败处理，用户重试即可，状态已一致、重试不会再撞。
+      const twinAfter = row.message_id
+        ? (db.prepare('SELECT * FROM messages WHERE account_id=? AND folder_id=? AND message_id=?')
+            .get(accountId, target.id, row.message_id) as MessageRow | undefined)
+        : undefined;
+      if (twinAfter && twinAfter.id !== messageId) {
+        removeMessageFts(messageId);
+        removeBodyFiles(messageId);
+        db.prepare('DELETE FROM messages WHERE id=?').run(messageId);
+        refreshFolderCounts(source.id);
+        refreshFolderCounts(target.id);
+        emit('mail-deleted', { messageId });
+        return twinAfter;
+      }
+      try {
+        const backUid = await this._moveServerCopyBack(accountId, row, target, source, newUid, client);
+        if (backUid != null) {
+          db.prepare('UPDATE messages SET uid=?, updated_at=datetime(\'now\') WHERE id=?').run(backUid, messageId);
+        }
+      } catch { /* 移回失败也无能为力——下面重新抛出原错，同步对账随后会删掉 stale 行 */ }
+      throw e;
+    }
     refreshFolderCounts(source.id);
     refreshFolderCounts(target.id);
     // 带上 accountId：前端收到跨文件夹移信事件时能凭账号/文件夹
     // 更新未读角标（只带 folderId 时聚合视图的角标算不对，见审计#2 L3）。
     emit('mail-updated', { messageId, accountId, folderId: target.id, changes: { folderId: target.id } });
     return db.prepare('SELECT * FROM messages WHERE id=?').get(messageId) as MessageRow;
+  }
+
+  // Audit #19 HIGH-1：服务器端删掉源文件夹里的一份（\Deleted + expunge，
+  // 与 _deleteMessage 彻底删除分支同款）。调用方负责本地行的清理。
+  // client 由批量删除传进来时共用该会话，不另开连接。
+  private async _deleteServerCopy(accountId: number, row: MessageRow, source: FolderRow, client?: ImapFlow): Promise<void> {
+    const del = async (c: ImapFlow) => {
+      await c.mailboxOpen(source.path);
+      await c.messageFlagsAdd(String(row.uid), ['\\Deleted'], { uid: true });
+      await c.messageDelete(String(row.uid), { uid: true });
+    };
+    if (client) await del(client);
+    else await this.withClient(accountId, del);
+  }
+
+  // Audit #19 HIGH-1 补偿：把刚移入目标文件夹的服务器副本移回源文件夹，
+  // 返回它在源文件夹里的新 UID；移不回或反查不到时返回 null。UIDPLUS
+  // 有无不依赖——不用 uidMap，用 Message-ID 反查拿新 UID。
+  private async _moveServerCopyBack(accountId: number, row: MessageRow, target: FolderRow, source: FolderRow, targetUid: number, client?: ImapFlow): Promise<number | null> {
+    if (!row.message_id) return null;
+    const back = async (c: ImapFlow) => {
+      await c.mailboxOpen(target.path);
+      await c.messageMove(String(targetUid), source.path, { uid: true });
+      return this._findUidByMessageId(c, source.path, row.message_id as string);
+    };
+    if (client) return back(client);
+    return this.withClient(accountId, back);
   }
 
   // The IMAP-side move itself (mailboxOpen → messageMove → UID lookup).
@@ -1571,8 +1966,7 @@ export class SyncEngine {
     // 永久删除）。批量删除同一请求内是顺序执行的，前一路在 finally 里
     // 已释放标记，不会误判为冲突。
     // 409 映射：本错误带 status=409 / code=DELETE_IN_FLIGHT，路由层
-    // （messageRoutes.ts 单删 catch 目前一律 502）须据此返回 409，
-    // 该映射不在本次可改文件范围内，见报告。
+    // （messageRoutes.ts 单删与移动 catch）据此返回 409。
     const delKey = `${accountId}:${messageId}`;
     // Audit #10 L-13：删/移互斥——移动进行中再删同一封信也直接报冲突
     // （旧版只拦 deleteInflight，移动中的信照样能被删）。
@@ -1598,6 +1992,17 @@ export class SyncEngine {
     if (row.account_id !== accountId) throw new Error('邮件不属于该账号');
     const folder = db.prepare('SELECT * FROM folders WHERE id=?').get(row.folder_id) as FolderRow | undefined;
     if (!folder) throw new Error('文件夹不存在');
+    // Audit #12 H1：本行的指纹（主题/发件人/收件人/时间/大小）——清扫时除
+    // Message-ID 外再按指纹补扫，OquMail 服务器副本（Message-ID 被重写）
+    // 才能一并删掉；date 解析不出时指纹的 dateMs 为 null，补扫不命中。
+    const rowDateMs = Date.parse(row.date || '');
+    let rowTo: string[] | null = null;
+    try { rowTo = JSON.parse(row.to_json || '[]') as string[]; } catch { rowTo = null; }
+    const rowFp: SentFingerprint = {
+      subject: row.subject || '', from: row.from_addr || '',
+      dateMs: Number.isNaN(rowDateMs) ? null : rowDateMs, size: row.size || null,
+      messageId: row.message_id || null, to: rowTo,
+    };
     // 是否永久删除只看邮件实际所在文件夹：只有已在已删除文件夹里的信才
     // 彻底删除。客户端传的 permanent 不再采信——搜索是全局的，按视图判断
     // 会把非垃圾邮件永久删掉；反过来，已在垃圾邮件里的信也必须永久删，
@@ -1612,9 +2017,13 @@ export class SyncEngine {
       // F1 附带：从已发送删信时，把同文件夹内同一 Message-ID 的其他
       // 服务器副本一并删掉（163/QQ 自动保存的那份），否则原件移走后
       // 另一份还留在已发送、墓碑又挡着它不再显示、界面里永远删不掉。
-      if (folder.type === 'sent' && row.message_id) {
-        await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid,
-          { subject: row.subject || '', from: row.from_addr || '' }, client);
+      // Audit #13 L1(b)：message_id 为 null 的行也走指纹清扫（指纹
+      // 可用时，dateMs 非 null）——旧版整段被 if (row.message_id) 挡住。
+      if (folder.type === 'sent' && (row.message_id || rowFp.dateMs != null)) {
+        const swept = await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid,
+          { subject: row.subject || '', from: row.from_addr || '' }, client, rowFp);
+        // Audit #21 LOW-1：被清副本的本地行同步删掉，不等下一次同步对账。
+        this._deleteSweptLocalRows(accountId, folder.id, swept.sweptUids);
       }
       return true;
     }
@@ -1633,25 +2042,46 @@ export class SyncEngine {
     }
     // F1 附带：彻底删除时同样清掉同文件夹内同一 Message-ID 的其他
     // 服务器副本（两份副本先后被移进已删除的情形）。
-    if (row.message_id) {
-      await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid,
-        { subject: row.subject || '', from: row.from_addr || '' }, client);
+    // Audit #13 L1(b)：message_id 为 null 的行也走指纹清扫；L3：清扫
+    // 删掉的双生副本 Message-ID 一并写进墓碑（见下），防复活；L1(a)：
+    // 第二遍清扫（已发送文件夹）用全量窗口——被删行在已删除文件夹，
+    // 它的 UID 与已发送的 UID 序列无关，无法定中心，最后 100 名之外
+    // 的旧双生副本也必须扫到。
+    const sweptTwinIds: string[] = [];
+    const sweptLocal: { folderId: number; uids: number[] }[] = [];
+    if (row.message_id || rowFp.dateMs != null) {
+      const twinsHere = await this._deleteOtherCopiesInFolder(accountId, folder, row.message_id, row.uid,
+        { subject: row.subject || '', from: row.from_addr || '' }, client, rowFp);
+      sweptTwinIds.push(...twinsHere.twinIds);
+      sweptLocal.push({ folderId: folder.id, uids: twinsHere.sweptUids });
       // L3: 彻底删除时也清扫同账号已发送文件夹里的同 Message-ID 副本
       // （第一次清扫失败、或副本在已发送里时，墓碑会挡着它永不显示、
       // 界面里永远删不掉，只占服务器空间）。
       const sentFolder = this._folderByType(accountId, 'sent');
       if (sentFolder && sentFolder.id !== folder.id) {
-        await this._deleteOtherCopiesInFolder(accountId, sentFolder, row.message_id, null,
-          { subject: row.subject || '', from: row.from_addr || '' }, client);
+        const twinsSent = await this._deleteOtherCopiesInFolder(accountId, sentFolder, row.message_id, null,
+          { subject: row.subject || '', from: row.from_addr || '' }, client, rowFp,
+          { fpWindow: Number.POSITIVE_INFINITY });
+        sweptTwinIds.push(...twinsSent.twinIds);
+        sweptLocal.push({ folderId: sentFolder.id, uids: twinsSent.sweptUids });
       }
     }
     const folderId = row.folder_id;
     // 墓碑：记下彻底删除邮件的 Message-ID，同步时跳过它，删掉的信不再复活。
     // message_id 是邮件头的 Message-ID（全局唯一），不是本地行 id。
-    if (row.message_id) {
+    // Audit #13 L3：清扫时删掉的双生副本 Message-ID 也写进墓碑——只记
+    // 原 ID 时，双生副本的 ID 不在墓碑里，清扫后它若在服务器上重新出现
+    // （删除未真正 expunge、服务端恢复），同步会把它当新信插回来。
+    const tombIds = new Set<string>();
+    if (row.message_id) tombIds.add(row.message_id);
+    for (const t of sweptTwinIds) tombIds.add(t);
+    for (const mid of tombIds) {
       db.prepare('INSERT OR IGNORE INTO deleted_messages (account_id, message_id) VALUES (?,?)')
-        .run(accountId, row.message_id);
+        .run(accountId, mid);
     }
+    // Audit #21 LOW-1：被清副本的本地行与墓碑同一段代码里同步删掉，
+    // 不等下一次同步对账（否则窗口内列表里还显示已删的信）。
+    for (const s of sweptLocal) this._deleteSweptLocalRows(accountId, s.folderId, s.uids);
     removeMessageFts(messageId);
     db.prepare('DELETE FROM messages WHERE id=?').run(messageId);
     // Audit #9 L9：正文文件同步删除（removeBodyFiles）——之前两次
